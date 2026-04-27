@@ -3249,11 +3249,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::write(&path, content);
                     }
                 }
-                CtrlReq::LoadBuffer(path) => {
+                CtrlReq::LoadBuffer(path, buffer_name) => {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        app.paste_buffers.insert(0, content);
-                        if app.paste_buffers.len() > 10 {
-                            app.paste_buffers.pop();
+                        if let Some(name) = buffer_name {
+                            app.named_buffers.insert(name, content);
+                        } else {
+                            app.paste_buffers.insert(0, content);
+                            if app.paste_buffers.len() > 10 {
+                                app.paste_buffers.pop();
+                            }
                         }
                     }
                 }

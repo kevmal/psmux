@@ -13,6 +13,64 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
+fn parse_buffer_name_and_path(args: &[&str]) -> (Option<String>, Option<String>) {
+    let mut buffer_name: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-b" => {
+                if let Some(name) = args.get(i + 1) {
+                    buffer_name = Some((*name).to_string());
+                }
+                i += 2;
+                continue;
+            }
+            "-t" => {
+                i += 2;
+                continue;
+            }
+            "-w" => {
+                i += 1;
+                continue;
+            }
+            "-" => {
+                path = Some("-".to_string());
+            }
+            arg if !arg.starts_with('-') => {
+                path = Some(arg.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (buffer_name, path)
+}
+
+fn parse_buffer_name_and_payload(args: &[&str]) -> (Option<String>, Option<String>) {
+    let mut buffer_name: Option<String> = None;
+    let mut payload: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-b" => {
+                if let Some(name) = args.get(i + 1) {
+                    buffer_name = Some((*name).to_string());
+                }
+                i += 2;
+                continue;
+            }
+            arg if !arg.starts_with('-') => {
+                payload = Some(arg.to_string());
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (buffer_name, payload)
+}
+
 /// Handle a single TCP connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
@@ -687,6 +745,18 @@ match cmd {
         if let Some(encoded) = args.get(0) {
             if let Some(decoded) = base64_decode(encoded) {
                 let _ = tx.send(CtrlReq::SendPaste(decoded));
+            }
+        }
+    }
+    "set-buffer-data" => {
+        let (buf_name, encoded) = parse_buffer_name_and_payload(&args);
+        if let Some(encoded) = encoded {
+            if let Some(decoded) = base64_decode(&encoded) {
+                if let Some(name) = buf_name {
+                    let _ = tx.send(CtrlReq::SetNamedBuffer(name, decoded));
+                } else {
+                    let _ = tx.send(CtrlReq::SetBuffer(decoded));
+                }
             }
         }
     }
@@ -1801,8 +1871,10 @@ match cmd {
         let _ = tx.send(CtrlReq::SaveBuffer(path));
     }
     "load-buffer" | "loadb" => {
-        let path = args.iter().find(|a| **a == "-" || !a.starts_with('-')).unwrap_or(&"").to_string();
-        let _ = tx.send(CtrlReq::LoadBuffer(path));
+        let (buffer_name, path) = parse_buffer_name_and_path(&args);
+        if let Some(path) = path {
+            let _ = tx.send(CtrlReq::LoadBuffer(path, buffer_name));
+        }
     }
     "set-environment" | "setenv" => {
         let has_u = args.iter().any(|a| {
@@ -2800,6 +2872,28 @@ fn dispatch_control_command(
             }
             true
         }
+        "set-buffer-data" => {
+            let (buf_name, encoded) = parse_buffer_name_and_payload(args);
+            if let Some(encoded) = encoded {
+                if let Some(decoded) = base64_decode(&encoded) {
+                    if let Some(name) = buf_name {
+                        let _ = tx.send(CtrlReq::SetNamedBuffer(name, decoded));
+                    } else {
+                        let _ = tx.send(CtrlReq::SetBuffer(decoded));
+                    }
+                }
+            }
+            let _ = resp_tx.send(String::new());
+            true
+        }
+        "load-buffer" | "loadb" => {
+            let (buffer_name, path) = parse_buffer_name_and_path(args);
+            if let Some(path) = path {
+                let _ = tx.send(CtrlReq::LoadBuffer(path, buffer_name));
+            }
+            let _ = resp_tx.send(String::new());
+            true
+        }
         "has-session" | "has" => {
             let (rtx, rrx) = mpsc::channel::<bool>();
             let _ = tx.send(CtrlReq::HasSession(rtx));
@@ -3178,5 +3272,38 @@ fn dispatch_control_command(
             let _ = resp_tx.send(format!("unknown command: {}", cmd));
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_buffer_name_and_path, parse_buffer_name_and_payload};
+
+    #[test]
+    fn parses_load_buffer_name_without_treating_it_as_path() {
+        let (name, path) = parse_buffer_name_and_path(&["-b", "prompt", "C:\\Temp\\payload.txt"]);
+        assert_eq!(name.as_deref(), Some("prompt"));
+        assert_eq!(path.as_deref(), Some("C:\\Temp\\payload.txt"));
+    }
+
+    #[test]
+    fn parses_load_buffer_stdin_path() {
+        let (name, path) = parse_buffer_name_and_path(&["-w", "-b", "prompt", "-"]);
+        assert_eq!(name.as_deref(), Some("prompt"));
+        assert_eq!(path.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn parses_load_buffer_target_without_treating_it_as_path() {
+        let (name, path) = parse_buffer_name_and_path(&["C:\\Temp\\payload.txt", "-t", "client"]);
+        assert_eq!(name, None);
+        assert_eq!(path.as_deref(), Some("C:\\Temp\\payload.txt"));
+    }
+
+    #[test]
+    fn parses_base64_payload_without_treating_name_as_payload() {
+        let (name, payload) = parse_buffer_name_and_payload(&["-b", "prompt", "bXVsdGkKbGluZQ=="]);
+        assert_eq!(name.as_deref(), Some("prompt"));
+        assert_eq!(payload.as_deref(), Some("bXVsdGkKbGluZQ=="));
     }
 }

@@ -2496,6 +2496,7 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-t" => { i += 1; }
                         "-w" => {} // tmux 3.2+ clipboard propagation flag, silently accept
                         "-" => { file_path = Some("-".to_string()); }
                         s if !s.starts_with('-') => { file_path = Some(s.to_string()); }
@@ -2504,22 +2505,35 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 if let Some(path) = file_path {
-                    let content = if path == "-" {
+                    if path == "-" {
                         let mut input = String::new();
                         io::stdin().read_to_string(&mut input)?;
-                        input
+                        let encoded = crate::util::base64_encode(&input);
+                        let mut cmd = "set-buffer-data".to_string();
+                        if let Some(b) = buffer_name {
+                            cmd.push_str(&format!(" -b {}", crate::util::quote_arg(&b)));
+                        }
+                        cmd.push_str(&format!(" {}", encoded));
+                        cmd.push('\n');
+                        send_control(cmd)?;
                     } else {
-                        std::fs::read_to_string(&path)?
-                    };
-                    let mut cmd = "set-buffer".to_string();
-                    if let Some(b) = buffer_name {
-                        cmd.push_str(&format!(" -b {}", b));
+                        let expanded = if path.starts_with('~') {
+                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                            path.replacen('~', &home, 1)
+                        } else {
+                            path
+                        };
+                        let server_path = std::fs::canonicalize(&expanded)?
+                            .to_string_lossy()
+                            .into_owned();
+                        let mut cmd = "load-buffer".to_string();
+                        if let Some(b) = buffer_name {
+                            cmd.push_str(&format!(" -b {}", crate::util::quote_arg(&b)));
+                        }
+                        cmd.push_str(&format!(" {}", crate::util::quote_arg(&server_path)));
+                        cmd.push('\n');
+                        send_control(cmd)?;
                     }
-                    // Escape the content for transmission
-                    let escaped = content.replace('\n', "\\n").replace('\r', "\\r");
-                    cmd.push_str(&format!(" {}", escaped));
-                    cmd.push('\n');
-                    send_control(cmd)?;
                 }
                 return Ok(());
             }

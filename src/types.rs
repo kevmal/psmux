@@ -1112,7 +1112,7 @@ pub enum CtrlReq {
     CopyModePageUp,
     ClearHistory,
     SaveBuffer(String),
-    LoadBuffer(String),
+    LoadBuffer(String, Option<String>),
     SetEnvironment(String, String),
     UnsetEnvironment(String),
     ShowEnvironment(mpsc::Sender<String>),

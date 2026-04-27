@@ -1560,10 +1560,41 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "load-buffer" | "loadb" => {
-            if let Some(path) = parts.get(1) {
+            let mut buffer_name: Option<String> = None;
+            let mut path: Option<&str> = None;
+            let mut i = 1;
+            while i < parts.len() {
+                match parts[i] {
+                    "-b" => {
+                        if let Some(name) = parts.get(i + 1) {
+                            buffer_name = Some((*name).to_string());
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    "-t" => {
+                        i += 2;
+                        continue;
+                    }
+                    "-w" => {}
+                    "-" => {
+                        path = Some("-");
+                    }
+                    arg if !arg.starts_with('-') => {
+                        path = Some(arg);
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if let Some(path) = path {
                 if let Ok(data) = std::fs::read_to_string(path) {
-                    app.paste_buffers.insert(0, data);
-                    if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+                    if let Some(name) = buffer_name {
+                        app.named_buffers.insert(name, data);
+                    } else {
+                        app.paste_buffers.insert(0, data);
+                        if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
+                    }
                 }
             }
         }

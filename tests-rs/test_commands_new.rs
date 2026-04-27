@@ -418,6 +418,47 @@ fn setb_alias_inserts_same_as_set_buffer() {
 }
 
 #[test]
+fn load_buffer_preserves_multiline_file_contents() {
+    let mut app = mock_app_with_window();
+    let path = std::env::temp_dir().join(format!(
+        "psmux-load-buffer-{}-plain.txt",
+        std::process::id()
+    ));
+    let content = "first line\nsecond line\r\nthird line";
+    std::fs::write(&path, content).unwrap();
+
+    execute_command_string(
+        &mut app,
+        &format!("load-buffer {}", path.to_string_lossy()),
+    )
+    .unwrap();
+
+    assert_eq!(app.paste_buffers.first().map(String::as_str), Some(content));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn load_buffer_b_sets_named_buffer() {
+    let mut app = mock_app_with_window();
+    let path = std::env::temp_dir().join(format!(
+        "psmux-load-buffer-{}-named.txt",
+        std::process::id()
+    ));
+    let content = "named\nbuffer\npayload";
+    std::fs::write(&path, content).unwrap();
+
+    execute_command_string(
+        &mut app,
+        &format!("load-buffer -b prompt {}", path.to_string_lossy()),
+    )
+    .unwrap();
+
+    assert!(app.paste_buffers.is_empty());
+    assert_eq!(app.named_buffers.get("prompt").map(String::as_str), Some(content));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn delete_buffer_removes_first_buffer() {
     let mut app = mock_app_with_window();
     app.paste_buffers = vec!["a".into(), "b".into(), "c".into()];
