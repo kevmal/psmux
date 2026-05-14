@@ -281,17 +281,15 @@ if line.trim() == "PERSISTENT" {
         let mut frames_written: u64 = 0;
         let mut bytes_written: u64 = 0;
         let mut last_probe = std::time::Instant::now();
-        loop {
+        let exit_reason = 'writer_loop: loop {
             // 0. Check for queued directives (non-blocking) — these take priority
             while let Ok(directive) = directive_rx.try_recv() {
                 let write_start = std::time::Instant::now();
-                if write!(ws_bg, "{}\n", directive).is_err() {
-                    freeze_log("server-writer", &format!("directive write error client_id={}", client_id));
-                    return;
+                if let Err(e) = write!(ws_bg, "{}\n", directive) {
+                    break 'writer_loop format!("directive write error: {}", e);
                 }
-                if ws_bg.flush().is_err() {
-                    freeze_log("server-writer", &format!("directive flush error client_id={}", client_id));
-                    return;
+                if let Err(e) = ws_bg.flush() {
+                    break 'writer_loop format!("directive flush error: {}", e);
                 }
                 directives_written += 1;
                 bytes_written += directive.len() as u64 + 1;
@@ -303,27 +301,14 @@ if line.trim() == "PERSISTENT" {
             // 1. Drain all pending command responses (non-blocking after first)
             match resp_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(rrx) => {
-                    if let Ok(text) = rrx.recv() {
-                        let write_start = std::time::Instant::now();
-                        if write!(ws_bg, "{}\n", text).is_err() { break; }
-                        if ws_bg.flush().is_err() { break; }
-                        responses_written += 1;
-                        bytes_written += text.len() as u64 + 1;
-                        let elapsed = write_start.elapsed();
-                        if elapsed >= Duration::from_millis(50) {
-                            freeze_log("server-writer", &format!("slow response write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), text.len() + 1));
-                        }
-                    }
-                    while let Ok(rrx) = resp_rx.try_recv() {
-                        if let Ok(text) = rrx.recv() {
+                    match rrx.recv() {
+                        Ok(text) => {
                             let write_start = std::time::Instant::now();
-                            if write!(ws_bg, "{}\n", text).is_err() {
-                                freeze_log("server-writer", &format!("response write error client_id={}", client_id));
-                                return;
+                            if let Err(e) = write!(ws_bg, "{}\n", text) {
+                                break 'writer_loop format!("response write error: {}", e);
                             }
-                            if ws_bg.flush().is_err() {
-                                freeze_log("server-writer", &format!("response flush error client_id={}", client_id));
-                                return;
+                            if let Err(e) = ws_bg.flush() {
+                                break 'writer_loop format!("response flush error: {}", e);
                             }
                             responses_written += 1;
                             bytes_written += text.len() as u64 + 1;
@@ -332,10 +317,37 @@ if line.trim() == "PERSISTENT" {
                                 freeze_log("server-writer", &format!("slow response write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), text.len() + 1));
                             }
                         }
+                        Err(e) => {
+                            freeze_log("server-writer", &format!("response receiver dropped client_id={} err={}", client_id, e));
+                        }
+                    }
+                    while let Ok(rrx) = resp_rx.try_recv() {
+                        match rrx.recv() {
+                            Ok(text) => {
+                                let write_start = std::time::Instant::now();
+                                if let Err(e) = write!(ws_bg, "{}\n", text) {
+                                    break 'writer_loop format!("response write error: {}", e);
+                                }
+                                if let Err(e) = ws_bg.flush() {
+                                    break 'writer_loop format!("response flush error: {}", e);
+                                }
+                                responses_written += 1;
+                                bytes_written += text.len() as u64 + 1;
+                                let elapsed = write_start.elapsed();
+                                if elapsed >= Duration::from_millis(50) {
+                                    freeze_log("server-writer", &format!("slow response write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), text.len() + 1));
+                                }
+                            }
+                            Err(e) => {
+                                freeze_log("server-writer", &format!("response receiver dropped client_id={} err={}", client_id, e));
+                            }
+                        }
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break 'writer_loop "response queue disconnected".to_string();
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             // 2. Drain all queued frames from the bounded channel
@@ -346,13 +358,11 @@ if line.trim() == "PERSISTENT" {
                         freeze_log("server-writer", &format!("frame-write-start client_id={} bytes={} frames={} responses={} directives={}", client_id, text.len() + 1, frames_written, responses_written, directives_written));
                     }
                     let write_start = std::time::Instant::now();
-                    if write!(ws_bg, "{}\n", text).is_err() {
-                        freeze_log("server-writer", &format!("frame write error client_id={} bytes={}", client_id, text.len() + 1));
-                        return;
+                    if let Err(e) = write!(ws_bg, "{}\n", text) {
+                        break 'writer_loop format!("frame write error: {} bytes={}", e, text.len() + 1);
                     }
-                    if ws_bg.flush().is_err() {
-                        freeze_log("server-writer", &format!("frame flush error client_id={} bytes={}", client_id, text.len() + 1));
-                        return;
+                    if let Err(e) = ws_bg.flush() {
+                        break 'writer_loop format!("frame flush error: {} bytes={}", e, text.len() + 1);
                     }
                     frames_written += 1;
                     bytes_written += text.len() as u64 + 1;
@@ -363,11 +373,19 @@ if line.trim() == "PERSISTENT" {
                     }
                 }
             } else {
-                freeze_log("server-writer", &format!("frame channel lock poisoned client_id={}", client_id));
-                return;
+                break 'writer_loop "frame channel lock poisoned".to_string();
             }
-        }
-        freeze_log("server-writer", &format!("exit client_id={} frames={} responses={} directives={} bytes={}", client_id, frames_written, responses_written, directives_written, bytes_written));
+        };
+        freeze_log("server-writer", &format!(
+            "exit client_id={} reason={} frames={} responses={} directives={} bytes={}",
+            client_id,
+            exit_reason,
+            frames_written,
+            responses_written,
+            directives_written,
+            bytes_written
+        ));
+        crate::types::shutdown_client_stream(client_id);
     });
     resp_tx_opt = Some(resp_tx);
     line.clear();
@@ -729,6 +747,9 @@ loop {
         match r.read_line(&mut line) {
             Ok(0) => {
                 // EOF - client disconnected
+                if persistent {
+                    freeze_log("server-read", &format!("EOF client_id={} attached_sent={}", client_id, attached_sent));
+                }
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 }
@@ -739,6 +760,9 @@ loop {
                 if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
+                }
+                if persistent {
+                    freeze_log("server-read", &format!("error client_id={} attached_sent={} err={}", client_id, attached_sent, e));
                 }
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
@@ -2881,6 +2905,9 @@ match cmd {
     match r.read_line(&mut line) {
         Ok(0) => {
             // EOF - client disconnected
+            if persistent {
+                freeze_log("server-read", &format!("EOF client_id={} attached_sent={}", client_id, attached_sent));
+            }
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
@@ -2891,6 +2918,9 @@ match cmd {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
             }
+            if persistent {
+                freeze_log("server-read", &format!("error client_id={} attached_sent={} err={}", client_id, attached_sent, e));
+            }
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
@@ -2899,6 +2929,10 @@ match cmd {
         Ok(_) => {} // Continue processing
     }
 } // end command loop
+if persistent {
+    freeze_log("server-persistent", &format!("cleanup client_id={} attached_sent={}", client_id, attached_sent));
+    crate::types::shutdown_client_stream(client_id);
+}
 }
 
 /// Dispatch a command from a control mode client.
