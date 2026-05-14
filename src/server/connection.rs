@@ -13,6 +13,12 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
+fn is_persistent_read_pending(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::WouldBlock
+        || e.kind() == io::ErrorKind::TimedOut
+        || e.raw_os_error() == Some(997)
+}
+
 /// Split a command line on top-level `;` separators, respecting single and
 /// double quotes and `\` escapes. Real tmux's parser treats `;` as a command
 /// separator on the same line; iTerm2's `sendCommandList` joins many commands
@@ -674,7 +680,7 @@ loop {
             }
             Err(e) => {
                 // In persistent mode, timeouts are expected - keep waiting
-                if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
+                if persistent && is_persistent_read_pending(&e) {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
                 }
@@ -2825,7 +2831,7 @@ match cmd {
             break;
         }
         Err(e) => {
-            if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
+            if persistent && is_persistent_read_pending(&e) {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
             }
