@@ -385,7 +385,6 @@ if line.trim() == "PERSISTENT" {
             directives_written,
             bytes_written
         ));
-        crate::types::shutdown_client_stream(client_id);
     });
     resp_tx_opt = Some(resp_tx);
     line.clear();
@@ -2931,7 +2930,6 @@ match cmd {
 } // end command loop
 if persistent {
     freeze_log("server-persistent", &format!("cleanup client_id={} attached_sent={}", client_id, attached_sent));
-    crate::types::shutdown_client_stream(client_id);
 }
 }
 
