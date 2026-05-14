@@ -1506,6 +1506,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut freeze_last_draw_probe = Instant::now();
     let mut freeze_input_detail_left: u32 = 32;
     let mut freeze_send_detail_left: u32 = 32;
+    let mut freeze_paste_detail_left: u32 = 64;
     loop {
         freeze_loop_iter += 1;
         if freeze_last_heartbeat.elapsed() >= Duration::from_secs(2) {
@@ -1651,6 +1652,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 if paste_confirmed {
                     // Ctrl+V Release already seen — send as paste now
                     if !paste_pend.is_empty() {
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} confirmed-top send-paste len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
                                 paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
@@ -1674,6 +1684,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // trigger a false-positive 300ms delay (fixes #91).
                         paste_stage2 = true;
                         paste_stage2_last_len = paste_pend.len();
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} stage2 ascii len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
                         }
@@ -1683,12 +1702,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // IME composition (which rarely exceeds a few chars).
                         paste_stage2 = true;
                         paste_stage2_last_len = paste_pend.len();
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} stage2 non-ascii-large len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2 (large non-ASCII): {} chars in 20ms", paste_pend.len()));
                         }
                     } else if paste_pend.len() >= 3 && has_non_ascii {
                         // ≥3 chars but contains non-ASCII (IME input) — flush
                         // immediately as normal text to avoid 300ms delay.
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} flush-normal non-ascii len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("flush {} chars as normal (non-ASCII / IME detected)", paste_pend.len()));
                         }
@@ -1711,6 +1748,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         paste_pend_start = None;
                     } else {
                         // <3 chars → normal typing, flush as send-text
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} flush-normal small len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("flush {} chars as normal (< 3 in 20ms)", paste_pend.len()));
                         }
@@ -1738,11 +1784,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     // ConPTY is still injecting characters (large paste).
                     // Extend the window instead of splitting the paste.
                     if paste_pend.len() > paste_stage2_last_len {
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} stage2-extend len={} prev_len={}",
+                                name,
+                                paste_pend.len(),
+                                paste_stage2_last_len
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         paste_stage2_last_len = paste_pend.len();
                         paste_pend_start = Some(Instant::now() - Duration::from_millis(280));
                     } else {
                         // Buffer stopped growing — send accumulated chars as
                         // send-paste so the server wraps in bracketed paste.
+                        if freeze_paste_detail_left > 0 {
+                            freeze_log("client-paste", &format!(
+                                "session={} stage2-timeout send-paste len={} elapsed_ms={}",
+                                name,
+                                paste_pend.len(),
+                                elapsed.as_millis()
+                            ));
+                            freeze_paste_detail_left -= 1;
+                        }
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
                         }
@@ -1779,7 +1843,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         Event::Paste(d) => format!("paste bytes={}", d.len()),
                         other => format!("other {:?}", other),
                     };
-                    freeze_log("client-input", &format!("session={} {}", name, detail));
+                    freeze_log("client-input", &format!(
+                        "session={} {} prefix_armed={} paste_len={} paste_stage2={} command_input={} overlays={} got_frame={} frames={} cmds={}",
+                        name,
+                        detail,
+                        prefix_armed,
+                        paste_pend.len(),
+                        paste_stage2,
+                        command_input,
+                        srv_popup_active || srv_confirm_active || srv_menu_active || srv_display_panes || srv_customize_active,
+                        got_frame,
+                        freeze_frames_seen,
+                        freeze_cmds_sent
+                    ));
                     freeze_input_detail_left -= 1;
                 }
                 // Input debug: log every raw event BEFORE filtering
@@ -3012,6 +3088,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         if paste_pend_start.is_none() {
                                             paste_pend_start = Some(Instant::now());
                                         }
+                                        if freeze_paste_detail_left > 0 {
+                                            freeze_log("client-paste", &format!(
+                                                "session={} buffer char='space' len={} stage2={} suppress=false",
+                                                name,
+                                                paste_pend.len(),
+                                                paste_stage2
+                                            ));
+                                            freeze_paste_detail_left -= 1;
+                                        }
                                     }
                                     #[cfg(not(windows))]
                                     {
@@ -3030,6 +3115,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         paste_pend.push(c);
                                         if paste_pend_start.is_none() {
                                             paste_pend_start = Some(Instant::now());
+                                        }
+                                        if freeze_paste_detail_left > 0 {
+                                            freeze_log("client-paste", &format!(
+                                                "session={} buffer altgr char='{}' len={} stage2={}",
+                                                name,
+                                                c.escape_debug(),
+                                                paste_pend.len(),
+                                                paste_stage2
+                                            ));
+                                            freeze_paste_detail_left -= 1;
                                         }
                                     }
                                     #[cfg(not(windows))]
@@ -3158,6 +3253,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             if paste_pend_start.is_none() {
                                                 paste_pend_start = Some(Instant::now());
                                             }
+                                            if freeze_paste_detail_left > 0 {
+                                                freeze_log("client-paste", &format!(
+                                                    "session={} buffer char='{}' len={} stage2={} suppress=false",
+                                                    name,
+                                                    c.escape_debug(),
+                                                    paste_pend.len(),
+                                                    paste_stage2
+                                                ));
+                                                freeze_paste_detail_left -= 1;
+                                            }
                                         }
                                     }
                                     #[cfg(not(windows))]
@@ -3175,6 +3280,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     {
                                         if !paste_pend.is_empty() {
                                             paste_pend.push('\n');
+                                            if freeze_paste_detail_left > 0 {
+                                                freeze_log("client-paste", &format!(
+                                                    "session={} buffer enter len={} stage2={}",
+                                                    name,
+                                                    paste_pend.len(),
+                                                    paste_stage2
+                                                ));
+                                                freeze_paste_detail_left -= 1;
+                                            }
                                         } else {
                                             cmd_batch.push(format!("send-key {}\n", modified_key_name("Enter", key.modifiers)));
                                         }
@@ -3759,6 +3873,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         #[cfg(windows)]
         {
             if paste_confirmed && !paste_pend.is_empty() {
+                if freeze_paste_detail_left > 0 {
+                    freeze_log("client-paste", &format!(
+                        "session={} confirmed-post send-paste len={}",
+                        name,
+                        paste_pend.len()
+                    ));
+                    freeze_paste_detail_left -= 1;
+                }
                 if input_log_enabled() {
                     input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
                         paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
