@@ -160,7 +160,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
@@ -226,7 +226,7 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
@@ -277,7 +277,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
 
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
@@ -434,7 +434,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cpr_writer = cpr_pending.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
@@ -1198,6 +1198,17 @@ fn scan_cpr_query(data: &[u8]) -> bool {
     data.contains(&0x1b) && data.windows(CPR.len()).any(|w| w == CPR)
 }
 
+fn should_signal_reactive_cpr(has_cpr_query: bool, preemptive_cpr_response_available: &mut bool) -> bool {
+    if !has_cpr_query {
+        return false;
+    }
+    if *preemptive_cpr_response_available {
+        *preemptive_cpr_response_available = false;
+        return false;
+    }
+    true
+}
+
 // TODO: The 7 Arc parameters below should be grouped into a `ReaderSignals`
 // struct the next time a new signal is added, to keep the call-site manageable.
 pub fn spawn_reader_thread(
@@ -1207,6 +1218,7 @@ pub fn spawn_reader_thread(
     cursor_shape: Arc<std::sync::atomic::AtomicU8>,
     bell_pending: Arc<std::sync::atomic::AtomicBool>,
     cpr_pending: Arc<std::sync::atomic::AtomicBool>,
+    preemptive_cpr_response_available: bool,
     output_ring: Arc<Mutex<std::collections::VecDeque<u8>>>,
 ) {
     // ── Issue #246: split the old single reader thread into two threads ──
@@ -1289,6 +1301,7 @@ pub fn spawn_reader_thread(
 
     // ── Parser thread: coalesces staged bytes, processes under one lock ──
     thread::spawn(move || {
+        let mut preemptive_cpr_response_available = preemptive_cpr_response_available;
         loop {
             // Wait for at least one byte (or shutdown).
             {
@@ -1376,7 +1389,7 @@ pub fn spawn_reader_thread(
             // Signal the main loop to inject a CPR response (ESC[row;colR).
             // pwsh emits ESC[6n at startup and after session events such as
             // lock/unlock; the main loop writes the response via pane.writer.
-            if has_cpr_query {
+            if should_signal_reactive_cpr(has_cpr_query, &mut preemptive_cpr_response_available) {
                 cpr_pending.store(true, Ordering::Release);
                 crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
             }

@@ -7,7 +7,8 @@
 //   blocks indefinitely.
 //
 // Fix: the parser thread scans every byte batch for ESC[6n via
-// `scan_cpr_query` and sets `cpr_pending`; the server loop calls
+// `scan_cpr_query` and sets `cpr_pending` after the first query already
+// covered by psmux's preemptive response; the server loop calls
 // `drain_cpr_pending` which writes ESC[row;colR and clears the flag.
 
 use super::*;
@@ -60,6 +61,35 @@ fn detects_cpr_query_at_end_of_buffer() {
 fn escapes_without_0x1b_skip_window_scan() {
     // Pre-check: no ESC byte → must be false without scanning
     assert!(!scan_cpr_query(b"[6n"));
+}
+
+// ── should_signal_reactive_cpr ───────────────────────────────────────────
+
+#[test]
+fn first_cpr_query_is_covered_by_preemptive_response() {
+    let mut preemptive_available = true;
+    assert!(!should_signal_reactive_cpr(true, &mut preemptive_available));
+    assert!(!preemptive_available);
+}
+
+#[test]
+fn second_cpr_query_is_reactive_after_preemptive_response_is_consumed() {
+    let mut preemptive_available = true;
+    assert!(!should_signal_reactive_cpr(true, &mut preemptive_available));
+    assert!(should_signal_reactive_cpr(true, &mut preemptive_available));
+}
+
+#[test]
+fn non_cpr_batch_does_not_consume_preemptive_response() {
+    let mut preemptive_available = true;
+    assert!(!should_signal_reactive_cpr(false, &mut preemptive_available));
+    assert!(preemptive_available);
+}
+
+#[test]
+fn proxy_panes_without_preemptive_response_signal_first_cpr_query() {
+    let mut preemptive_available = false;
+    assert!(should_signal_reactive_cpr(true, &mut preemptive_available));
 }
 
 // ── drain_cpr_pending — response format ──────────────────────────────────
