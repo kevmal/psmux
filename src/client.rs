@@ -1504,6 +1504,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut freeze_last_cmd_at = Instant::now();
     let mut freeze_last_dump_at = Instant::now();
     let mut freeze_last_draw_probe = Instant::now();
+    let mut freeze_input_detail_left: u32 = 32;
+    let mut freeze_send_detail_left: u32 = 32;
     loop {
         freeze_loop_iter += 1;
         if freeze_last_heartbeat.elapsed() >= Duration::from_secs(2) {
@@ -1764,6 +1766,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             while let Some(_cur_evt) = _pending_evt {
                 freeze_events_seen += 1;
                 freeze_last_input_at = Instant::now();
+                if freeze_input_detail_left > 0 {
+                    let detail = match &_cur_evt {
+                        Event::Key(key) => format!(
+                            "key kind={:?} code={:?} mods={:?}",
+                            key.kind,
+                            key.code,
+                            key.modifiers
+                        ),
+                        Event::Mouse(me) => format!("mouse kind={:?} col={} row={}", me.kind, me.column, me.row),
+                        Event::Resize(w, h) => format!("resize {}x{}", w, h),
+                        Event::Paste(d) => format!("paste bytes={}", d.len()),
+                        other => format!("other {:?}", other),
+                    };
+                    freeze_log("client-input", &format!("session={} {}", name, detail));
+                    freeze_input_detail_left -= 1;
+                }
                 // Input debug: log every raw event BEFORE filtering
                 if input_log_enabled() {
                     match &_cur_evt {
@@ -3807,6 +3825,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         if sent_keys_this_iter {
             freeze_cmds_sent += cmd_batch.len() as u64;
             freeze_last_cmd_at = Instant::now();
+            if freeze_send_detail_left > 0 {
+                for cmd in &cmd_batch {
+                    if freeze_send_detail_left == 0 { break; }
+                    freeze_log("client-send", &format!("session={} cmd={}", name, cmd.trim()));
+                    freeze_send_detail_left -= 1;
+                }
+            }
             if input_log_enabled() {
                 for cmd in &cmd_batch {
                     input_log("send", &format!("→ {}", cmd.trim()));
@@ -3979,6 +4004,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
         // ── Audible bell: forward BEL to host terminal ──────────────
         if state.bell {
+            freeze_log("client-bell", &format!(
+                "session={} forwarded BEL frames={} events={} cmds={} draws={}",
+                name,
+                freeze_frames_seen,
+                freeze_events_seen,
+                freeze_cmds_sent,
+                freeze_draws_ok
+            ));
             pending_bell = true;
         }
 
