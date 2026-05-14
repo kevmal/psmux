@@ -8,6 +8,7 @@ use crate::types::{CtrlReq, LayoutKind, WaitForOp, ControlNotification};
 use crate::cli::{parse_target, extract_flag_value};
 use crate::util::base64_decode;
 use crate::control;
+use crate::debug_log::freeze_log;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 use crate::commands::parse_command_line;
@@ -180,6 +181,8 @@ pub(crate) fn handle_connection(
     aliases: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 ) {
 let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
+freeze_log("server-conn", &format!("accepted client_id={} peer={}", client_id, peer));
 // Enable TCP_NODELAY for low-latency responses
 let _ = stream.set_nodelay(true);
 // Clone stream for writing, original goes into BufReader for reading
@@ -202,12 +205,14 @@ if r.read_line(&mut auth_line).is_err() {
 let auth_line = auth_line.trim();
 if !auth_line.starts_with("AUTH ") {
     // Legacy client without auth - reject for security
+    freeze_log("server-conn", &format!("auth missing client_id={} peer={}", client_id, peer));
     let _ = write_stream.write_all(b"ERROR: Authentication required\n");
     let _ = write_stream.flush();
     return;
 }
 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
 if provided_key != session_key {
+    freeze_log("server-conn", &format!("auth invalid client_id={} peer={}", client_id, peer));
     let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
     let _ = write_stream.flush();
     return;
@@ -215,6 +220,7 @@ if provided_key != session_key {
 // Auth successful - send OK and flush immediately
 let _ = write_stream.write_all(b"OK\n");
 let _ = write_stream.flush();
+freeze_log("server-conn", &format!("auth ok client_id={} peer={}", client_id, peer));
 
 // Use a reasonable timeout for the first command after AUTH.
 // Clients may have a small delay between AUTH and the actual command.
@@ -236,6 +242,7 @@ if r.read_line(&mut line).is_err() {
 // Check if client requests persistent connection mode
 if line.trim() == "PERSISTENT" {
     persistent = true;
+    freeze_log("server-persistent", &format!("start client_id={} peer={}", client_id, peer));
     // Enable TCP_NODELAY for low-latency persistent connections
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
@@ -266,24 +273,64 @@ if line.trim() == "PERSISTENT" {
     // by frame channel backpressure.
     let directive_rx = crate::types::register_directive_channel(client_id);
 
+    let writer_peer = peer.clone();
     std::thread::spawn(move || {
+        freeze_log("server-writer", &format!("start client_id={} peer={}", client_id, writer_peer));
+        let mut directives_written: u64 = 0;
+        let mut responses_written: u64 = 0;
+        let mut frames_written: u64 = 0;
+        let mut bytes_written: u64 = 0;
+        let mut last_probe = std::time::Instant::now();
         loop {
             // 0. Check for queued directives (non-blocking) — these take priority
             while let Ok(directive) = directive_rx.try_recv() {
-                if write!(ws_bg, "{}\n", directive).is_err() { return; }
-                if ws_bg.flush().is_err() { return; }
+                let write_start = std::time::Instant::now();
+                if write!(ws_bg, "{}\n", directive).is_err() {
+                    freeze_log("server-writer", &format!("directive write error client_id={}", client_id));
+                    return;
+                }
+                if ws_bg.flush().is_err() {
+                    freeze_log("server-writer", &format!("directive flush error client_id={}", client_id));
+                    return;
+                }
+                directives_written += 1;
+                bytes_written += directive.len() as u64 + 1;
+                let elapsed = write_start.elapsed();
+                if elapsed >= Duration::from_millis(50) {
+                    freeze_log("server-writer", &format!("slow directive write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), directive.len() + 1));
+                }
             }
             // 1. Drain all pending command responses (non-blocking after first)
             match resp_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(rrx) => {
                     if let Ok(text) = rrx.recv() {
+                        let write_start = std::time::Instant::now();
                         if write!(ws_bg, "{}\n", text).is_err() { break; }
                         if ws_bg.flush().is_err() { break; }
+                        responses_written += 1;
+                        bytes_written += text.len() as u64 + 1;
+                        let elapsed = write_start.elapsed();
+                        if elapsed >= Duration::from_millis(50) {
+                            freeze_log("server-writer", &format!("slow response write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), text.len() + 1));
+                        }
                     }
                     while let Ok(rrx) = resp_rx.try_recv() {
                         if let Ok(text) = rrx.recv() {
-                            if write!(ws_bg, "{}\n", text).is_err() { return; }
-                            if ws_bg.flush().is_err() { return; }
+                            let write_start = std::time::Instant::now();
+                            if write!(ws_bg, "{}\n", text).is_err() {
+                                freeze_log("server-writer", &format!("response write error client_id={}", client_id));
+                                return;
+                            }
+                            if ws_bg.flush().is_err() {
+                                freeze_log("server-writer", &format!("response flush error client_id={}", client_id));
+                                return;
+                            }
+                            responses_written += 1;
+                            bytes_written += text.len() as u64 + 1;
+                            let elapsed = write_start.elapsed();
+                            if elapsed >= Duration::from_millis(50) {
+                                freeze_log("server-writer", &format!("slow response write client_id={} elapsed_ms={} bytes={}", client_id, elapsed.as_millis(), text.len() + 1));
+                            }
                         }
                     }
                     continue;
@@ -294,13 +341,33 @@ if line.trim() == "PERSISTENT" {
             // 2. Drain all queued frames from the bounded channel
             if let Ok(frame_rx) = frame_chan.rx.lock() {
                 while let Ok(text) = frame_rx.try_recv() {
-                    if write!(ws_bg, "{}\n", text).is_err() { return; }
-                    if ws_bg.flush().is_err() { return; }
+                    let probe_this_write = last_probe.elapsed() >= Duration::from_secs(2);
+                    if probe_this_write {
+                        freeze_log("server-writer", &format!("frame-write-start client_id={} bytes={} frames={} responses={} directives={}", client_id, text.len() + 1, frames_written, responses_written, directives_written));
+                    }
+                    let write_start = std::time::Instant::now();
+                    if write!(ws_bg, "{}\n", text).is_err() {
+                        freeze_log("server-writer", &format!("frame write error client_id={} bytes={}", client_id, text.len() + 1));
+                        return;
+                    }
+                    if ws_bg.flush().is_err() {
+                        freeze_log("server-writer", &format!("frame flush error client_id={} bytes={}", client_id, text.len() + 1));
+                        return;
+                    }
+                    frames_written += 1;
+                    bytes_written += text.len() as u64 + 1;
+                    let elapsed = write_start.elapsed();
+                    if probe_this_write || elapsed >= Duration::from_millis(50) {
+                        freeze_log("server-writer", &format!("frame-write-ok client_id={} elapsed_ms={} bytes={} frames={} total_bytes={}", client_id, elapsed.as_millis(), text.len() + 1, frames_written, bytes_written));
+                        last_probe = std::time::Instant::now();
+                    }
                 }
             } else {
+                freeze_log("server-writer", &format!("frame channel lock poisoned client_id={}", client_id));
                 return;
             }
         }
+        freeze_log("server-writer", &format!("exit client_id={} frames={} responses={} directives={} bytes={}", client_id, frames_written, responses_written, directives_written, bytes_written));
     });
     resp_tx_opt = Some(resp_tx);
     line.clear();

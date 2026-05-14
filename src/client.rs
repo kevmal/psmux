@@ -15,7 +15,7 @@ use crate::rendering::{dim_predictions_enabled, map_color, dim_color, centered_r
 use crate::style::parse_tmux_style_components;
 use crate::config::{parse_key_string, normalize_key_for_binding};
 use crate::copy_mode::{copy_to_system_clipboard, read_from_system_clipboard};
-use crate::debug_log::{client_log, client_log_enabled, input_log, input_log_enabled};
+use crate::debug_log::{client_log, client_log_enabled, freeze_log, input_log, input_log_enabled};
 use crate::layout::RowRunsJson;
 use crate::tree::split_with_gaps;
 
@@ -874,6 +874,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
     let addr = format!("127.0.0.1:{}", port);
     let session_key = read_session_key(&name).unwrap_or_default();
+    freeze_log("client-start", &format!("session={} addr={} exe_args={:?}", name, addr, env::args().collect::<Vec<_>>()));
     let last_path = format!("{}\\.psmux\\last_session", home);
     if !crate::session::is_warm_session(&name) {
         let _ = std::fs::write(&last_path, &name);
@@ -899,6 +900,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let _ = writer.write_all(b"PERSISTENT\n");
     let _ = writer.write_all(b"client-attach\n");
     let _ = writer.flush();
+    freeze_log("client-connect", &format!("session={} persistent attach sent", name));
 
     // Spawn a dedicated reader thread so the event loop never blocks on I/O.
     // The reader thread reads lines from the server and sends them via channel.
@@ -908,30 +910,76 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // the client stuck after the last pane exits.
     let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    let reader_lines = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader_timeouts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader_errors = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reader_lines_bg = reader_lines.clone();
+    let reader_bytes_bg = reader_bytes.clone();
+    let reader_timeouts_bg = reader_timeouts.clone();
+    let reader_errors_bg = reader_errors.clone();
+    let reader_session = name.clone();
     std::thread::spawn(move || {
+        freeze_log("client-reader", &format!("start session={}", reader_session));
         let mut reader = reader;
         let mut buf = String::with_capacity(64 * 1024);
+        let mut last_probe = Instant::now();
         loop {
             buf.clear();
             loop {
                 match reader.read_line(&mut buf) {
-                    Ok(0) => return, // EOF — server closed connection
+                    Ok(0) => {
+                        freeze_log("client-reader", &format!("EOF session={}", reader_session));
+                        return; // EOF — server closed connection
+                    }
                     Ok(_) => break,  // Got a complete line, send it
                     Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
+                        reader_timeouts_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if last_probe.elapsed() >= Duration::from_secs(10) {
+                            freeze_log("client-reader", &format!(
+                                "timeout-still-alive session={} lines={} bytes={} timeouts={}",
+                                reader_session,
+                                reader_lines_bg.load(std::sync::atomic::Ordering::Relaxed),
+                                reader_bytes_bg.load(std::sync::atomic::Ordering::Relaxed),
+                                reader_timeouts_bg.load(std::sync::atomic::Ordering::Relaxed)
+                            ));
+                            last_probe = Instant::now();
+                        }
                         // Timeout: buf may contain a partial line from a
                         // previous fill_buf.  Do NOT clear it — read_line
                         // will resume appending on the next call.  This
                         // keeps the protocol stream intact.
                         continue;
                     }
-                    Err(_) => return, // Real error — connection died
+                    Err(e) => {
+                        reader_errors_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        freeze_log("client-reader", &format!("error session={} err={}", reader_session, e));
+                        return; // Real error — connection died
+                    }
                 }
             }
             let line = std::mem::take(&mut buf);
+            reader_lines_bg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reader_bytes_bg.fetch_add(line.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if last_probe.elapsed() >= Duration::from_secs(5) {
+                let kind = if line.trim() == "NC" { "NC" } else if line.trim().starts_with("SWITCH ") { "SWITCH" } else { "FRAME" };
+                freeze_log("client-reader", &format!(
+                    "line session={} kind={} len={} lines={} bytes={}",
+                    reader_session,
+                    kind,
+                    line.len(),
+                    reader_lines_bg.load(std::sync::atomic::Ordering::Relaxed),
+                    reader_bytes_bg.load(std::sync::atomic::Ordering::Relaxed)
+                ));
+                last_probe = Instant::now();
+            }
             buf = String::with_capacity(64 * 1024);
-            if frame_tx.send(line).is_err() { return; }
+            if frame_tx.send(line).is_err() {
+                freeze_log("client-reader", &format!("frame channel closed session={}", reader_session));
+                return;
+            }
         }
     });
 
@@ -1439,7 +1487,53 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Cache the last-sent DECSCUSR code so we only write it when it
     // actually changes (avoids resetting WT's blink timer every frame).
     let mut last_cursor_style: u8 = 255;
+    let mut freeze_loop_iter: u64 = 0;
+    let mut freeze_events_seen: u64 = 0;
+    let mut freeze_frames_seen: u64 = 0;
+    let mut freeze_nc_seen: u64 = 0;
+    let mut freeze_cmds_sent: u64 = 0;
+    let mut freeze_dumps_sent: u64 = 0;
+    let mut freeze_draws_ok: u64 = 0;
+    let mut freeze_idle_skips: u64 = 0;
+    let mut freeze_same_frame_skips: u64 = 0;
+    let mut freeze_dump_timeouts: u64 = 0;
+    let mut freeze_last_heartbeat = Instant::now();
+    let mut freeze_last_frame_at = Instant::now();
+    let mut freeze_last_draw_at = Instant::now();
+    let mut freeze_last_input_at = Instant::now();
+    let mut freeze_last_cmd_at = Instant::now();
+    let mut freeze_last_dump_at = Instant::now();
+    let mut freeze_last_draw_probe = Instant::now();
     loop {
+        freeze_loop_iter += 1;
+        if freeze_last_heartbeat.elapsed() >= Duration::from_secs(2) {
+            freeze_log("client-heartbeat", &format!(
+                "session={} iter={} events={} frames={} nc={} cmds={} dumps={} draws={} idle_skips={} same_skips={} dump_timeouts={} dump_in_flight={} force_dump={} since_frame_ms={} since_draw_ms={} since_input_ms={} since_cmd_ms={} since_dump_ms={} reader_lines={} reader_bytes={} reader_timeouts={} reader_errors={}",
+                name,
+                freeze_loop_iter,
+                freeze_events_seen,
+                freeze_frames_seen,
+                freeze_nc_seen,
+                freeze_cmds_sent,
+                freeze_dumps_sent,
+                freeze_draws_ok,
+                freeze_idle_skips,
+                freeze_same_frame_skips,
+                freeze_dump_timeouts,
+                dump_in_flight,
+                force_dump,
+                freeze_last_frame_at.elapsed().as_millis(),
+                freeze_last_draw_at.elapsed().as_millis(),
+                freeze_last_input_at.elapsed().as_millis(),
+                freeze_last_cmd_at.elapsed().as_millis(),
+                freeze_last_dump_at.elapsed().as_millis(),
+                reader_lines.load(std::sync::atomic::Ordering::Relaxed),
+                reader_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                reader_timeouts.load(std::sync::atomic::Ordering::Relaxed),
+                reader_errors.load(std::sync::atomic::Ordering::Relaxed)
+            ));
+            freeze_last_heartbeat = Instant::now();
+        }
         // Expire stale key_send_instant after 30ms — ConPTY echo should
         // have arrived by then; stop force-dumping to save CPU.
         if let Some(ks) = key_send_instant {
@@ -1448,6 +1542,12 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // Safety valve: if dump_in_flight is stuck for >500ms (e.g. server
         // did not respond), release it so the client doesn't spin at 1ms.
         if dump_in_flight && dump_flight_start.elapsed().as_millis() > 500 {
+            freeze_dump_timeouts += 1;
+            freeze_log("client-dump", &format!(
+                "dump_in_flight timeout session={} elapsed_ms={}",
+                name,
+                dump_flight_start.elapsed().as_millis()
+            ));
             dump_in_flight = false;
         }
         // ── STEP 0: Receive latest frame from reader thread (non-blocking) ──
@@ -1458,6 +1558,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             match frame_rx.try_recv() {
                 Ok(line) => {
                     if line.trim() == "NC" {
+                        freeze_nc_seen += 1;
                         _nc_count += 1;
                         // Server says nothing changed — release dump_in_flight
                         // without touching dump_buf (saves 50-100KB clone + parse).
@@ -1473,6 +1574,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // Server is telling us to switch to another session
                         let target_session = line.trim().strip_prefix("SWITCH ").unwrap_or("").to_string();
                         if !target_session.is_empty() {
+                            freeze_log("client-switch", &format!("server directive SWITCH {} from session={}", target_session, name));
                             env::set_var("PSMUX_SWITCH_TO", &target_session);
                             let _ = writer.write_all(b"client-detach\n");
                             let _ = writer.flush();
@@ -1487,6 +1589,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         if client_log_enabled() {
                             client_log("frame", &format!("received {} bytes", line.len()));
                         }
+                        freeze_frames_seen += 1;
+                        freeze_last_frame_at = Instant::now();
                         dump_buf = line; got_frame = true; dump_in_flight = false;
                     }
                 }
@@ -1658,6 +1762,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         {
             let mut _pending_evt = input.read_timeout(Duration::from_millis(poll_ms))?;
             while let Some(_cur_evt) = _pending_evt {
+                freeze_events_seen += 1;
+                freeze_last_input_at = Instant::now();
                 // Input debug: log every raw event BEFORE filtering
                 if input_log_enabled() {
                     match &_cur_evt {
@@ -2045,7 +2151,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             rsel_end = None;
                             selection_changed = true;
                         }
-                        else if is_prefix { prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into()); }
+                        else if is_prefix {
+                            freeze_log("client-prefix", &format!("prefix armed session={} key={:?} mods={:?}", name, key.code, key.modifiers));
+                            prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into());
+                        }
                         // Check root-table bindings (bind-key -n / bind-key -T root)
                         // These fire without prefix, before keys are forwarded to PTY
                         else if !command_input && !renaming && !pane_renaming && !tree_chooser && !buffer_chooser && !session_chooser && !keys_viewer && confirm_cmd.is_none() && {
@@ -2217,6 +2326,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             // Dispatch pending flags for complex client-side UI commands.
                             // These are shared between synced_bindings dispatch and pre-sync fallback.
                             if do_choose_tree {
+                                freeze_log("client-chooser", &format!("choose-tree open session={}", name));
                                 tree_chooser = true;
                                 tree_entries.clear();
                                 tree_selected = 0;
@@ -2306,6 +2416,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                             }
                             if do_choose_session {
+                                freeze_log("client-chooser", &format!("choose-session open session={}", name));
                                 session_chooser = true;
                                 session_entries.clear();
                                 session_selected = 0;
@@ -2438,6 +2549,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             (cur_pos + names.len() - 1) % names.len()
                                         };
                                         let next_name = names[next_pos].clone();
+                                        freeze_log("client-switch", &format!("prefix switch-client session={} -> {}", name, next_name));
                                         cmd_batch.push("client-detach\n".into());
                                         env::set_var("PSMUX_SWITCH_TO", &next_name);
                                         quit = true;
@@ -2490,6 +2602,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     if let Some(idx) = target_idx {
                                         if let Some((sname, _)) = session_entries.get(idx) {
                                             if sname != &current_session {
+                                                freeze_log("client-switch", &format!("choose-session switch session={} -> {}", name, sname));
                                                 cmd_batch.push("client-detach\n".into());
                                                 env::set_var("PSMUX_SWITCH_TO", sname);
                                                 quit = true;
@@ -2591,6 +2704,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             if *wid == usize::MAX {
                                                 // Session header — switch to that session
                                                 if *sess_name != current_session {
+                                                    freeze_log("client-switch", &format!("choose-tree session-header switch session={} -> {}", name, sess_name));
                                                     cmd_batch.push("client-detach\n".into());
                                                     env::set_var("PSMUX_SWITCH_TO", sess_name);
                                                     quit = true;
@@ -2599,6 +2713,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 tree_num_buffer.clear();
                                             } else if *sess_name != current_session {
                                                 // Window/pane in another session — switch to that session
+                                                freeze_log("client-switch", &format!("choose-tree entry switch session={} -> {} win={} pane={}", name, sess_name, wid, pid));
                                                 cmd_batch.push("client-detach\n".into());
                                                 env::set_var("PSMUX_SWITCH_TO", sess_name);
                                                 quit = true;
@@ -3690,6 +3805,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
         if sent_keys_this_iter {
+            freeze_cmds_sent += cmd_batch.len() as u64;
+            freeze_last_cmd_at = Instant::now();
             if input_log_enabled() {
                 for cmd in &cmd_batch {
                     input_log("send", &format!("→ {}", cmd.trim()));
@@ -3727,6 +3844,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         if should_dump && !dump_in_flight {
             if writer.write_all(b"dump-state\n").is_err() { break; }
             if writer.flush().is_err() { break; }
+            freeze_dumps_sent += 1;
+            freeze_last_dump_at = Instant::now();
             dump_in_flight = true;
             dump_flight_start = Instant::now();
         }
@@ -3735,12 +3854,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // Also render if selection changed (for highlight overlay) even without new frame
         // Always render when overlays are active (command prompt, rename, choosers)
         if !got_frame && !selection_changed && !overlays_active {
+            freeze_idle_skips += 1;
             continue;
         }
 
         // Skip parse + render when the raw JSON is identical to the previous
         // frame AND selection hasn't changed AND no overlays are active.
         if dump_buf == prev_dump_buf && !selection_changed && !overlays_active {
+            freeze_same_frame_skips += 1;
             last_dump_time = Instant::now();
             continue;
         }
@@ -3999,6 +4120,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             let sz = terminal.size().unwrap_or_default();
             client_log("draw", &format!("pre-draw terminal_size={}x{}", sz.width, sz.height));
         }
+        let freeze_draw_probe_due = freeze_last_draw_probe.elapsed() >= Duration::from_secs(2);
+        if freeze_draw_probe_due {
+            let sz = terminal.size().unwrap_or_default();
+            freeze_log("client-draw", &format!(
+                "draw-start session={} got_frame={} frame_len={} prev_len={} overlays={} terminal={}x{}",
+                name,
+                got_frame,
+                frame_to_parse.len(),
+                prev_dump_buf.len(),
+                overlays_active,
+                sz.width,
+                sz.height
+            ));
+        }
+        let freeze_draw_start = Instant::now();
         terminal.draw(|f| {
             let area = f.area();
             let constraints = if status_at_top {
@@ -5144,6 +5280,20 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
 
         })?;
+        let freeze_draw_elapsed = freeze_draw_start.elapsed();
+        freeze_draws_ok += 1;
+        freeze_last_draw_at = Instant::now();
+        if freeze_draw_probe_due || freeze_draw_elapsed >= Duration::from_millis(50) {
+            freeze_log("client-draw", &format!(
+                "draw-ok session={} elapsed_ms={} draws={} got_frame={} frame_len={}",
+                name,
+                freeze_draw_elapsed.as_millis(),
+                freeze_draws_ok,
+                got_frame,
+                frame_to_parse.len()
+            ));
+            freeze_last_draw_probe = Instant::now();
+        }
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
                 _t_parse.elapsed().as_micros().saturating_sub(_parse_us as u128),
@@ -5347,6 +5497,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     }
 
     // Clean disconnect on persistent connection
+    freeze_log("client-exit", &format!(
+        "session={} quit={} iter={} events={} frames={} nc={} cmds={} dumps={} draws={}",
+        name,
+        quit,
+        freeze_loop_iter,
+        freeze_events_seen,
+        freeze_frames_seen,
+        freeze_nc_seen,
+        freeze_cmds_sent,
+        freeze_dumps_sent,
+        freeze_draws_ok
+    ));
     let _ = writer.write_all(b"client-detach\n");
     let _ = writer.flush();
     // detach-client -P parity (issue #275): kill the parent shell so the host

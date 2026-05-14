@@ -12,6 +12,7 @@
 //! | `PSMUX_STYLE_DEBUG=1`  | `~/.psmux/style_debug.log`        | Style/theme parsing, inline styles   |/// | `PSMUX_INPUT_DEBUG=1`  | `~/.psmux/input_debug.log`        | Every crossterm event + console mode |//! | `PSMUX_MOUSE_DEBUG=1`  | `~/.psmux/mouse_debug.log`        | Mouse injection (existing)           |
 //! | `PSMUX_SSH_DEBUG=1`    | `~/.psmux/ssh_input.log`          | SSH input handling (existing)        |
 //! | `PSMUX_LATENCY_LOG=1`  | `~/.psmux/latency.log`            | Keypress-to-render latency (existing)|
+//! | `PSMUX_FREEZE_DIAG=0`  | `~/.psmux/freeze_diag_<pid>.log`  | Attach/render/input liveness probes  |
 //!
 //! All loggers are:
 //! - **Off by default** — zero overhead when disabled (one atomic load per call)
@@ -45,9 +46,27 @@ fn open_log(filename: &str) -> Option<std::fs::File> {
         .ok()
 }
 
+/// Open an append-only log file in the psmux data directory.
+/// Used by freeze diagnostics so short-lived CLI/server/client processes do
+/// not truncate each other's evidence.
+fn open_log_append(filename: &str) -> Option<std::fs::File> {
+    let dir = psmux_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}/{}", dir, filename))
+        .ok()
+}
+
 /// Check if an env var is set to a truthy value ("1" or "true").
 fn env_enabled(var: &str) -> bool {
     std::env::var(var).map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Check if an env var is explicitly disabled ("0" or "false").
+fn env_disabled(var: &str) -> bool {
+    std::env::var(var).map_or(false, |v| v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
 // ─── Client debug log ───────────────────────────────────────────────────────
@@ -219,4 +238,48 @@ pub fn server_log(component: &str, msg: &str) {
 /// Returns `true` if server debug logging is active.
 pub fn server_log_enabled() -> bool {
     SERVER_LOG.lock().ok().map_or(false, |g| g.is_some())
+}
+
+// ─── Freeze diagnostics log ────────────────────────────────────────────────
+
+/// Always-on liveness diagnostics for the intermittent client freeze being
+/// investigated in the local fork. Set `PSMUX_FREEZE_DIAG=0` to disable.
+/// Each process writes to its own append-only file to avoid cross-process
+/// truncation/races.
+static FREEZE_LOG: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| {
+    if env_disabled("PSMUX_FREEZE_DIAG") { return Mutex::new(None); }
+    let filename = format!("freeze_diag_{}.log", std::process::id());
+    Mutex::new(open_log_append(&filename))
+});
+
+static FREEZE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const FREEZE_LOG_CAP: u32 = 100_000;
+
+/// Log a freeze diagnostic message. This is intentionally available by default
+/// in the instrumented fork and capped per process to prevent unbounded growth.
+pub fn freeze_log(component: &str, msg: &str) {
+    let n = FREEZE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= FREEZE_LOG_CAP {
+        if n == FREEZE_LOG_CAP {
+            if let Ok(mut guard) = FREEZE_LOG.lock() {
+                if let Some(ref mut f) = *guard {
+                    let _ = writeln!(f, "[{}][pid={}][log] --- freeze diag cap reached ({} entries), further logging suppressed ---",
+                        chrono::Local::now().format("%H:%M:%S%.3f"), std::process::id(), FREEZE_LOG_CAP);
+                    let _ = f.flush();
+                }
+            }
+        }
+        return;
+    }
+    if let Ok(mut guard) = FREEZE_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "[{}][pid={}][{:?}][{}] {}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                std::process::id(),
+                std::thread::current().id(),
+                component,
+                msg.replace('\n', "\\n"));
+            let _ = f.flush();
+        }
+    }
 }

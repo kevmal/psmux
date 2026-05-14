@@ -3160,10 +3160,14 @@ fn run_main() -> io::Result<()> {
 
     // Loop to handle session switching without spawning new processes
     let result = loop {
+        if let Ok(session_name) = env::var("PSMUX_SESSION_NAME") {
+            crate::debug_log::freeze_log("main-attach-loop", &format!("enter run_remote session={}", session_name));
+        }
         let result = run_remote(&mut terminal, &input);
         
         // Check if we should switch to another session
         if let Ok(switch_to) = env::var("PSMUX_SWITCH_TO") {
+            crate::debug_log::freeze_log("main-attach-loop", &format!("switch requested -> {}", switch_to));
             env::remove_var("PSMUX_SWITCH_TO");
             env::set_var("PSMUX_SESSION_NAME", &switch_to);
             // Update last_session file
