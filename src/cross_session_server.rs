@@ -275,6 +275,7 @@ pub fn handle_pane_forward_inject(
         proxy_pane.cursor_shape.clone(),
         proxy_pane.bell_pending.clone(),
         proxy_pane.cpr_pending.clone(),
+        false,
         proxy_pane.output_ring.clone(),
     );
     // Graft into the target window tree
