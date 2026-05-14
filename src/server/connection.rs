@@ -267,40 +267,45 @@ if line.trim() == "PERSISTENT" {
     let directive_rx = crate::types::register_directive_channel(client_id);
 
     std::thread::spawn(move || {
-        loop {
+        'writer_loop: loop {
             // 0. Check for queued directives (non-blocking) — these take priority
             while let Ok(directive) = directive_rx.try_recv() {
-                if write!(ws_bg, "{}\n", directive).is_err() { return; }
-                if ws_bg.flush().is_err() { return; }
+                if write!(ws_bg, "{}\n", directive).is_err() { break 'writer_loop; }
+                if ws_bg.flush().is_err() { break 'writer_loop; }
             }
             // 1. Drain all pending command responses (non-blocking after first)
             match resp_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(rrx) => {
                     if let Ok(text) = rrx.recv() {
-                        if write!(ws_bg, "{}\n", text).is_err() { break; }
-                        if ws_bg.flush().is_err() { break; }
+                        if write!(ws_bg, "{}\n", text).is_err() { break 'writer_loop; }
+                        if ws_bg.flush().is_err() { break 'writer_loop; }
                     }
                     while let Ok(rrx) = resp_rx.try_recv() {
                         if let Ok(text) = rrx.recv() {
-                            if write!(ws_bg, "{}\n", text).is_err() { return; }
-                            if ws_bg.flush().is_err() { return; }
+                            if write!(ws_bg, "{}\n", text).is_err() { break 'writer_loop; }
+                            if ws_bg.flush().is_err() { break 'writer_loop; }
                         }
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break 'writer_loop,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             // 2. Drain all queued frames from the bounded channel
             if let Ok(frame_rx) = frame_chan.rx.lock() {
                 while let Ok(text) = frame_rx.try_recv() {
-                    if write!(ws_bg, "{}\n", text).is_err() { return; }
-                    if ws_bg.flush().is_err() { return; }
+                    if write!(ws_bg, "{}\n", text).is_err() { break 'writer_loop; }
+                    if ws_bg.flush().is_err() { break 'writer_loop; }
                 }
             } else {
-                return;
+                break 'writer_loop;
             }
         }
+        // Tear down the persistent client's stream on every writer exit path
+        // (not just normal disconnect). A writer that returned early used to
+        // leave the client registered with a dead stream, wedging input.
+        // (functional half of 80a5fd5)
+        crate::types::shutdown_client_stream(client_id);
     });
     resp_tx_opt = Some(resp_tx);
     line.clear();
@@ -2832,6 +2837,12 @@ match cmd {
         Ok(_) => {} // Continue processing
     }
 } // end command loop
+if persistent {
+    // Mirror the writer-thread cleanup: when the persistent command loop
+    // exits, drop the client's stream so a half-open client cannot wedge
+    // input for the session. (functional half of 80a5fd5)
+    crate::types::shutdown_client_stream(client_id);
+}
 }
 
 /// Dispatch a command from a control mode client.
