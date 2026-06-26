@@ -1679,7 +1679,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             for key in parts.iter() {
                                 let key_upper = key.to_uppercase();
                                 let normalized = match key_upper.as_str() {
-                                    "ENTER" => "enter",
+                                    "ENTER" | "RETURN" | "CR" => "enter",
                                     "TAB" => "tab",
                                     "BTAB" | "BACKTAB" => "btab",
                                     "ESCAPE" | "ESC" => "esc",
@@ -1713,15 +1713,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let parts: Vec<&str> = keys.split_whitespace().collect();
                         for (i, key) in parts.iter().enumerate() {
                             let key_upper = key.to_uppercase();
-                            let _is_special = matches!(key_upper.as_str(), 
-                                "ENTER" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
+                            let _is_special = matches!(key_upper.as_str(),
+                                "ENTER" | "RETURN" | "CR" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                 "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
                                 "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
                                 "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
                             ) || key_upper.starts_with("C-") || key_upper.starts_with("M-") || key_upper.starts_with("S-");
                             
                             match key_upper.as_str() {
-                                "ENTER" => send_text_to_active(&mut app, "\r")?,
+                                "ENTER" | "RETURN" | "CR" => send_text_to_active(&mut app, "\r")?,
                                 "TAB" => send_text_to_active(&mut app, "\t")?,
                                 "BTAB" | "BACKTAB" => send_text_to_active(&mut app, "\x1b[Z")?,
                                 "ESCAPE" | "ESC" => send_text_to_active(&mut app, "\x1b")?,
@@ -1796,7 +1796,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     if i + 1 < parts.len() {
                                         let next_upper = parts[i + 1].to_uppercase();
                                         let next_is_special = matches!(next_upper.as_str(),
-                                            "ENTER" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
+                                            "ENTER" | "RETURN" | "CR" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                             "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
                                             "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
                                             "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"

@@ -2902,7 +2902,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     if matches!(app.mode, Mode::PopupMode { .. }) {
         // Map named keys to VT sequences for the popup PTY
         let seq = match k {
-            "enter" => Some("\r"),
+            "enter" | "return" | "cr" => Some("\r"),
             "esc" | "escape" => {
                 app.mode = Mode::Passthrough;
                 return Ok(());
@@ -3091,7 +3091,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
         match k {
-            "enter" => { let _ = write!(p.writer, "\r"); }
+            "enter" | "return" | "cr" => { let _ = write!(p.writer, "\r"); }
             "tab" => { let _ = write!(p.writer, "\t"); }
             "btab" | "backtab" => { let _ = write!(p.writer, "\x1b[Z"); }
             "backspace" => { let _ = p.writer.write_all(&[0x7F]); }
