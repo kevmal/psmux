@@ -16,16 +16,24 @@ use winapi::um::wincon::COORD;
 fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
-    use winapi::shared::minwindef::TRUE;
+    use winapi::shared::minwindef::FALSE;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
     use winapi::um::namedpipeapi::CreatePipe;
     use winapi::um::winnt::HANDLE;
 
+    // Non-inheritable. ConPTY hands stdio to the child via the
+    // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute (with bInheritHandles=FALSE
+    // in spawn_command), and CreatePseudoConsole duplicates these handles
+    // internally, so they never need to be inheritable. Marking them inheritable
+    // only lets concurrent bInheritHandles=TRUE helper spawns in the server
+    // process (run-shell, #() format, if-shell, clipboard pipes) inherit a
+    // duplicate of a pane's conin handle, breaking the child shell's sole
+    // ownership of console input and crashing it with "The handle is invalid".
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
-        bInheritHandle: TRUE as _,
+        bInheritHandle: FALSE as _,
     };
     let mut read: HANDLE = INVALID_HANDLE_VALUE;
     let mut write: HANDLE = INVALID_HANDLE_VALUE;
