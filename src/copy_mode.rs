@@ -649,6 +649,25 @@ pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
     Ok(())
 }
 
+/// The text a cell contributes to a plain / `-e` capture.
+///
+/// An empty (cleared) cell is drawn on screen as a single space by the renderer
+/// (see `rendering.rs`: a cell whose contents have display width 0 — which
+/// includes the empty string — is drawn as `" "`). A TUI that positions text
+/// with cursor moves (e.g. Claude Code) can leave the gaps between words as
+/// *cleared* cells rather than literal spaces; `cell.contents()` is `""` for
+/// those, so capturing it verbatim collapses the words together. Emit a space
+/// for such cells to match what's actually on screen. Wide-char continuation
+/// cells contribute nothing (the wide char before them already produced text).
+fn cell_capture_str(cell: &vt100::Cell) -> &str {
+    let t = cell.contents();
+    if t.is_empty() {
+        if cell.is_wide_continuation() { "" } else { " " }
+    } else {
+        t
+    }
+}
+
 pub fn capture_active_pane(app: &mut AppState) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(()) };
@@ -657,7 +676,7 @@ pub fn capture_active_pane(app: &mut AppState) -> io::Result<()> {
     let mut text = String::new();
     for r in 0..p.last_rows {
         let mut row = String::new();
-        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(cell_capture_str(cell)); } else { row.push(' '); } }
         text.push_str(row.trim_end());
         text.push('\n');
     }
@@ -674,7 +693,7 @@ pub fn capture_active_pane_text(app: &mut AppState) -> io::Result<Option<String>
     let mut text = String::new();
     for r in 0..p.last_rows {
         let mut row = String::new();
-        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+        for c in 0..p.last_cols { if let Some(cell) = screen.cell(r, c) { row.push_str(cell_capture_str(cell)); } else { row.push(' '); } }
         text.push_str(row.trim_end());
         text.push('\n');
     }
@@ -963,7 +982,7 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
         let mut text = String::new();
         for r in start..=end {
             let mut row = String::new();
-            for c in 0..cols { if let Some(cell) = screen.cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); } }
+            for c in 0..cols { if let Some(cell) = screen.cell(r, c) { row.push_str(cell_capture_str(cell)); } else { row.push(' '); } }
             text.push_str(row.trim_end());
             text.push('\n');
         }
@@ -1019,7 +1038,7 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
             let r = (aline + actual_sb) as u16;
             let mut row = String::new();
             for c in 0..cols {
-                if let Some(cell) = parser.screen().cell(r, c) { row.push_str(&cell.contents().to_string()); } else { row.push(' '); }
+                if let Some(cell) = parser.screen().cell(r, c) { row.push_str(cell_capture_str(cell)); } else { row.push(' '); }
             }
             text.push_str(row.trim_end());
             text.push('\n');
@@ -1131,7 +1150,7 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
                     None
                 };
                 row_sgr.push(sgr);
-                row_chars.push(cell.contents().to_string());
+                row_chars.push(cell_capture_str(cell).to_string());
             } else {
                 row_sgr.push(None);
                 row_chars.push(" ".to_string());
