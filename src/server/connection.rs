@@ -2628,18 +2628,11 @@ match cmd {
 
             let port_file_base = name.clone();
 
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
-
-            // Check if session already exists
-            let already_exists = if std::path::Path::new(&port_path).exists() {
-                if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-                        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok()
-                    } else { false }
-                } else { false }
-            } else { false };
+            // Check if session already exists (verified liveness: probe
+            // retries + PID fallback, not a single 100ms connect)
+            let port_path = crate::registry::port_path(&port_file_base);
+            let already_exists = crate::registry::registration_liveness(&port_file_base)
+                == crate::registry::Liveness::Alive;
 
             if already_exists {
                 if persistent {

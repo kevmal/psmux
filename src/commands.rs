@@ -2037,24 +2037,28 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 name.clone()
             };
 
-            // Check if session already exists
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
-            if std::path::Path::new(&port_path).exists() {
-                if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            std::time::Duration::from_millis(100),
-                        ).is_ok() {
-                            app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
-                            return Ok(());
-                        }
-                    }
+            // Unit tests drive this handler through execute_command_string
+            // with a mock AppState but the REAL user registry (`cargo test`
+            // does not sandbox USERPROFILE).  Without this dry-run guard the
+            // test suite claims the developer's live __warm__ server and
+            // spawns real detached servers (observed: a test run littered
+            // the live registry with compat2/detached_sess/... sessions).
+            if cfg!(test) {
+                app.status_message = Some((format!("created session '{}'", name), Instant::now(), None));
+                return Ok(());
+            }
+
+            // Check if session already exists.  Verified liveness (probe
+            // retries + PID fallback) so a busy server is not mistaken for
+            // dead and stripped of its registration.
+            let port_path = crate::registry::port_path(&port_file_base);
+            match crate::registry::registration_liveness(&port_file_base) {
+                crate::registry::Liveness::Alive => {
+                    app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
+                    return Ok(());
                 }
-                // Stale port file, remove it
-                let _ = std::fs::remove_file(&port_path);
+                crate::registry::Liveness::Dead => crate::registry::remove_registration(&port_file_base),
+                crate::registry::Liveness::Missing => {}
             }
 
             // Try to claim a warm server first (fast path)
@@ -2066,15 +2070,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
-                if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
+                match crate::registry::registration_liveness(&warm_base) {
+                    crate::registry::Liveness::Alive => {
+                        if let Some(warm_port) = crate::registry::read_port(&warm_base) {
                             let warm_addr = format!("127.0.0.1:{}", warm_port);
-                            if std::net::TcpStream::connect_timeout(
-                                &warm_addr.parse().unwrap(),
-                                std::time::Duration::from_millis(100),
-                            ).is_ok() {
                                 let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
                                 if !warm_key.is_empty() {
                                     let claim_cmd = format!("claim-session {}\n", crate::util::quote_arg(&name));
@@ -2105,10 +2104,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                                         _ => false,
                                     }
                                 } else { false }
-                            } else { false }
                         } else { false }
-                    } else { false }
-                } else { false }
+                    }
+                    crate::registry::Liveness::Dead => {
+                        crate::registry::remove_registration(&warm_base);
+                        false
+                    }
+                    crate::registry::Liveness::Missing => false,
+                }
             } else { false };
 
             if !claimed_warm {

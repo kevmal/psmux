@@ -134,7 +134,7 @@ pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
         None => return Ok(()),
     };
     let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    if let Ok(mut s) = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)) {
+    if let Ok(mut s) = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(250)) {
         let _ = s.set_nodelay(true);
         let _ = write!(s, "AUTH {}\n", key);
         let _ = std::io::Write::write_all(&mut s, cmd);
@@ -366,7 +366,10 @@ pub fn send_control(line: String) -> io::Result<()> {
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))?;
+    // 500ms: a dead port refuses instantly on loopback, so the timeout only
+    // bites for live-but-stalled servers — where 100ms caused false "server
+    // gone" errors under load (and destructive cleanup in some callers).
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let _ = write!(stream, "AUTH {}\n", session_key);

@@ -27,6 +27,7 @@ mod client;
 mod ssh_input;
 mod debug_log;
 mod control;
+mod registry;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
@@ -753,22 +754,15 @@ fn run_main() -> io::Result<()> {
                     Some(positional_args.join(" "))
                 };
                 
-                // Check if session already exists AND is actually running
+                // Check if session already exists AND is actually running.
+                // The liveness verdict retries the TCP probe and falls back
+                // to a PID check — a live server that is merely slow to
+                // answer must NOT lose its registration here (that is how
+                // zombie sessions were born).
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
-                if std::path::Path::new(&port_path).exists() {
-                    // Verify server is actually running
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    
-                    if server_alive {
+                match crate::registry::registration_liveness(&port_file_base) {
+                    crate::registry::Liveness::Alive => {
                         if attach_if_exists {
                             // -A flag: attach to existing session instead of erroring
                             env::set_var("PSMUX_SESSION_NAME", &port_file_base);
@@ -779,10 +773,11 @@ fn run_main() -> io::Result<()> {
                             eprintln!("duplicate session: {}", name);
                             std::process::exit(1);
                         }
-                    } else {
-                        // Stale port file - remove it and continue
-                        let _ = std::fs::remove_file(&port_path);
                     }
+                    crate::registry::Liveness::Dead => {
+                        crate::registry::remove_registration(&port_file_base);
+                    }
+                    crate::registry::Liveness::Missing => {}
                 }
                 
                 // If -A attached to an existing session, skip server creation
@@ -805,17 +800,12 @@ fn run_main() -> io::Result<()> {
                     } else {
                         "__warm__".to_string()
                     };
-                    let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
-                    if std::path::Path::new(&warm_port_path).exists() {
-                        if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
-                            if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
+                    match crate::registry::registration_liveness(&warm_base) {
+                        crate::registry::Liveness::Alive => {
+                            if let Some(warm_port) = crate::registry::read_port(&warm_base) {
                                 let warm_addr = format!("127.0.0.1:{}", warm_port);
-                                if std::net::TcpStream::connect_timeout(
-                                    &warm_addr.parse().unwrap(),
-                                    Duration::from_millis(100),
-                                ).is_ok() {
-                                    let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
-                                    if !warm_key.is_empty() {
+                                let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
+                                if !warm_key.is_empty() {
                                         let client_cwd = std::env::current_dir()
                                             .ok()
                                             .and_then(|p| p.to_str().map(|s| s.to_string()));
@@ -850,14 +840,15 @@ fn run_main() -> io::Result<()> {
                                             }
                                             _ => false,
                                         }
-                                    } else { false }
-                                } else {
-                                    let _ = std::fs::remove_file(&warm_port_path);
-                                    false
-                                }
+                                } else { false }
                             } else { false }
-                        } else { false }
-                    } else { false }
+                        }
+                        crate::registry::Liveness::Dead => {
+                            crate::registry::remove_registration(&warm_base);
+                            false
+                        }
+                        crate::registry::Liveness::Missing => false,
+                    }
                 } else { false };
 
                 if !claimed_warm {
@@ -966,17 +957,11 @@ fn run_main() -> io::Result<()> {
                     std::process::exit(1);
                 }
                 {
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    if !server_alive {
-                        let _ = std::fs::remove_file(&port_path);
+                    // Full liveness check (probe retries + PID fallback): a
+                    // freshly spawned server that is slow to accept must not
+                    // be declared dead and have its registration scrubbed.
+                    if crate::registry::registration_liveness(&port_file_base) != crate::registry::Liveness::Alive {
+                        crate::registry::remove_registration(&port_file_base);
                         eprintln!("psmux: session '{}' exited immediately (check shell command)", name);
                         std::process::exit(1);
                     }
@@ -1500,10 +1485,12 @@ fn run_main() -> io::Result<()> {
                 }
                 // Try to send kill command to server
                 if send_control("kill-session\n".to_string()).is_err() {
-                    // Server not responding - clean up stale port file
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
-                    let _ = std::fs::remove_file(&port_path);
+                    // Server not responding — only scrub the registration
+                    // once the server is confirmed dead (probe retries +
+                    // PID check).  A live-but-busy server keeps its name.
+                    if crate::registry::registration_liveness(&session_name) == crate::registry::Liveness::Dead {
+                        crate::registry::remove_registration(&session_name);
+                    }
                 }
                 return Ok(());
             }
@@ -2814,29 +2801,18 @@ fn run_main() -> io::Result<()> {
                 // Pre-spawn a warm __warm__ server so the next new-session is
                 // instant.  Also triggers Windows Defender's scan cache on the
                 // binary, eliminating the ~200-400ms first-run penalty.
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let warm_base = if let Some(ref l) = l_socket_name {
                     format!("{}____warm__", l)
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
-                // Check if warm server is already running
-                let already_running = if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            std::net::TcpStream::connect_timeout(
-                                &format!("127.0.0.1:{}", port).parse().unwrap(),
-                                Duration::from_millis(100),
-                            ).is_ok()
-                        } else { false }
-                    } else { false }
-                } else { false };
-                if already_running {
-                    return Ok(());
+                // Check if warm server is already running (verified liveness,
+                // not a single short connect — see registry module docs).
+                match crate::registry::registration_liveness(&warm_base) {
+                    crate::registry::Liveness::Alive => return Ok(()),
+                    crate::registry::Liveness::Dead => crate::registry::remove_registration(&warm_base),
+                    crate::registry::Liveness::Missing => {}
                 }
-                // Clean up stale port file if any
-                let _ = std::fs::remove_file(&warm_port_path);
                 // Spawn the warm server
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
