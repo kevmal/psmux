@@ -1553,10 +1553,8 @@ match cmd {
         } else {
             parts.join(" ")
         };
-        // Pass target pane index for PANE_POS_OVERRIDE (#113).
-        let target_pane_idx: Option<usize> = if !pane_is_id { target_pane } else { None };
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_stdout, duration_ms));
+        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, pane_is_id, !print_stdout, duration_ms));
         if let Ok(text) = rrx.recv() {
             if print_stdout {
                 if persistent {
@@ -2507,7 +2505,7 @@ match cmd {
             let false_cmd = positional.get(2).copied();
             let success = if format_mode {
                 let (rtx, rrx) = std::sync::mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, None));
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, false, None));
                 let expanded = rrx.recv().unwrap_or_default();
                 !expanded.is_empty() && expanded != "0"
             } else if condition == "true" || condition == "1" {
@@ -2540,7 +2538,7 @@ match cmd {
         let fmt = extract_flag_value(&args, "-F");
         if let Some(fmt_str) = fmt {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str, None, false, None));
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str, None, false, false, None));
             if let Ok(text) = rrx.recv() {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-sessions".to_string(), text));
@@ -2749,9 +2747,12 @@ match cmd {
     "resize-window" | "resizew" => {
         let abs_x = args.windows(2).find(|w| w[0] == "-x").and_then(|w| w[1].parse::<u16>().ok());
         let abs_y = args.windows(2).find(|w| w[0] == "-y").and_then(|w| w[1].parse::<u16>().ok());
+        // Send BOTH dimensions when both are given (`resize-window -x W -y H`) — the old
+        // else-if silently dropped -y whenever -x parsed.
         if let Some(xv) = abs_x {
             let _ = tx.send(CtrlReq::ResizeWindow("x".to_string(), xv));
-        } else if let Some(yv) = abs_y {
+        }
+        if let Some(yv) = abs_y {
             let _ = tx.send(CtrlReq::ResizeWindow("y".to_string(), yv));
         }
     }
@@ -2901,9 +2902,8 @@ fn dispatch_control_command(
             } else {
                 raw_fmt
             };
-            let target_pane_idx = if pane_is_id { None } else { target_pane };
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, pane_is_id, !print_mode, None));
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }

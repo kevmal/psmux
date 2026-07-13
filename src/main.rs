@@ -552,10 +552,22 @@ fn run_main() -> io::Result<()> {
                                                     println!("{}", display_name); 
                                                 }
                                             } else {
-                                                // stale port file - remove it along with matching key
-                                                let _ = std::fs::remove_file(e.path());
-                                                let key_path = e.path().with_extension("key");
-                                                let _ = std::fs::remove_file(&key_path);
+                                                match crate::registry::registration_liveness(base) {
+                                                    crate::registry::Liveness::Alive => {
+                                                        crate::registry::log_registry_event(
+                                                            "list_sessions_keep_unresponsive",
+                                                            &format!("base={} path={}", base, e.path().display()),
+                                                        );
+                                                    }
+                                                    crate::registry::Liveness::Dead => {
+                                                        crate::registry::log_registry_event(
+                                                            "list_sessions_remove_dead",
+                                                            &format!("base={} path={}", base, e.path().display()),
+                                                        );
+                                                        crate::registry::remove_registration(base);
+                                                    }
+                                                    crate::registry::Liveness::Missing => {}
+                                                }
                                             }
                                         }
                                     }
@@ -1553,8 +1565,23 @@ fn run_main() -> io::Result<()> {
                             // Fallback: connection succeeded so session likely exists
                             std::process::exit(0);
                         } else {
-                            // Stale port file - clean it up
-                            let _ = std::fs::remove_file(&path);
+                            match crate::registry::registration_liveness(&target) {
+                                crate::registry::Liveness::Alive => {
+                                    crate::registry::log_registry_event(
+                                        "has_session_alive_by_registry",
+                                        &format!("base={} path={}", target, path),
+                                    );
+                                    std::process::exit(0);
+                                }
+                                crate::registry::Liveness::Dead => {
+                                    crate::registry::log_registry_event(
+                                        "has_session_remove_dead",
+                                        &format!("base={} path={}", target, path),
+                                    );
+                                    crate::registry::remove_registration(&target);
+                                }
+                                crate::registry::Liveness::Missing => {}
+                            }
                         }
                     }
                 }

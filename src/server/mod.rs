@@ -44,6 +44,25 @@ use crate::control;
 use crate::format::{expand_format, format_list_windows, format_list_panes, set_buffer_idx_override, set_named_buffer_override};
 use crate::help;
 
+fn resolve_display_message_target_pane(
+    app: &AppState,
+    target_pane: Option<usize>,
+    target_pane_is_id: bool,
+) -> Option<(usize, usize)> {
+    let pane = target_pane?;
+    if target_pane_is_id {
+        app.windows
+            .iter()
+            .enumerate()
+            .find_map(|(win_idx, win)| {
+                tree::get_pane_position_in_window(&win.root, pane)
+                    .map(|pane_pos| (win_idx, pane_pos))
+            })
+    } else {
+        Some((app.active_idx, pane))
+    }
+}
+
 /// Build a JSON fragment with overlay state (popup, menu, confirm, display_panes).
 /// Delegates popup-specific serialization to the popup module.
 fn serialize_overlay_json(app: &AppState) -> String {
@@ -545,6 +564,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         app.last_window_area = ratatui::layout::Rect { x: 0, y: 0, width: w, height: h };
     }
 
+    // Tag spawn-diagnostics log lines with this server's session name
+    // (~/.psmux/spawn_diag.log is shared by all servers).
+    crate::debug_log::set_spawn_log_session(&app.session_name);
+
     // Apply -e environment variables BEFORE pane spawn so the first pane
     // inherits them via apply_user_environment().
     crate::util::merge_session_env_into_app(&mut app, &env_vars);
@@ -729,6 +752,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // required so a claim that is mid-rename never triggers a false exit.
     let mut warm_reg_last_check = Instant::now();
     let mut warm_reg_strikes: u32 = 0;
+    let mut own_reg_last_check = Instant::now();
+    let mut own_reg_loss_logged = false;
 
     // Persist temp_focus_restore across batch boundaries so that a
     // FocusWindowTemp/FocusPaneByIndexTemp in one batch plus the actual
@@ -2558,14 +2583,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::DisplayMessage(resp, fmt, target_pane_idx, set_status_bar, duration_ms) => {
+                CtrlReq::DisplayMessage(resp, fmt, target_pane, target_pane_is_id, set_status_bar, duration_ms) => {
                     // Propagate OSC titles so #{pane_title} reflects latest state
                     helpers::propagate_osc_titles(&mut app);
-                    let result = if let Some(pane_idx) = target_pane_idx {
+                    let result = if let Some((win_idx, pane_idx)) =
+                        resolve_display_message_target_pane(&app, target_pane, target_pane_is_id)
+                    {
                         // -t targeting: evaluate format for the specific pane
                         // using PANE_POS_OVERRIDE so #{pane_active} reflects
                         // the REAL active pane, not the target (#113)
-                        crate::format::expand_format_for_pane(&fmt, &app, app.active_idx, pane_idx)
+                        crate::format::expand_format_for_pane(&fmt, &app, win_idx, pane_idx)
                     } else {
                         expand_format(&fmt, &app)
                     };
@@ -3856,9 +3883,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Return message log (tmux stores recent log messages)
                     let _ = resp.send(String::new());
                 }
-                CtrlReq::ResizeWindow(_dim, _size) => {
-                    // On Windows, window size is controlled by the terminal emulator;
-                    // resize-window is a no-op since we adapt to the terminal size.
+                CtrlReq::ResizeWindow(dim, size) => {
+                    // Manual geometry override (tmux-style `resize-window -x/-y`): apply the
+                    // requested dimension to the window area and re-fit every pane, so a remote
+                    // controller (Cletus viewer "Fit session", the phone session manager) can
+                    // reflow the agent to ITS screen. Deliberately "until further notice": the
+                    // next attached-client attach/detach/resize event recomputes the effective
+                    // client size and snaps geometry back to the terminal.
+                    if size > 0 {
+                        let mut new_area = app.last_window_area;
+                        if dim == "x" { new_area.width = size; } else if dim == "y" { new_area.height = size; }
+                        if new_area != app.last_window_area {
+                            app.last_window_area = new_area;
+                            resize_all_panes(&mut app);
+                            state_dirty = true;
+                            meta_dirty = true;
+                        }
+                    }
                 }
                 CtrlReq::ControlClientResize(w, h) => {
                     // iTerm2 (or another -CC client) is the authoritative
@@ -4596,6 +4637,41 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             if should_close && close_on_exit {
                 app.mode = Mode::Passthrough;
                 state_dirty = true;
+            }
+        }
+        // Own-registration audit: a live server whose .port/.key files were
+        // deleted can continue serving already-attached clients but becomes
+        // invisible to `psmux ls` and impossible to attach to.  Recreate the
+        // registration when no other server has claimed the name.
+        if own_reg_last_check.elapsed() >= Duration::from_secs(60) {
+            own_reg_last_check = Instant::now();
+            if let Some(port) = app.control_port {
+                let audit = crate::registry::audit_or_repair_own_registration(
+                    &app.port_file_base(),
+                    port,
+                    &app.session_key,
+                );
+                match audit {
+                    crate::registry::OwnRegistrationAudit::Current |
+                    crate::registry::OwnRegistrationAudit::Repaired => {
+                        own_reg_loss_logged = false;
+                    }
+                    crate::registry::OwnRegistrationAudit::Missing |
+                    crate::registry::OwnRegistrationAudit::OwnedByOther => {
+                        if !own_reg_loss_logged {
+                            crate::registry::log_registry_event(
+                                "own_registration_not_current",
+                                &format!(
+                                    "base={} port={} outcome={:?}",
+                                    app.port_file_base(),
+                                    port,
+                                    audit
+                                ),
+                            );
+                            own_reg_loss_logged = true;
+                        }
+                    }
+                }
             }
         }
         // ── Warm-standby orphan self-reap (see declaration above) ──

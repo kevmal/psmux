@@ -576,34 +576,48 @@ pub fn parse_target(target: &str) -> ParsedTarget {
     result.session = session_part;
     
     if let Some(wp) = window_pane_part {
-        if wp.starts_with('%') {
-            if let Ok(pid) = wp[1..].parse::<usize>() {
-                result.pane = Some(pid);
-                result.pane_is_id = true;
-            }
-        } else if wp.starts_with('@') {
-            if let Ok(wid) = wp[1..].parse::<usize>() {
-                result.window = Some(wid);
-                result.window_is_id = true;
-            }
-        } else if let Some(dot_pos) = wp.find('.') {
-            if dot_pos > 0 {
-                let win_part = &wp[..dot_pos];
-                if let Ok(w) = win_part.parse::<usize>() {
-                    result.window = Some(w);
-                } else if !win_part.is_empty() {
-                    result.window_name = Some(win_part.to_string());
+        fn parse_window_part(result: &mut ParsedTarget, win_part: &str) {
+            if let Some(rest) = win_part.strip_prefix('@') {
+                if let Ok(wid) = rest.parse::<usize>() {
+                    result.window = Some(wid);
+                    result.window_is_id = true;
+                    result.window_name = None;
                 }
-            }
-            if let Ok(p) = wp[dot_pos + 1..].parse::<usize>() {
-                result.pane = Some(p);
-            }
-        } else {
-            if let Ok(w) = wp.parse::<usize>() {
+            } else if let Ok(w) = win_part.parse::<usize>() {
                 result.window = Some(w);
-            } else if !wp.is_empty() {
-                result.window_name = Some(wp.to_string());
+                result.window_is_id = false;
+                result.window_name = None;
+            } else if !win_part.is_empty() {
+                result.window_name = Some(win_part.to_string());
+                result.window = None;
+                result.window_is_id = false;
             }
+        }
+        fn parse_pane_part(result: &mut ParsedTarget, pane_part: &str) {
+            if let Some(rest) = pane_part.strip_prefix('%') {
+                if let Ok(pid) = rest.parse::<usize>() {
+                    result.pane = Some(pid);
+                    result.pane_is_id = true;
+                }
+            } else if let Ok(p) = pane_part.parse::<usize>() {
+                result.pane = Some(p);
+                result.pane_is_id = false;
+            }
+        }
+
+        if let Some(dot_pos) = wp.find('.') {
+            let win_part = &wp[..dot_pos];
+            let pane_part = &wp[dot_pos + 1..];
+            if !win_part.is_empty() {
+                parse_window_part(&mut result, win_part);
+            }
+            if !pane_part.is_empty() {
+                parse_pane_part(&mut result, pane_part);
+            }
+        } else if wp.starts_with('%') {
+            parse_pane_part(&mut result, wp);
+        } else {
+            parse_window_part(&mut result, wp);
         }
     }
     
@@ -701,6 +715,38 @@ mod tests {
         assert_eq!(pt.window, None);
         assert_eq!(pt.window_name, Some("mywindow".to_string()));
         assert_eq!(pt.pane, Some(1));
+        assert!(!pt.pane_is_id);
+    }
+
+    #[test]
+    fn parse_target_session_with_pane_id() {
+        let pt = parse_target("mysession:%3");
+        assert_eq!(pt.session, Some("mysession".to_string()));
+        assert_eq!(pt.window, None);
+        assert_eq!(pt.window_name, None);
+        assert_eq!(pt.pane, Some(3));
+        assert!(pt.pane_is_id);
+    }
+
+    #[test]
+    fn parse_target_window_id_with_pane_id() {
+        let pt = parse_target("mysession:@8.%3");
+        assert_eq!(pt.session, Some("mysession".to_string()));
+        assert_eq!(pt.window, Some(8));
+        assert!(pt.window_is_id);
+        assert_eq!(pt.window_name, None);
+        assert_eq!(pt.pane, Some(3));
+        assert!(pt.pane_is_id);
+    }
+
+    #[test]
+    fn parse_target_window_index_with_pane_id() {
+        let pt = parse_target("mysession:4.%3");
+        assert_eq!(pt.session, Some("mysession".to_string()));
+        assert_eq!(pt.window, Some(4));
+        assert!(!pt.window_is_id);
+        assert_eq!(pt.pane, Some(3));
+        assert!(pt.pane_is_id);
     }
 
     #[test]

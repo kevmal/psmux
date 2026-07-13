@@ -49,6 +49,19 @@ pub enum RegisterOutcome {
     NameTaken,
 }
 
+/// Result of a server checking the registry entry for its own session.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum OwnRegistrationAudit {
+    /// The `<base>.port` file still points at this server.
+    Current,
+    /// The registration was missing and this process recreated it.
+    Repaired,
+    /// The name is missing and could not be reclaimed.
+    Missing,
+    /// The name now points at another server.
+    OwnedByOther,
+}
+
 pub fn psmux_dir() -> String {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     format!("{}\\.psmux", home)
@@ -57,6 +70,26 @@ pub fn psmux_dir() -> String {
 pub fn port_path(base: &str) -> String { format!("{}\\{}.port", psmux_dir(), base) }
 pub fn key_path(base: &str) -> String { format!("{}\\{}.key", psmux_dir(), base) }
 pub fn pid_path(base: &str) -> String { format!("{}\\{}.pid", psmux_dir(), base) }
+
+pub fn log_registry_event(event: &str, detail: &str) {
+    let dir = psmux_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{}\\registry.log", dir))
+    {
+        let _ = writeln!(
+            f,
+            "[{}][pid {}][{}] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            std::process::id(),
+            event,
+            detail
+        );
+        let _ = f.flush();
+    }
+}
 
 pub fn read_port(base: &str) -> Option<u16> {
     std::fs::read_to_string(port_path(base)).ok()?.trim().parse().ok()
@@ -178,18 +211,42 @@ pub fn registration_liveness(base: &str) -> Liveness {
         }
     }
     match read_pid(base) {
-        Some(pid) if pid_is_live_psmux(pid) => Liveness::Alive,
-        Some(_) => Liveness::Dead,
+        Some(pid) if pid_is_live_psmux(pid) => {
+            log_registry_event(
+                "liveness_alive_by_pid",
+                &format!("base={} port={} pid={} tcp_probe_failed=true", base, port, pid),
+            );
+            Liveness::Alive
+        }
+        Some(pid) => {
+            log_registry_event(
+                "liveness_dead",
+                &format!("base={} port={} pid={} tcp_probe_failed=true", base, port, pid),
+            );
+            Liveness::Dead
+        }
         // Registration from a build predating .pid files: the process can't
         // be verified, and three probes failed — treat as dead (matches the
         // old behavior, but only after real retries instead of one 100ms shot).
-        None => Liveness::Dead,
+        None => {
+            log_registry_event(
+                "liveness_dead_no_pid",
+                &format!("base={} port={} tcp_probe_failed=true", base, port),
+            );
+            Liveness::Dead
+        }
     }
 }
 
 /// Remove a registration decided to be stale.  Callers must have obtained a
 /// `Liveness::Dead` verdict (or otherwise own the name) first.
 pub fn remove_registration(base: &str) {
+    let old_port = read_port(base);
+    let old_pid = read_pid(base);
+    log_registry_event(
+        "remove_registration",
+        &format!("base={} old_port={:?} old_pid={:?}", base, old_port, old_pid),
+    );
     let _ = std::fs::remove_file(port_path(base));
     let _ = std::fs::remove_file(key_path(base));
     let _ = std::fs::remove_file(pid_path(base));
@@ -202,10 +259,20 @@ pub fn remove_registration(base: &str) {
 pub fn remove_registration_if_owner(base: &str, my_port: u16) -> bool {
     match read_port(base) {
         Some(p) if p == my_port => {
+            log_registry_event(
+                "remove_registration_if_owner",
+                &format!("base={} port={}", base, my_port),
+            );
             remove_registration(base);
             true
         }
-        _ => false,
+        other => {
+            log_registry_event(
+                "skip_remove_registration_if_owner",
+                &format!("base={} my_port={} registered_port={:?}", base, my_port, other),
+            );
+            false
+        }
     }
 }
 
@@ -221,12 +288,28 @@ pub fn register_new_server(base: &str, port: u16, key: &str) -> RegisterOutcome 
                 let _ = f.write_all(port.to_string().as_bytes());
                 let _ = std::fs::write(key_path(base), key);
                 let _ = std::fs::write(pid_path(base), std::process::id().to_string());
+                log_registry_event(
+                    "register_new_server",
+                    &format!("base={} port={} outcome=registered", base, port),
+                );
                 return RegisterOutcome::Registered;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match registration_liveness(base) {
-                    Liveness::Alive => return RegisterOutcome::NameTaken,
-                    _ => remove_registration(base), // stale — clear and retry the claim
+                    Liveness::Alive => {
+                        log_registry_event(
+                            "register_new_server",
+                            &format!("base={} port={} outcome=name_taken", base, port),
+                        );
+                        return RegisterOutcome::NameTaken;
+                    }
+                    _ => {
+                        log_registry_event(
+                            "register_new_server",
+                            &format!("base={} port={} outcome=stale_remove", base, port),
+                        );
+                        remove_registration(base)
+                    }, // stale — clear and retry the claim
                 }
             }
             Err(_) => {
@@ -236,6 +319,10 @@ pub fn register_new_server(base: &str, port: u16, key: &str) -> RegisterOutcome 
                 let _ = std::fs::write(port_path(base), port.to_string());
                 let _ = std::fs::write(key_path(base), key);
                 let _ = std::fs::write(pid_path(base), std::process::id().to_string());
+                log_registry_event(
+                    "register_new_server",
+                    &format!("base={} port={} outcome=fallback_registered", base, port),
+                );
                 return RegisterOutcome::Registered;
             }
         }
@@ -252,7 +339,16 @@ pub fn register_new_server(base: &str, port: u16, key: &str) -> RegisterOutcome 
 pub fn move_registration(old_base: &str, new_base: &str, my_port: u16, key: &str) -> Result<(), String> {
     if new_base != old_base {
         match registration_liveness(new_base) {
-            Liveness::Alive => return Err(format!("session name '{}' already in use", new_base)),
+            Liveness::Alive => {
+                log_registry_event(
+                    "move_registration",
+                    &format!(
+                        "old_base={} new_base={} port={} outcome=name_taken",
+                        old_base, new_base, my_port
+                    ),
+                );
+                return Err(format!("session name '{}' already in use", new_base));
+            }
             Liveness::Dead => remove_registration(new_base),
             Liveness::Missing => {}
         }
@@ -261,5 +357,68 @@ pub fn move_registration(old_base: &str, new_base: &str, my_port: u16, key: &str
     let _ = std::fs::write(port_path(new_base), my_port.to_string());
     let _ = std::fs::write(key_path(new_base), key);
     let _ = std::fs::write(pid_path(new_base), std::process::id().to_string());
+    log_registry_event(
+        "move_registration",
+        &format!(
+            "old_base={} new_base={} port={} outcome=moved",
+            old_base, new_base, my_port
+        ),
+    );
     Ok(())
+}
+
+/// Check this process's own registration and repair the exact failure mode
+/// where a stale cleanup deleted `<base>.port` / `<base>.key` while leaving
+/// the live server process attached to existing clients.
+pub fn audit_or_repair_own_registration(base: &str, port: u16, key: &str) -> OwnRegistrationAudit {
+    match read_port(base) {
+        Some(p) if p == port => OwnRegistrationAudit::Current,
+        Some(p) => {
+            log_registry_event(
+                "own_registration_owned_by_other",
+                &format!("base={} my_port={} registered_port={}", base, port, p),
+            );
+            OwnRegistrationAudit::OwnedByOther
+        }
+        None => {
+            let pid = read_pid(base);
+            if matches!(pid, Some(existing) if existing != std::process::id()) {
+                log_registry_event(
+                    "own_registration_missing_port_pid_mismatch",
+                    &format!(
+                        "base={} my_port={} registered_pid={:?}",
+                        base, port, pid
+                    ),
+                );
+                return OwnRegistrationAudit::Missing;
+            }
+
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(port_path(base)) {
+                Ok(mut f) => {
+                    let _ = f.write_all(port.to_string().as_bytes());
+                    let _ = std::fs::write(key_path(base), key);
+                    let _ = std::fs::write(pid_path(base), std::process::id().to_string());
+                    log_registry_event(
+                        "own_registration_repaired",
+                        &format!("base={} port={} previous_pid={:?}", base, port, pid),
+                    );
+                    OwnRegistrationAudit::Repaired
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    log_registry_event(
+                        "own_registration_repair_race_lost",
+                        &format!("base={} port={} previous_pid={:?}", base, port, pid),
+                    );
+                    OwnRegistrationAudit::OwnedByOther
+                }
+                Err(e) => {
+                    log_registry_event(
+                        "own_registration_repair_failed",
+                        &format!("base={} port={} previous_pid={:?} err={}", base, port, pid, e),
+                    );
+                    OwnRegistrationAudit::Missing
+                }
+            }
+        }
+    }
 }

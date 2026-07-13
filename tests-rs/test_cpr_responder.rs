@@ -117,3 +117,66 @@ fn cpr_response_fallback_produces_valid_sequence() {
     let response = format!("\x1b[{};{}R", r + 1, c + 1);
     assert_eq!(response, "\x1b[1;1R");
 }
+
+// ── reader startup zeroes ─────────────────────────────────────────────────
+
+struct ZeroThenDataReader {
+    zeroes_left: usize,
+    sent_data: bool,
+}
+
+impl std::io::Read for ZeroThenDataReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.zeroes_left > 0 {
+            self.zeroes_left -= 1;
+            return Ok(0);
+        }
+        if !self.sent_data {
+            self.sent_data = true;
+            let data = b"after-zero-startup";
+            buf[..data.len()].copy_from_slice(data);
+            return Ok(data.len());
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "done"))
+    }
+}
+
+#[test]
+fn reader_survives_startup_zero_reads_before_first_output() {
+    let term = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(5, 80, 0)));
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CURSOR_SHAPE_UNSET));
+    let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+    spawn_reader_thread(
+        Box::new(ZeroThenDataReader { zeroes_left: 20, sent_data: false }),
+        term.clone(),
+        data_version.clone(),
+        cursor_shape,
+        bell_pending,
+        cpr_pending,
+        true,
+        output_ring,
+        "test-delayed-zero-reader",
+    );
+
+    for _ in 0..100 {
+        if data_version.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        data_version.load(std::sync::atomic::Ordering::Acquire) > 0,
+        "reader exited before processing delayed startup output"
+    );
+    let parser = term.lock().unwrap();
+    let first_row = (0..20)
+        .filter_map(|col| parser.screen().cell(0, col))
+        .map(|cell| cell.contents())
+        .collect::<String>();
+    assert!(first_row.contains("after-zero-startup"));
+}

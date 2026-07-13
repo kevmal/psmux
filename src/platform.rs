@@ -356,6 +356,69 @@ pub fn install_console_ctrl_handler() {
 }
 
 // ---------------------------------------------------------------------------
+// Process-global console-state serialization
+// ---------------------------------------------------------------------------
+// A process has exactly ONE console attachment; FreeConsole/AttachConsole is
+// process-global state.  The mouse_inject cycles below flip that state, and a
+// ConPTY pane spawn (CreatePseudoConsole + CreateProcessW) consults it when
+// deciding how the child's std handles are initialized.  Interleaving the two
+// can hand a freshly spawned shell invalid std handles ("The handle is
+// invalid" FailFast in pwsh — see the 2026-07-13 Ops incident).  Every inject
+// cycle and every pane spawn must hold this lock.
+
+pub static CONSOLE_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the console-op lock, recovering from poisoning (a panicked inject
+/// thread must not permanently block pane spawning).
+pub fn console_op_guard() -> std::sync::MutexGuard<'static, ()> {
+    CONSOLE_OP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Snapshot of this process's own console state, for spawn diagnostics.
+/// Reports whether the process is attached to a console and whether its std
+/// handle slots hold live handles — the key inputs to how a ConPTY child's
+/// stdio gets initialized.
+#[cfg(windows)]
+pub fn console_state_summary() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> isize;
+        fn GetConsoleCP() -> u32;
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        fn GetLastError() -> u32;
+    }
+    unsafe {
+        let win = GetConsoleWindow();
+        let cp = GetConsoleCP();
+        let cp_err = if cp == 0 { GetLastError() } else { 0 };
+        let mut parts = vec![format!("con_win=0x{:x} con_cp={}(err={})", win, cp, cp_err)];
+        for (name, id) in [("stdin", 0xFFFF_FFF6u32), ("stdout", 0xFFFF_FFF5u32), ("stderr", 0xFFFF_FFF4u32)] {
+            let h = GetStdHandle(id);
+            let ft = GetFileType(h);
+            let ft_err = if ft == 0 { GetLastError() } else { 0 };
+            parts.push(format!("{}=0x{:x}:type{}(err={})", name, h as usize, ft, ft_err));
+        }
+        let (cycles, last_ms) = inject_cycle_stats();
+        parts.push(match last_ms {
+            Some(ms) => format!("inject_cycles={} last={}ms_ago", cycles, ms),
+            None => format!("inject_cycles={}", cycles),
+        });
+        parts.join(" ")
+    }
+}
+
+#[cfg(not(windows))]
+pub fn console_state_summary() -> String { String::new() }
+
+/// (total inject cycles this process, ms since the last one).
+#[cfg(windows)]
+pub fn inject_cycle_stats() -> (u64, Option<u64>) { mouse_inject::cycle_stats() }
+
+#[cfg(not(windows))]
+pub fn inject_cycle_stats() -> (u64, Option<u64>) { (0, None) }
+
+// ---------------------------------------------------------------------------
 // Windows Console API mouse injection
 // ---------------------------------------------------------------------------
 // ConPTY does NOT translate VT mouse escape sequences (e.g. SGR \x1b[<0;10;5M)
@@ -399,6 +462,36 @@ pub mod mouse_inject {
     use std::time::{Duration, Instant};
     static LAST_DRAG_INJECT: Mutex<Option<Instant>> = Mutex::new(None);
     const DRAG_THROTTLE: Duration = Duration::from_millis(16); // ~60fps
+
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static CYCLE_COUNT: AtomicU64 = AtomicU64::new(0);
+    /// ms-since-process-epoch of the most recent cycle; u64::MAX = never.
+    static LAST_CYCLE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PROCESS_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+    /// Enter a FreeConsole/AttachConsole cycle: takes the process-global
+    /// console-op lock (serializing against ConPTY pane spawns) and records
+    /// cycle stats for spawn diagnostics.  Hold the returned guard for the
+    /// whole cycle.  NOT reentrant — only leaf cycle functions may call this.
+    fn begin_cycle() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::platform::console_op_guard();
+        CYCLE_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        let epoch = PROCESS_EPOCH.get_or_init(Instant::now);
+        LAST_CYCLE_MS.store(epoch.elapsed().as_millis() as u64, AtomicOrdering::Relaxed);
+        guard
+    }
+
+    /// (total cycles, ms since last cycle) — see platform::inject_cycle_stats.
+    pub fn cycle_stats() -> (u64, Option<u64>) {
+        let count = CYCLE_COUNT.load(AtomicOrdering::Relaxed);
+        let last = LAST_CYCLE_MS.load(AtomicOrdering::Relaxed);
+        if last == u64::MAX {
+            (count, None)
+        } else {
+            let now = PROCESS_EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+            (count, Some(now.saturating_sub(last)))
+        }
+    }
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -456,6 +549,12 @@ pub mod mouse_inject {
 
     #[inline]
     fn debug_log(msg: &str) {
+        // Cycle failures indicate console-state trouble (the precursor to the
+        // "new pane instantly dies" failure mode), so they always go to the
+        // spawn diagnostics log — even when PSMUX_MOUSE_DEBUG is off.
+        if msg.contains("FAILED") {
+            crate::debug_log::spawn_log("inject", msg);
+        }
         // Write to mouse_debug.log when PSMUX_MOUSE_DEBUG=1 is set.
         use std::sync::atomic::{AtomicBool, Ordering};
         static CHECKED: AtomicBool = AtomicBool::new(false);
@@ -492,6 +591,7 @@ pub mod mouse_inject {
     /// which sets only ENABLE_WINDOW_INPUT), VT mouse sequences should NOT
     /// be written because the app cannot parse them and they appear as garbage.
     pub fn query_vti_enabled(child_pid: u32) -> Option<bool> {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -576,6 +676,7 @@ pub mod mouse_inject {
             }
         }
 
+        let _cycle = begin_cycle();
         unsafe {
             // Check if we currently own a console (app mode yes, server mode no after first call)
             let had_console = reattach && GetConsoleWindow() != 0;
@@ -676,6 +777,7 @@ pub mod mouse_inject {
     /// child reads input as text (ReadConsole/ReadFile) and expects VT
     /// mouse sequences delivered as KEY_EVENT records (nvim, vim).
     pub fn query_mouse_input_enabled(child_pid: u32) -> Option<bool> {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -742,6 +844,7 @@ pub mod mouse_inject {
     /// ConPTY's input engine may not correctly handle SGR mouse sequences
     /// written to hInput.
     pub fn send_vt_sequence(child_pid: u32, sequence: &[u8]) -> bool {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -863,6 +966,7 @@ pub mod mouse_inject {
     /// The text is encoded as UTF-16 for proper Unicode support (file paths
     /// may contain non-ASCII characters).
     pub fn send_bracketed_paste(child_pid: u32, text: &str, bracket: bool) -> bool {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -1066,6 +1170,7 @@ pub mod mouse_inject {
             debug_log(&format!("ctrl_c: {}", msg));
         }
 
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = reattach && GetConsoleWindow() != 0;
 
@@ -1159,6 +1264,7 @@ pub mod mouse_inject {
     ///
     /// Convenience wrapper: `send_alt_key_event` calls this with ctrl=false, alt=true, shift=false.
     pub fn send_modified_key_event(child_pid: u32, ch: char, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -1314,6 +1420,7 @@ pub mod mouse_inject {
     /// KEY_EVENT_RECORD with the correct modifier flags, so PSReadLine and
     /// other console-API-based readers see the true Shift/Ctrl/Alt+Enter.
     pub fn send_modified_enter_event(child_pid: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let _cycle = begin_cycle();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();

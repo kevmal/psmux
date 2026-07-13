@@ -1025,7 +1025,7 @@ pub enum CtrlReq {
     /// Delete a named buffer by name
     DeleteNamedBuffer(String),
     PasteBufferAt(usize),
-    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, bool, Option<u64>),  // resp, format, target_pane, target_pane_is_id, set_status_bar, duration_override_ms
     LastWindow,
     LastPane,
     RotateWindow(bool),

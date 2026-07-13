@@ -75,7 +75,17 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     // The warm pane has its shell already loaded (~470ms for pwsh), so the
     // prompt appears instantly — matching wezterm's "instant tab" feel.
     if command.is_none() && start_dir.is_none() && app.warm_pane.is_some() {
-        let wp = app.warm_pane.take().unwrap();
+        let mut wp = app.warm_pane.take().unwrap();
+        // A pooled warm pane can die while waiting (its shell crashed, e.g.
+        // the 2026-07-13 "handle is invalid" startup crashes).  Transplanting
+        // a corpse gives the user a window full of stale crash output that
+        // closes itself — verify liveness and cold-spawn instead.
+        if matches!(wp.child.try_wait(), Ok(Some(_))) {
+            crate::debug_log::spawn_log("warm", &format!(
+                "pooled warm pane %{} (pid={:?}) found dead at consume — discarding, cold-spawning. {}",
+                wp.pane_id, wp.child_pid, crate::platform::console_state_summary()));
+            let _ = crate::debug_log::record_pane_exit(wp.pane_id);
+        } else {
         // Resize to current terminal dimensions if they changed since pre-spawn
         let area = app.last_window_area;
         let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
@@ -104,6 +114,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         app.next_win_id += 1;
         app.active_idx = app.windows.len() - 1;
         return Ok(());
+        }
     }
     // ── Normal path: spawn a new ConPTY + shell synchronously ──
     // Use actual terminal size if known, otherwise fall back to defaults
@@ -111,9 +122,16 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
     let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    // Hold the console-op lock across ConPTY creation + child spawn so no
+    // AttachConsole inject cycle flips this process's console state mid-spawn.
+    let con_guard = crate::platform::console_op_guard();
     let pair = pty_system
         .openpty(size)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("spawn", &format!("window: openpty FAILED {}x{}: {} | {}",
+                cols, rows, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}"))
+        })?;
 
     // When no explicit command is given, use the configured default-shell
     // (from `set -g default-shell` / `default-command`).
@@ -135,11 +153,16 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     let child = pair
         .slave
         .spawn_command(shell_cmd)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("spawn", &format!("window: spawn_command FAILED {}x{} cmd={:?}: {} | {}",
+                cols, rows, command, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}"))
+        })?;
     // On Windows ConPTY the slave handle MUST be closed after spawning so the
     // child owns the sole reference to the console input pipe.  Leaving it open
     // causes "The handle is invalid" IOExceptions inside the child process.
     drop(pair.slave);
+    drop(con_guard);
 
     let scrollback = app.history_limit as u32;
     let mut parser = vt100::Parser::new(size.rows, size.cols, scrollback as usize);
@@ -160,10 +183,13 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone(), format!("pane=%{} window", app.next_pane_id));
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    crate::debug_log::record_pane_spawn(app.next_pane_id, child_pid.unwrap_or(0));
+    crate::debug_log::spawn_log("spawn", &format!("window pane=%{} pid={:?} {}x{} cmd={:?} | {}",
+        app.next_pane_id, child_pid, cols, rows, command, crate::platform::console_state_summary()));
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -191,9 +217,15 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
     let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    // See create_window: serialize against AttachConsole inject cycles.
+    let con_guard = crate::platform::console_op_guard();
     let pair = pty_system
         .openpty(size)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("warm", &format!("openpty FAILED {}x{}: {} | {}",
+                cols, rows, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}"))
+        })?;
     // Expand format variables like #{pane_current_path} at spawn time (#111).
     let expanded_shell = crate::format::expand_format(&app.default_shell, app);
     let mut shell_cmd = if !expanded_shell.is_empty() {
@@ -207,8 +239,13 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     apply_user_environment(&mut shell_cmd, &app.environment);
     let child = pair.slave
         .spawn_command(shell_cmd)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("warm", &format!("spawn_command FAILED {}x{}: {} | {}",
+                cols, rows, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}"))
+        })?;
     drop(pair.slave);
+    drop(con_guard);
     let scrollback = app.history_limit as u32;
     let mut parser = vt100::Parser::new(rows, cols, scrollback as usize);
     parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
@@ -226,8 +263,11 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone(), format!("pane=%{} warm", pane_id));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    crate::debug_log::record_pane_spawn(pane_id, child_pid.unwrap_or(0));
+    crate::debug_log::spawn_log("warm", &format!("pre-spawned pane=%{} pid={:?} {}x{} | {}",
+        pane_id, child_pid, cols, rows, crate::platform::console_state_summary()));
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -244,9 +284,15 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let rows = if area.height > 1 { area.height } else { 30 };
     let cols = if area.width > 1 { area.width } else { 120 };
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    // See create_window: serialize against AttachConsole inject cycles.
+    let con_guard = crate::platform::console_op_guard();
     let pair = pty_system
         .openpty(size)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("spawn", &format!("raw-window: openpty FAILED {}x{}: {} | {}",
+                cols, rows, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}"))
+        })?;
 
     let mut shell_cmd = build_raw_command(raw_args);
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
@@ -254,9 +300,14 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let child = pair
         .slave
         .spawn_command(shell_cmd)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+        .map_err(|e| {
+            crate::debug_log::spawn_log("spawn", &format!("raw-window: spawn_command FAILED {}x{} args={:?}: {} | {}",
+                cols, rows, raw_args, e, crate::platform::console_state_summary()));
+            io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}"))
+        })?;
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
+    drop(con_guard);
 
     let scrollback = app.history_limit;
     let mut parser = vt100::Parser::new(size.rows, size.cols, scrollback);
@@ -277,9 +328,12 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone(), format!("pane=%{} raw-window", app.next_pane_id));
 
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    crate::debug_log::record_pane_spawn(app.next_pane_id, child_pid.unwrap_or(0));
+    crate::debug_log::spawn_log("spawn", &format!("raw-window pane=%{} pid={:?} {}x{} args={:?} | {}",
+        app.next_pane_id, child_pid, cols, rows, raw_args, crate::platform::console_state_summary()));
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -372,7 +426,14 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     // Skip warm pane when start_dir is set — the warm pane was spawned
     // in the server's CWD, not the requested directory (#107).
     if command.is_none() && start_dir.is_none() && app.warm_pane.is_some() {
-        let wp = app.warm_pane.take().unwrap();
+        let mut wp = app.warm_pane.take().unwrap();
+        // Liveness check — see create_window()'s warm fast path.
+        if matches!(wp.child.try_wait(), Ok(Some(_))) {
+            crate::debug_log::spawn_log("warm", &format!(
+                "pooled warm pane %{} (pid={:?}) found dead at split-consume — discarding, cold-spawning. {}",
+                wp.pane_id, wp.child_pid, crate::platform::console_state_summary()));
+            let _ = crate::debug_log::record_pane_exit(wp.pane_id);
+        } else {
         let need_resize = rows != wp.rows || cols != wp.cols;
         if need_resize {
             let sz = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
@@ -397,10 +458,17 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
         // Add new pane to MRU (most recent)
         crate::tree::touch_mru(&mut win.pane_mru, new_pane_id);
         return Ok(());
+        }
     }
 
     // ── Normal path: cold-spawn a new ConPTY + shell ────────────────
-    let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+    // See create_window: serialize against AttachConsole inject cycles.
+    let con_guard = crate::platform::console_op_guard();
+    let pair = pty_system.openpty(size).map_err(|e| {
+        crate::debug_log::spawn_log("spawn", &format!("split: openpty FAILED {}x{}: {} | {}",
+            cols, rows, e, crate::platform::console_state_summary()));
+        io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}"))
+    })?;
     // When no explicit command is given, use the configured default-shell.
     // Expand format variables like #{pane_current_path} at spawn time (#111).
     let expanded_shell = crate::format::expand_format(&app.default_shell, app);
@@ -417,9 +485,14 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     }
     set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
-    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| {
+        crate::debug_log::spawn_log("spawn", &format!("split: spawn_command FAILED {}x{} cmd={:?}: {} | {}",
+            cols, rows, command, e, crate::platform::console_state_summary()));
+        io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}"))
+    })?;
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
+    drop(con_guard);
     let mut parser = vt100::Parser::new(size.rows, size.cols, app.history_limit);
     parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(parser));
@@ -434,8 +507,11 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cpr_writer = cpr_pending.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone(), format!("pane=%{} split", app.next_pane_id));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    crate::debug_log::record_pane_spawn(app.next_pane_id, child_pid.unwrap_or(0));
+    crate::debug_log::spawn_log("spawn", &format!("split pane=%{} pid={:?} {}x{} cmd={:?} | {}",
+        app.next_pane_id, child_pid, cols, rows, command, crate::platform::console_state_summary()));
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -1147,8 +1223,9 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
 }
 
 /// Spawn a dedicated PTY reader thread that processes output and updates the
-/// data_version counter. Exits cleanly after 200 consecutive zero-byte reads
-/// (indicating the PTY pipe is closed) or on any I/O error.
+/// data_version counter. ConPTY can report transient zero-byte reads before
+/// pwsh emits its first startup bytes, so startup zeroes get a longer grace
+/// window than post-output EOF detection.
 ///
 /// Uses an 8KB read buffer (down from 64KB) to reduce mutex hold time during
 /// `parser.process()`, which improves DumpState latency under heavy output.
@@ -1209,7 +1286,7 @@ fn should_signal_reactive_cpr(has_cpr_query: bool, preemptive_cpr_response_avail
     true
 }
 
-// TODO: The 7 Arc parameters below should be grouped into a `ReaderSignals`
+// TODO: The Arc parameters below should be grouped into a `ReaderSignals`
 // struct the next time a new signal is added, to keep the call-site manageable.
 pub fn spawn_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
@@ -1220,6 +1297,7 @@ pub fn spawn_reader_thread(
     cpr_pending: Arc<std::sync::atomic::AtomicBool>,
     preemptive_cpr_response_available: bool,
     output_ring: Arc<Mutex<std::collections::VecDeque<u8>>>,
+    debug_label: impl Into<String>,
 ) {
     // ── Issue #246: split the old single reader thread into two threads ──
     //
@@ -1249,21 +1327,35 @@ pub fn spawn_reader_thread(
     // and well below the 50ms keystroke-echo threshold.
     const COALESCE_TICK_MS: u64 = 1;
     const COALESCE_MAX_MS: u128 = 8;
+    const STARTUP_ZERO_READ_GRACE_MS: u128 = 30_000;
+    const EOF_ZERO_READ_GRACE_MS: u128 = 500;
 
     let staging: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::with_capacity(131072)), Condvar::new()));
     let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let debug_label = debug_label.into();
+    crate::debug_log::server_log("pty-reader", &format!("{} start preemptive_cpr={}", debug_label, preemptive_cpr_response_available));
 
     // ── Reader thread: pure I/O, no parser lock ──
     let staging_r = staging.clone();
     let reader_done_r = reader_done.clone();
     let output_ring_r = output_ring.clone();
+    let reader_label = debug_label.clone();
     thread::spawn(move || {
         let mut local = vec![0u8; 65536];
         let mut zero_reads: u32 = 0;
+        let mut zero_since: Option<Instant> = None;
+        let mut saw_output = false;
+        let mut total_bytes: u64 = 0;
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
+                    if !saw_output {
+                        crate::debug_log::server_log("pty-reader", &format!("{} first_output bytes={}", reader_label, n));
+                    }
+                    saw_output = true;
+                    total_bytes = total_bytes.saturating_add(n as u64);
                     zero_reads = 0;
+                    zero_since = None;
                     // Push raw bytes into staging (no parser lock involved).
                     let (lock, cv) = &*staging_r;
                     if let Ok(mut buf) = lock.lock() {
@@ -1286,10 +1378,27 @@ pub fn spawn_reader_thread(
                 }
                 Ok(_) => {
                     zero_reads += 1;
-                    if zero_reads > 10 { break; }
+                    let started = *zero_since.get_or_insert_with(Instant::now);
+                    let grace_ms = if saw_output { EOF_ZERO_READ_GRACE_MS } else { STARTUP_ZERO_READ_GRACE_MS };
+                    if started.elapsed().as_millis() >= grace_ms {
+                        crate::debug_log::server_log(
+                            "pty-reader",
+                            &format!(
+                                "{} exit zero_reads={} saw_output={} total_bytes={} grace_ms={}",
+                                reader_label, zero_reads, saw_output, total_bytes, grace_ms
+                            ),
+                        );
+                        break;
+                    }
                     thread::sleep(Duration::from_millis(1));
                 }
-                Err(_) => break,
+                Err(e) => {
+                    crate::debug_log::server_log(
+                        "pty-reader",
+                        &format!("{} exit read_error={} saw_output={} total_bytes={}", reader_label, e, saw_output, total_bytes),
+                    );
+                    break;
+                }
             }
         }
         // Signal end-of-stream and wake parser thread one last time so it
@@ -1300,8 +1409,11 @@ pub fn spawn_reader_thread(
     });
 
     // ── Parser thread: coalesces staged bytes, processes under one lock ──
+    let parser_label = debug_label;
     thread::spawn(move || {
         let mut preemptive_cpr_response_available = preemptive_cpr_response_available;
+        let mut batches: u64 = 0;
+        let mut parsed_bytes_total: u64 = 0;
         loop {
             // Wait for at least one byte (or shutdown).
             {
@@ -1315,6 +1427,10 @@ pub fn spawn_reader_thread(
                         // Reader is gone and nothing left to drain — exit
                         // after running alt-screen cleanup below.
                         drop(buf);
+                        crate::debug_log::server_log(
+                            "pty-parser",
+                            &format!("{} exit batches={} parsed_bytes={}", parser_label, batches, parsed_bytes_total),
+                        );
                         if let Ok(mut parser) = term_reader.lock() {
                             if parser.screen().alternate_screen() {
                                 parser.process(b"\x1b[?25h\x1b[?1049l");
@@ -1366,6 +1482,8 @@ pub fn spawn_reader_thread(
                 }
             };
             if bytes.is_empty() { continue; }
+            batches = batches.saturating_add(1);
+            parsed_bytes_total = parsed_bytes_total.saturating_add(bytes.len() as u64);
 
             // Scan for cursor shape and RMCUP on the raw batch BEFORE
             // handing to vt100 parser (preserves prior ordering semantics).
@@ -1390,8 +1508,11 @@ pub fn spawn_reader_thread(
             // pwsh emits ESC[6n at startup and after session events such as
             // lock/unlock; the main loop writes the response via pane.writer.
             if should_signal_reactive_cpr(has_cpr_query, &mut preemptive_cpr_response_available) {
+                crate::debug_log::server_log("pty-parser", &format!("{} reactive_cpr batch={} bytes={}", parser_label, batches, bytes.len()));
                 cpr_pending.store(true, Ordering::Release);
                 crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
+            } else if has_cpr_query {
+                crate::debug_log::server_log("pty-parser", &format!("{} startup_cpr_covered batch={} bytes={}", parser_label, batches, bytes.len()));
             }
             dv_writer.fetch_add(1, Ordering::Release);
             crate::types::PTY_DATA_READY.store(true, Ordering::Release);

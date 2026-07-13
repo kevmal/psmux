@@ -401,7 +401,19 @@ pub fn prune_exited(n: Node, remain_on_exit: bool) -> (Option<Node>, usize) {
         Node::Leaf(mut p) => {
             if p.dead { return (Some(Node::Leaf(p)), 0); }
             match p.child.try_wait() {
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    // A child that dies within seconds of its spawn is a
+                    // startup crash (e.g. the ConPTY "handle is invalid"
+                    // failure mode) — log it loudly with the server's own
+                    // console state so the incident is diagnosable later.
+                    if let Some((age_ms, child_pid)) = crate::debug_log::record_pane_exit(p.id) {
+                        if age_ms < crate::debug_log::EARLY_DEATH_MS {
+                            crate::debug_log::spawn_log("early-death", &format!(
+                                "pane=%{} pid={} exited {}ms after spawn exit_code=0x{:08x} — startup crash; window will be culled. {}",
+                                p.id, child_pid, age_ms, status.exit_code(),
+                                crate::platform::console_state_summary()));
+                        }
+                    }
                     if remain_on_exit {
                         p.dead = true;
                         (Some(Node::Leaf(p)), 1)

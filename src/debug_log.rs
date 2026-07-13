@@ -220,3 +220,92 @@ pub fn server_log(component: &str, msg: &str) {
 pub fn server_log_enabled() -> bool {
     SERVER_LOG.lock().ok().map_or(false, |g| g.is_some())
 }
+
+// ─── Spawn diagnostics log (ALWAYS ON) ──────────────────────────────────────
+//
+// Unlike the gated logs above, spawn diagnostics are always enabled: pane
+// spawns are rare (user-initiated), so the cost is negligible, and the
+// "new window instantly dies with `The handle is invalid`" failure mode
+// (2026-06-26 / 2026-07-13, Ops session) is state-dependent and impossible
+// to diagnose after the fact without a persistent record.  The log answers:
+//   - which spawns happened, in which session, at what ConPTY size
+//   - whether the child died young (startup crash) and with what exit code
+//   - what the server's own console state looked like at that moment
+//   - how recently a console inject cycle (AttachConsole/FreeConsole) ran
+//
+// File: `~/.psmux/spawn_diag.log`, shared by all servers (each line carries
+// the writer's pid + session), append-mode, truncated at open when >2 MB.
+
+static SPAWN_LOG: LazyLock<Mutex<Option<std::fs::File>>> = LazyLock::new(|| {
+    let dir = psmux_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{}/spawn_diag.log", dir);
+    // Trim the shared file when it grows past 2 MB.  Losing old history at
+    // the boundary is acceptable; unbounded growth is not.
+    let too_big = std::fs::metadata(&path).map_or(false, |m| m.len() > 2 * 1024 * 1024);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(!too_big)
+        .truncate(too_big)
+        .write(true)
+        .open(&path)
+        .ok();
+    Mutex::new(file)
+});
+
+static SPAWN_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const SPAWN_LOG_CAP: u32 = 20_000;
+
+/// Session name for spawn log lines, set once at server startup.
+static SPAWN_LOG_SESSION: Mutex<String> = Mutex::new(String::new());
+
+/// Record the session name this process serves; prefixes every spawn log line.
+pub fn set_spawn_log_session(name: &str) {
+    if let Ok(mut s) = SPAWN_LOG_SESSION.lock() {
+        *s = name.to_string();
+    }
+}
+
+/// Log a spawn-diagnostics message. Always on.
+///
+/// `component` — short tag like `"spawn"`, `"early-death"`, `"warm"`, `"inject"`.
+pub fn spawn_log(component: &str, msg: &str) {
+    let n = SPAWN_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= SPAWN_LOG_CAP { return; }
+    let session = SPAWN_LOG_SESSION.lock().map(|s| s.clone()).unwrap_or_default();
+    if let Ok(mut guard) = SPAWN_LOG.lock() {
+        if let Some(ref mut f) = *guard {
+            let _ = writeln!(f, "[{}][pid={} s={}][{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                std::process::id(), session, component, msg);
+            let _ = f.flush();
+        }
+    }
+}
+
+// ─── Pane spawn-time registry ───────────────────────────────────────────────
+//
+// Maps pane_id → (spawn Instant, child pid).  Lets `prune_exited` (which sees
+// a child exit but knows nothing about when it started) distinguish a normal
+// exit from a startup crash and log the latter loudly with the child's age.
+
+static SPAWN_TIMES: LazyLock<Mutex<std::collections::HashMap<usize, (std::time::Instant, u32)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Register a freshly spawned pane child. Call right after spawn_command().
+pub fn record_pane_spawn(pane_id: usize, child_pid: u32) {
+    if let Ok(mut m) = SPAWN_TIMES.lock() {
+        m.insert(pane_id, (std::time::Instant::now(), child_pid));
+    }
+}
+
+/// Report a pane child exit. Returns `(age_ms, child_pid)` if the spawn was
+/// registered. Removes the entry.
+pub fn record_pane_exit(pane_id: usize) -> Option<(u128, u32)> {
+    SPAWN_TIMES.lock().ok()?.remove(&pane_id)
+        .map(|(t, pid)| (t.elapsed().as_millis(), pid))
+}
+
+/// Threshold below which a child exit after spawn is logged as a startup
+/// crash ("early death") with full console-state diagnostics.
+pub const EARLY_DEATH_MS: u128 = 5_000;

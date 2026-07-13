@@ -54,33 +54,30 @@ pub fn next_session_name(ns_prefix: Option<&str>) -> String {
 
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::registry::psmux_dir();
     if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "port").unwrap_or(false) {
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(5)
-                        ).is_err() {
-                            let _ = std::fs::remove_file(&path);
-                            // Also remove the matching .key file to prevent
-                            // orphaned keys from accumulating (issue #136).
-                            let key_path = path.with_extension("key");
-                            let _ = std::fs::remove_file(&key_path);
-                        }
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                        let key_path = path.with_extension("key");
-                        let _ = std::fs::remove_file(&key_path);
+                let Some(base) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
+                if crate::registry::read_port(base).is_none() {
+                    crate::registry::log_registry_event(
+                        "cleanup_remove_invalid_port",
+                        &format!("base={} path={}", base, path.display()),
+                    );
+                    crate::registry::remove_registration(base);
+                    continue;
+                }
+                match crate::registry::registration_liveness(base) {
+                    crate::registry::Liveness::Alive => {}
+                    crate::registry::Liveness::Dead => {
+                        crate::registry::log_registry_event(
+                            "cleanup_remove_dead",
+                            &format!("base={} path={}", base, path.display()),
+                        );
+                        crate::registry::remove_registration(base);
                     }
+                    crate::registry::Liveness::Missing => {}
                 }
             }
         }
