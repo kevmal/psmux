@@ -6,8 +6,8 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = "tmux"
-$SshHost = "gj@localhost"
-
+$SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
+$SshHost = "$SshUser@localhost"
 Write-Host "=== Issue #197 Exact Text Reproduction Test ===" -ForegroundColor Cyan
 
 # Cleanup
@@ -15,7 +15,7 @@ ssh $SshHost "$PSMUX kill-server" 2>$null
 Start-Sleep -Seconds 2
 
 # Clear debug log
-ssh $SshHost "cmd /c echo. > C:\Users\gj\.psmux\ssh_input.log" 2>$null
+ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
 
 $ESC = [char]0x1b
 $BPO = "${ESC}[200~"

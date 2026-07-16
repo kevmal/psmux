@@ -178,6 +178,37 @@ The `#{window_zoomed_flag}` format variable is correctly maintained during zoom/
 
 Multi-byte UTF-8 characters (box-drawing, emoji, CJK text) render correctly in panes. Pasting CJK text no longer crashes the session. Japanese and Korean IME input is handled with minimal latency (the paste-detection heuristic was tuned to avoid misidentifying rapid IME bursts).
 
+## Behavioral Differences from tmux
+
+A few commands intentionally behave differently from upstream tmux. These are deliberate choices, not bugs.
+
+### `kill-server` with Multiple Sockets
+
+In upstream tmux, each `-L <name>` socket is a fully separate server, and `kill-server` only ever affects the socket it was invoked on. Bare `tmux kill-server` kills the default socket and leaves any `-L` servers running.
+
+psmux differs: **bare `psmux kill-server` tears down every socket and every session at once**, the default namespace plus all `-L` namespaces. It is a single "stop everything" switch. This is convenient on Windows, where leftover background servers are easy to lose track of.
+
+The namespaced form stays scoped, exactly like tmux:
+
+```text
+psmux kill-server            # kills ALL sockets and ALL sessions (default + every -L namespace)
+psmux -L work kill-server    # kills ONLY the "work" socket; other sockets keep running
+```
+
+So if you rely on isolated `-L` instances, always pass `-L <name>` to `kill-server` to limit the blast radius. Reach for bare `kill-server` only when you genuinely want a clean slate.
+
+### Background Processes When a Pane Exits
+
+On Unix, tmux leans on the kernel: closing a pane's terminal sends SIGHUP to its foreground process group, and anything deliberately detached (`nohup`, daemons, most GUI apps) survives. Windows has no SIGHUP and no pty process groups, so psmux walks the pane's process tree instead. By default, when a pane's shell exits on its own, psmux terminates the background children that shell left behind; without the sweep they leak invisibly along with a `conhost.exe` each, which in bulk can exhaust the desktop heap.
+
+To get tmux-style survival for intentionally backgrounded processes, opt out with the `@kill-descendants` user option:
+
+```tmux
+set -g @kill-descendants off
+```
+
+Explicit `kill-pane`, `kill-window`, and `kill-session` always terminate the pane's full process tree regardless of this option. See the Dead Panes section in [configuration.md](configuration.md) for details.
+
 ## Format Variables
 
 psmux supports 140+ format variables with full modifier support, including:

@@ -30,6 +30,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "pane-base-index" => app.pane_base_index.to_string(),
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
+        "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
         "pwsh-mouse-selection" => if app.pwsh_mouse_selection { "on".into() } else { "off".into() },
         "mouse-selection" => if app.mouse_selection { "on".into() } else { "off".into() },
@@ -193,6 +194,55 @@ pub(crate) fn render_window_options(app: &AppState) -> String {
     output
 }
 
+/// Returns `true` if the given option name is a boolean (on/off) option.
+/// Used by set-option toggle logic (tmux parity: `set <option>` without a
+/// value toggles boolean options).
+pub(crate) fn is_boolean_option(name: &str) -> bool {
+    matches!(
+        name,
+        "mouse"
+            | "scroll-enter-copy-mode"
+            | "pwsh-mouse-selection"
+            | "mouse-selection"
+            | "paste-detection"
+            | "choose-tree-preview"
+            | "focus-events"
+            | "renumber-windows"
+            | "automatic-rename"
+            | "allow-rename"
+            | "allow-set-title"
+            | "monitor-activity"
+            | "visual-activity"
+            | "synchronize-panes"
+            | "remain-on-exit"
+            | "destroy-unattached"
+            | "exit-empty"
+            | "set-titles"
+            | "aggressive-resize"
+            | "visual-bell"
+            | "prediction-dimming"
+            | "allow-predictions"
+            | "cursor-blink"
+            | "warm"
+            | "alternate-screen"
+            | "claude-code-fix-tty"
+            | "claude-code-force-interactive"
+            | "status"
+    )
+}
+
+/// Toggle a boolean option: read current value and flip it.
+/// Returns `true` if the option was toggled, `false` if not a boolean option.
+pub(crate) fn toggle_option(app: &mut AppState, option: &str) -> bool {
+    if !is_boolean_option(option) {
+        return false;
+    }
+    let current = get_option_value(app, option);
+    let new_value = if current == "on" { "off" } else { "on" };
+    apply_set_option(app, option, new_value, false);
+    true
+}
+
 /// Apply a set-option command. If `quiet` is true, unknown options are silently ignored.
 pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _quiet: bool) {
     match option {
@@ -215,6 +265,10 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             }
         }
         "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
+        "bold-is-bright" => {
+            app.bold_is_bright = matches!(value, "on" | "true" | "1");
+            crate::platform::set_bold_is_bright(app.bold_is_bright);
+        }
         "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1"); }
         "pwsh-mouse-selection" => { app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1"); }
         "mouse-selection" => { app.mouse_selection = matches!(value, "on" | "true" | "1"); }
@@ -414,15 +468,12 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                     wp.child.kill().ok();
                 }
                 // Kill the background warm server process
-                let home = std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_default();
                 let warm_base = if let Some(ref sn) = app.socket_name {
                     format!("{}____warm__", sn)
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                let warm_port_path = crate::paths::port_file(&warm_base);
                 if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
@@ -436,7 +487,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                     }
                 }
                 let _ = std::fs::remove_file(&warm_port_path);
-                let warm_key_path = format!("{}\\.psmux\\{}.key", home, warm_base);
+                let warm_key_path = crate::paths::key_file(&warm_base);
                 let _ = std::fs::remove_file(&warm_key_path);
             }
         }
@@ -489,3 +540,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue266_per_window_autorename.rs"]
 mod tests_issue266_per_window_autorename;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue278_toggle_bool_option.rs"]
+mod tests_issue278_toggle_bool_option;

@@ -5,23 +5,25 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = "tmux"
+$SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
+$SshHost = "$SshUser@localhost"
 
 Write-Host "=== VT Parser Paste: Missing Close Sequence Test ===" -ForegroundColor Cyan
 
 # Step 1: Clean up
-ssh gj@localhost "$PSMUX kill-server" 2>$null
+ssh $SshHost "$PSMUX kill-server" 2>$null
 Start-Sleep -Seconds 2
 
 # Step 2: Clear debug log
-ssh gj@localhost "cmd /c echo. > C:\Users\gj\.psmux\ssh_input.log" 2>$null
+ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
 
 # Step 3: Create session with verbose debug logging
-ssh gj@localhost "set PSMUX_SSH_DEBUG=1&& tmux new-session -d -s missing_close"
+ssh $SshHost "set PSMUX_SSH_DEBUG=1&& tmux new-session -d -s missing_close"
 Start-Sleep -Seconds 3
 Write-Host "[OK] Session created" -ForegroundColor Green
 
 # Step 4: Clear pane
-ssh gj@localhost "$PSMUX send-keys -t missing_close 'clear' Enter"
+ssh $SshHost "$PSMUX send-keys -t missing_close 'clear' Enter"
 Start-Sleep -Seconds 1
 
 # Step 5: Attach via SSH, inject bracket paste WITHOUT close sequence
@@ -29,7 +31,7 @@ Write-Host "[STEP 5] Attaching and injecting paste WITHOUT close sequence..." -F
 
 $proc = New-Object System.Diagnostics.Process
 $proc.StartInfo.FileName = "ssh"
-$proc.StartInfo.Arguments = "-tt gj@localhost $PSMUX attach -t missing_close"
+$proc.StartInfo.Arguments = "-tt $SshHost $PSMUX attach -t missing_close"
 $proc.StartInfo.UseShellExecute = $false
 $proc.StartInfo.RedirectStandardInput = $true
 $proc.StartInfo.RedirectStandardOutput = $true
@@ -84,13 +86,13 @@ try { $proc.Kill() } catch {}
 Start-Sleep -Seconds 1
 
 # Capture
-$capture = ssh gj@localhost "$PSMUX capture-pane -t missing_close -p"
+$capture = ssh $SshHost "$PSMUX capture-pane -t missing_close -p"
 Write-Host "--- PANE CONTENT ---" -ForegroundColor Cyan
 $capture | ForEach-Object { Write-Host "  $_" }
 Write-Host "--- END ---" -ForegroundColor Cyan
 
 # Debug log
-$debugLog = ssh gj@localhost "type C:\Users\gj\.psmux\ssh_input.log"
+$debugLog = ssh $SshHost "type %USERPROFILE%\.psmux\ssh_input.log"
 Write-Host "--- DEBUG LOG (relevant lines) ---" -ForegroundColor DarkGray
 $debugLog | Where-Object { $_ -match "paste|Paste|drain|Drain|flush|tilde|KEY|emit|u_char" } | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 Write-Host "--- END ---" -ForegroundColor DarkGray
@@ -136,5 +138,5 @@ if ($debugStr -match "PasteDrain") {
 }
 
 # Cleanup
-ssh gj@localhost "$PSMUX kill-server" 2>$null
+ssh $SshHost "$PSMUX kill-server" 2>$null
 Write-Host "=== DONE ===" -ForegroundColor Cyan

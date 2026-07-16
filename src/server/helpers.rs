@@ -52,6 +52,46 @@ pub(crate) fn serialize_bindings_json(app: &AppState) -> String {
 
 /// Escape a string for embedding inside a JSON double-quoted value.
 /// Handles backslashes, double-quotes, and control characters.
+/// Append the copy-mode-line-numbers state fields to a JSON object buffer that
+/// currently ends with `}`. Emits nothing when the option is unset or `off`.
+/// Ships the option value, the active pane's scrollback size (for absolute /
+/// hybrid numbering), and the optional gutter styles.
+pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
+    let Some(cln) = app.user_options.get("copy-mode-line-numbers") else { return; };
+    if cln == "off" || !buf.ends_with('}') { return; }
+    let hsize = app.windows.get(app.active_idx)
+        .and_then(|win| crate::tree::active_pane(&win.root, &win.active_path))
+        .and_then(|p| p.term.lock().ok().map(|g| g.screen().scrollback_filled()))
+        .unwrap_or(0);
+    buf.pop();
+    buf.push_str(",\"copy_mode_line_numbers\":\"");
+    buf.push_str(&json_escape_string(cln));
+    buf.push_str("\",\"copy_hsize\":");
+    buf.push_str(&hsize.to_string());
+    if let Some(st) = app.user_options.get("copy-mode-line-number-style") {
+        buf.push_str(",\"copy_mode_line_number_style\":\"");
+        buf.push_str(&json_escape_string(st));
+        buf.push('"');
+    }
+    if let Some(st) = app.user_options.get("copy-mode-current-line-number-style") {
+        buf.push_str(",\"copy_mode_current_line_number_style\":\"");
+        buf.push_str(&json_escape_string(st));
+        buf.push('"');
+    }
+    buf.push('}');
+}
+
+/// Append the active window's floating-pane overlays to a JSON object buffer
+/// that currently ends with `}`. Emits nothing when there are no floats.
+pub(crate) fn append_floats_json(app: &AppState, buf: &mut String) {
+    if !buf.ends_with('}') { return; }
+    let frag = crate::popup::serialize_floats_json(app);
+    if frag.is_empty() { return; }
+    buf.pop();
+    buf.push_str(&frag);
+    buf.push('}');
+}
+
 pub(crate) fn json_escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -68,6 +108,33 @@ pub(crate) fn json_escape_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Inject the status-bar style options that were dropped when the monolithic
+/// `app.rs` renderer was split into the modular client (regression from the
+/// modularization refactor, issue #451). The client only ever received
+/// `ws_style`/`wsc_style`, so `status-left-style`, `status-right-style`, and
+/// `window-status-{activity,bell,last}-style` never reached the renderer and had
+/// no effect. These are appended to the already-built render-state JSON object
+/// the same way `clock_colour` and the pane-border extras are (pop the trailing
+/// `}`, add fields, re-close), so the giant format-string arg list is untouched.
+pub(crate) fn append_extra_style_json(buf: &mut String, app: &AppState) {
+    if !buf.ends_with('}') { return; }
+    buf.pop();
+    for (key, raw) in [
+        ("status_left_style", &app.status_left_style),
+        ("status_right_style", &app.status_right_style),
+        ("wsa_style", &app.window_status_activity_style),
+        ("wsb_style", &app.window_status_bell_style),
+        ("wsl_style", &app.window_status_last_style),
+    ] {
+        buf.push_str(",\"");
+        buf.push_str(key);
+        buf.push_str("\":\"");
+        buf.push_str(&json_escape_string(&crate::format::expand_format(raw, app)));
+        buf.push('"');
+    }
+    buf.push('}');
 }
 
 /// Build windows JSON with pre-expanded tab_text for each window.
@@ -87,7 +154,10 @@ pub(crate) fn list_windows_json_with_tabs(app: &AppState) -> io::Result<String> 
             name: w.name.clone(),
             active: is_active,
             activity: w.activity_flag,
+            bell: w.bell_flag,
+            last: i == app.last_window_idx,
             tab_text: tab,
+            idx: app.win_display_index(i),
         });
     }
     serde_json::to_string(&v)
@@ -111,6 +181,14 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     }
     if let Some(win) = app.windows.get(app.active_idx) {
         walk(&win.root, &mut v);
+    }
+    // Include per-window status flags so non-active windows changing their
+    // bell/activity/silence state forces a frame emission. Without this, the
+    // status bar shows the bell or activity indicator only after some
+    // incidental repaint trigger like a mouse move or window switch (#162).
+    for (i, w) in app.windows.iter().enumerate() {
+        let bits = (w.bell_flag as u64) | ((w.activity_flag as u64) << 1) | ((w.silence_flag as u64) << 2);
+        v = v.wrapping_add(bits.wrapping_mul(0x50011).wrapping_add(i as u64));
     }
     // Include mode discriminant so overlay state changes (PopupMode, MenuMode,
     // ConfirmMode, PaneChooser, ClockMode) always invalidate the cached version.
@@ -153,6 +231,14 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     v = v.wrapping_add((app.copy_scroll_offset as u64).wrapping_mul(0x20003));
     if let Some((ar, ac)) = app.copy_anchor {
         v = v.wrapping_add((ar as u64).wrapping_mul(0x30007).wrapping_add(ac as u64));
+    }
+    // Include status_message content so the search prompt refreshes per
+    // keystroke while the user is typing in copy-mode search (#335).
+    if let Some((ref msg, _, _)) = app.status_message {
+        v = v.wrapping_add((msg.len() as u64).wrapping_mul(0x40009));
+        if let Some(b) = msg.as_bytes().last() {
+            v = v.wrapping_add(*b as u64);
+        }
     }
     v
 }
@@ -287,6 +373,41 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
     parser.screen().progress()
 }
 
+/// Drain a pending OSC 52 clipboard payload from any pane in the tree.
+/// Returns the first `(selector, base64_data)` found and clears it on the
+/// source pane.  Lets a child process inside any pane (e.g. Claude Code's
+/// `/copy`) ask the host terminal to copy text — the dump-state builder
+/// stages the result onto `App.clipboard_osc52`, the client re-emits OSC
+/// 52 on its own stdout, and the host terminal performs the copy.
+pub(crate) fn take_pane_clipboard(app: &AppState) -> Option<(Vec<u8>, Vec<u8>)> {
+    for win in &app.windows {
+        if let Some(payload) = drain_clipboard_in_node(&win.root) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn drain_clipboard_in_node(node: &Node) -> Option<(Vec<u8>, Vec<u8>)> {
+    match node {
+        Node::Leaf(p) => {
+            if p.dead {
+                return None;
+            }
+            let mut parser = p.term.lock().ok()?;
+            parser.screen_mut().take_clipboard()
+        }
+        Node::Split { children, .. } => {
+            for c in children {
+                if let Some(r) = drain_clipboard_in_node(c) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn propagate_osc_titles_in_tree(node: &mut Node, dirty: &mut bool) {
     match node {
         Node::Leaf(p) => {
@@ -355,6 +476,87 @@ pub(crate) fn drain_cpr_pending(node: &mut crate::types::Node) {
         crate::types::Node::Split { children, .. } => {
             for c in children {
                 drain_cpr_pending(c);
+            }
+        }
+    }
+}
+
+/// Issue #473: format an RGB triple as the xterm 16-bit-per-channel reply
+/// payload (`rgb:RRRR/GGGG/BBBB`), scaling 8-bit values by duplication.
+fn x11_rgb((r, g, b): (u8, u8, u8)) -> String {
+    format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+/// Issue #473: answer terminal color queries detected in a pane's output.
+///
+/// `bits` is the pane's drained `color_query_pending` bitmask.  Delivery is
+/// split by sequence type because ConPTY treats them differently on the
+/// child-input path (verified on Win11 26200, WT 1.24):
+///   * CSI replies (`?997;Nn`) pass through a normal pipe write intact — the
+///     same path the ESC[6n CPR responder uses.
+///   * Complete OSC replies written to the pseudoconsole input pipe are
+///     consumed by ConPTY before the child sees them, so they are injected
+///     as console KEY_EVENT records via WriteConsoleInputW instead
+///     (`send_vt_response`), falling back to the pipe if injection fails
+///     (e.g. no child pid, or non-Windows where the pipe is not filtered).
+///
+/// ConPTY also consumes the OSC 10;?/11;? QUERIES on the output path, so they
+/// normally never reach psmux.  Applications that need the full picture
+/// (GitHub Copilot CLI) issue fg/bg/palette queries as one burst; when the
+/// palette burst is observed (index 0 queried), the fg/bg replies they are
+/// simultaneously waiting for are included as well.
+pub(crate) fn answer_color_queries(
+    bits: u32,
+    writer: &mut dyn std::io::Write,
+    child_pid: Option<u32>,
+    colors: &crate::types::HostColors,
+) {
+    if bits == 0 { return; }
+    // Light/dark scheme query: CSI ?996n → CSI ?997;1n (dark) / ?997;2n (light).
+    if bits & crate::types::COLOR_QUERY_SCHEME != 0 {
+        let n = if colors.is_dark() { 1 } else { 2 };
+        let _ = writer.write_all(format!("\x1b[?997;{}n", n).as_bytes());
+        let _ = writer.flush();
+    }
+    let mut osc = String::new();
+    let burst = bits & 1 != 0; // palette index 0 queried → full-burst app
+    if (bits & crate::types::COLOR_QUERY_FG != 0 || burst) && colors.fg.is_some() {
+        osc.push_str(&format!("\x1b]10;{}\x1b\\", x11_rgb(colors.fg.unwrap())));
+    }
+    if (bits & crate::types::COLOR_QUERY_BG != 0 || burst) && colors.bg.is_some() {
+        osc.push_str(&format!("\x1b]11;{}\x1b\\", x11_rgb(colors.bg.unwrap())));
+    }
+    for i in 0..16usize {
+        if bits & (1u32 << i) != 0 {
+            if let Some(rgb) = colors.palette[i] {
+                osc.push_str(&format!("\x1b]4;{};{}\x1b\\", i, x11_rgb(rgb)));
+            }
+        }
+    }
+    if osc.is_empty() { return; }
+    let mut delivered = false;
+    if let Some(pid) = child_pid {
+        delivered = crate::platform::mouse_inject::send_vt_response(pid, &osc);
+    }
+    if !delivered {
+        let _ = writer.write_all(osc.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
+/// Issue #473: walk a pane tree and answer any pending terminal color queries.
+/// Mirrors `drain_cpr_pending`.
+pub(crate) fn drain_color_queries(node: &mut crate::types::Node, colors: &crate::types::HostColors) {
+    match node {
+        crate::types::Node::Leaf(p) => {
+            let bits = p.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
+            if bits != 0 {
+                answer_color_queries(bits, &mut *p.writer, p.child_pid, colors);
+            }
+        }
+        crate::types::Node::Split { children, .. } => {
+            for c in children {
+                drain_color_queries(c, colors);
             }
         }
     }
@@ -455,3 +657,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "unlink-window (unlinkw)",
     "wait-for (wait)",
 ];
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue451_status_styles.rs"]
+mod tests_issue451_status_styles;

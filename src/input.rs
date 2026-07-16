@@ -17,6 +17,18 @@ use crate::copy_mode::{enter_copy_mode, exit_copy_mode, switch_with_copy_save, m
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 
+/// Refresh the status-bar prompt shown while the user is typing in copy-mode
+/// search (#335). Without this the screen looks frozen because the search
+/// input is otherwise invisible.
+fn refresh_search_prompt(app: &mut AppState) {
+    if let Mode::CopySearch { ref input, forward } = app.mode {
+        let arrow = if forward { "down" } else { "up" };
+        let prompt = format!("(search {}) {}", arrow, input);
+        // display-time = 0 keeps the message sticky until cleared.
+        app.status_message = Some((prompt, Instant::now(), Some(0)));
+    }
+}
+
 /// Write a mouse event to the child PTY using the encoding the child requested.
 fn write_mouse_event(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
     match enc {
@@ -64,6 +76,13 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             // Check root key table for bindings (bind-key -n / bind-key -T root)
             let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
             if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
+                // Skip scroll-triggered copy mode entry when the option is
+                // off so the key (PageUp) reaches the PTY instead (#284).
+                let is_scroll_copy = matches!(&bind.action, crate::types::Action::Command(cmd) if cmd.starts_with("copy-mode") && cmd.contains("-u"));
+                if is_scroll_copy && !app.scroll_enter_copy_mode {
+                    forward_key_to_active(app, key)?;
+                    return Ok(false);
+                }
                 return execute_action(app, &bind.action);
             }
             forward_key_to_active(app, key)?;
@@ -127,20 +146,17 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Down => { switch_with_copy_save(app, |app| move_focus(app, FocusDir::Down)); true }
                 KeyCode::Char(d) if d.is_ascii_digit() => {
                     let idx = d.to_digit(10).unwrap() as usize;
-                    if idx >= app.window_base_index {
-                        let internal_idx = idx - app.window_base_index;
-                        if internal_idx < app.windows.len() {
-                            switch_with_copy_save(app, |app| {
-                                app.last_window_idx = app.active_idx;
-                                app.active_idx = internal_idx;
-                            });
-                        }
+                    if let Some(internal_idx) = app.win_pos(idx) {
+                        switch_with_copy_save(app, |app| {
+                            app.last_window_idx = app.active_idx;
+                            app.active_idx = internal_idx;
+                        });
                     }
                     true
                 }
                 KeyCode::Char('c') => {
                     let pty_system = native_pty_system();
-                    create_window(&*pty_system, app, None, None)?;
+                    create_window(&*pty_system, app, None, None, false)?;
                     true
                 }
                 KeyCode::Char('n') => {
@@ -592,10 +608,13 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     if let Mode::WindowChooser { selected: s, ref tree } = &app.mode {
                         let entry = &tree[*s];
                         if entry.is_current_session {
-                            // Same session: switch window directly
+                            // Same session: switch window directly. window_index is a
+                            // DISPLAY index (honors gaps); map it to a Vec position.
                             if let Some(wi) = entry.window_index {
-                                app.last_window_idx = app.active_idx;
-                                app.active_idx = wi;
+                                if let Some(pos) = app.win_pos(wi) {
+                                    app.last_window_idx = app.active_idx;
+                                    app.active_idx = pos;
+                                }
                             }
                         } else {
                             // Different session: set env and trigger switch
@@ -621,14 +640,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Enter => {
                     if let Mode::WindowIndexPrompt { input } = &app.mode {
                         if let Ok(idx) = input.parse::<usize>() {
-                            if idx >= app.window_base_index {
-                                let internal_idx = idx - app.window_base_index;
-                                if internal_idx < app.windows.len() {
-                                    switch_with_copy_save(app, |app| {
-                                        app.last_window_idx = app.active_idx;
-                                        app.active_idx = internal_idx;
-                                    });
-                                }
+                            if let Some(internal_idx) = app.win_pos(idx) {
+                                switch_with_copy_save(app, |app| {
+                                    app.last_window_idx = app.active_idx;
+                                    app.active_idx = internal_idx;
+                                });
                             }
                         }
                     }
@@ -796,9 +812,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => { yank_selection(app)?; exit_copy_mode(app); }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                    refresh_search_prompt(app);
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                    refresh_search_prompt(app);
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     exit_copy_mode(app);
@@ -901,9 +919,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 // --- copy-mode search ---
                 KeyCode::Char('/') => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                    refresh_search_prompt(app);
                 }
                 KeyCode::Char('?') => {
                     app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                    refresh_search_prompt(app);
                 }
                 KeyCode::Char('n') => { search_next(app); }
                 KeyCode::Char('N') => { search_prev(app); }
@@ -933,6 +953,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Esc => {
                     // Cancel search, return to copy mode
                     app.mode = Mode::CopyMode;
+                    app.status_message = None;
                 }
                 KeyCode::Enter => {
                     // Execute search
@@ -949,12 +970,15 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         }
                     }
                     app.mode = Mode::CopyMode;
+                    app.status_message = None;
                 }
                 KeyCode::Backspace => {
                     if let Mode::CopySearch { ref mut input, .. } = app.mode { let _ = input.pop(); }
+                    refresh_search_prompt(app);
                 }
                 KeyCode::Char(c) => {
                     if let Mode::CopySearch { ref mut input, .. } = app.mode { input.push(c); }
+                    refresh_search_prompt(app);
                 }
                 _ => {}
             }
@@ -1770,7 +1794,12 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
             format!("\x1b{}", c).into_bytes()
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let ctrl_char = (c as u8) & 0x1F;
+            // Use the tmux-parity control mapping so punctuation collapses to the
+            // correct C0 byte: C-/ -> 0x1f (^_), C-- (Ctrl+Shift+-) -> 0x1f, etc.
+            // The naive `c & 0x1f` mis-mapped these (e.g. '/' -> 0x0f ^O, issue
+            // #226) and broke neovim's Ctrl+/ comment-toggle under ConPTY
+            // terminals like Alacritty/WezTerm (issue #394).
+            let ctrl_char = ctrl_char_send_keys_byte(c).unwrap_or((c as u8) & 0x1F);
             vec![ctrl_char]
         }
         KeyCode::Char(c) if (c as u32) >= 0x01 && (c as u32) <= 0x1A => {
@@ -1791,11 +1820,19 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
                 #[cfg(windows)]
                 {
                     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+                    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
                     if !has_ctrl {
                         return Some(b"\x1b\r".to_vec());
                     }
+                    // Plain Ctrl+Enter: LF (0x0A), matching Windows Terminal and the
+                    // native VK_RETURN injection payload (#409).  This is the byte
+                    // fallback used only when native injection is unavailable.
+                    if has_ctrl && !has_alt && !has_shift {
+                        return Some(b"\n".to_vec());
+                    }
                 }
-                // Non-Windows or Ctrl combos: xterm modified-Enter: CSI 13 ; mod ~
+                // Non-Windows or other Ctrl combos: xterm modified-Enter: CSI 13 ; mod ~
                 format!("\x1b[13;{}~", m).into_bytes()
             } else {
                 b"\r".to_vec()
@@ -1862,7 +1899,112 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
     Some(encoded)
 }
 
+/// Map a CSI cursor key (`ESC [` A/B/C/D/H/F) to its SS3 form (`ESC O` x) when the
+/// target pane is in DECCKM application-cursor-keys mode; `None` keeps the CSI form.
+///
+/// Apps that enable application-cursor mode (via `ESC [ ? 1 h`), notably
+/// PowerShell/PSReadLine reached through an SSH pane, expect SS3 for unmodified
+/// arrows/Home/End and echo the raw escape when handed CSI instead. Local panes
+/// usually leave the mode off, so the mismatch only bites over SSH. Modified cursor
+/// keys stay xterm CSI (`ESC [ 1 ; mod x`); they are longer than 3 bytes, so the
+/// `len() == 3` guard skips them. tmux parity (`input_key`, `MODE_KCURSOR`).
+pub(crate) fn csi_cursor_to_ss3(seq: &[u8], app_cursor: bool) -> Option<[u8; 3]> {
+    if app_cursor
+        && seq.len() == 3
+        && seq[0] == 0x1b
+        && seq[1] == b'['
+        && matches!(seq[2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
+    {
+        Some([0x1b, b'O', seq[2]])
+    } else {
+        None
+    }
+}
+
+/// Write a key's byte sequence to a pane, upgrading a CSI cursor key to its SS3
+/// form when the pane is in DECCKM application-cursor mode (see csi_cursor_to_ss3).
+/// The transform no-ops on every other sequence, so all named keys route through
+/// this uniformly. Does not flush; callers flush once after the write.
+pub(crate) fn write_key_seq(p: &mut crate::types::Pane, seq: &[u8]) {
+    use std::io::Write as _;
+    let app_cursor = p.term.lock()
+        .map(|t| t.screen().application_cursor())
+        .unwrap_or(false);
+    let _ = match csi_cursor_to_ss3(seq, app_cursor) {
+        Some(ss3) => p.writer.write_all(&ss3),
+        None => p.writer.write_all(seq),
+    };
+}
+
+/// A printable text keystroke on the INTERACTIVE input route (drives
+/// `#{pane_last_text_input}`). Excludes control codes and any Ctrl/Alt-modified
+/// key, so navigation, shortcuts, Enter, Tab, etc. don't count. Shift is fine
+/// (capitals).
+pub(crate) fn is_text_input_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+    )
+}
+
+/// True when this key event represents plain Ctrl+C (or raw ETX / 0x03)
+/// without Alt modifiers. Used to keep interrupt behavior on Windows.
+pub(crate) fn is_ctrl_c_key_event(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(c) => {
+            (key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && c.eq_ignore_ascii_case(&'c'))
+                || (!key.modifiers.contains(KeyModifiers::ALT) && c == '\u{0003}')
+        }
+        _ => false,
+    }
+}
+
+/// Apply `f` to every pane that will RECEIVE the current interactive key --
+/// every non-dead pane under sync-input, else the active pane if alive -- so the
+/// route-signal timestamps match what's actually routed.
+fn for_each_receiving_pane<F: FnMut(&mut Pane)>(app: &mut AppState, mut f: F) {
+    let sync = app.sync_input;
+    let win = &mut app.windows[app.active_idx];
+    if sync {
+        fn walk<F: FnMut(&mut Pane)>(node: &mut Node, f: &mut F) {
+            match node {
+                Node::Leaf(p) if !p.dead => f(p),
+                Node::Leaf(_) => {}
+                Node::Split { children, .. } => { for c in children { walk(c, f); } }
+            }
+        }
+        walk(&mut win.root, &mut f);
+    } else if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        if !p.dead {
+            f(p);
+        }
+    }
+}
+
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
+    // Record use of the INTERACTIVE input route as read-only route signals:
+    // `#{pane_last_text_input}` (printable text) and, for every other key,
+    // `#{pane_last_special_key}` / `_ms` (the last non-text key -- Esc, Enter,
+    // arrows, function keys, Ctrl/Alt chords -- by canonical bind-key name).
+    // This route is handle_key -> forward_key_to_active; the injected route
+    // (send-keys / send-paste / send-text -> send_text_to_active) does NOT pass
+    // here, so it never updates these signals. for_each_receiving_pane stamps
+    // exactly the panes that will RECEIVE the key, so the timestamps match what
+    // is actually routed.
+    if is_text_input_key(&key) {
+        let now = Instant::now();
+        for_each_receiving_pane(app, |p| p.last_text_input = Some(now));
+    } else {
+        let now = Instant::now();
+        let name = crate::config::format_key_binding(&(key.code, key.modifiers));
+        for_each_receiving_pane(app, |p| p.last_special_key = Some((now, name.clone())));
+    }
+
     // On Windows, modified Enter delivery depends on the modifier:
     //
     // Shift/Alt+Enter (no Ctrl): Use VT encoding ONLY (\x1b\r).  Native
@@ -1885,6 +2027,10 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
             if ctrl {
                 let try_inject = |pane: &mut Pane| -> bool {
                     if let Some(pid) = pane.child_pid {
+                        // send_modified_enter_event injects VK_RETURN with the correct
+                        // modifier flags and (for plain Ctrl+Enter) an LF character
+                        // payload, matching Windows Terminal so VT/raw readers see LF
+                        // instead of CR (#409).
                         crate::platform::mouse_inject::send_modified_enter_event(pid, ctrl, alt, shift)
                     } else {
                         false
@@ -1927,6 +2073,85 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                 }
             }
             // Shift/Alt+Enter (no Ctrl): fall through to VT encoding below.
+        }
+
+        // Ctrl+letter: inject via WriteConsoleInputW so ConPTY's VT parser
+        // state is never touched.  Writing Win32 VT sequences to the pipe
+        // leaves the parser buffering \x1b, which blocks subsequent ESC
+        // delivery to apps like Neovim (#305, fixed for send-keys; this
+        // fixes the live-keypress path).
+        //
+        // crossterm may report Ctrl+K two ways:
+        //   1. KeyCode::Char('k') with KeyModifiers::CONTROL
+        //   2. KeyCode::Char('\x0b') with NO modifiers (raw control byte)
+        // We handle both variants here.
+        if let KeyCode::Char(c) = key.code {
+            let is_ctrl_c = is_ctrl_c_key_event(&key);
+            let (inject_char, is_ctrl_letter) = if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && c.is_ascii_alphabetic()
+            {
+                (c, true)
+            } else if !key.modifiers.contains(KeyModifiers::ALT)
+                && (c as u32) >= 0x01
+                && (c as u32) <= 0x1A
+            {
+                // Raw control byte → map back to the letter (0x01='a', 0x0B='k', etc.)
+                let letter = (c as u8 + b'a' - 1) as char;
+                (letter, true)
+            } else {
+                (c, false)
+            };
+
+            if is_ctrl_letter {
+                let ctrl_char = (inject_char.to_ascii_lowercase() as u8) & 0x1F;
+
+                if app.sync_input {
+                    let win = &mut app.windows[app.active_idx];
+                    fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8, is_ctrl_c: bool) {
+                        match node {
+                            Node::Leaf(p) if !p.dead => {
+                                let _ = p.writer.write_all(&[raw]);
+                                let _ = p.writer.flush();
+                                #[cfg(windows)]
+                                if let Some(pid) = p.child_pid {
+                                    if is_ctrl_c {
+                                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                    } else {
+                                        crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
+                                    }
+                                }
+                                crate::debug_log::input_log("ctrl-key",
+                                    &format!("sync inject_ctrl char='{}' pid={:?}", ch, p.child_pid));
+                            }
+                            Node::Leaf(_) => {}
+                            Node::Split { children, .. } => {
+                                for child in children { inject_ctrl_all(child, ch, raw, is_ctrl_c); }
+                            }
+                        }
+                    }
+                    inject_ctrl_all(&mut win.root, inject_char, ctrl_char, is_ctrl_c);
+                } else {
+                    let win = &mut app.windows[app.active_idx];
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        if !active.dead {
+                            let _ = active.writer.write_all(&[ctrl_char]);
+                            let _ = active.writer.flush();
+                            #[cfg(windows)]
+                            if let Some(pid) = active.child_pid {
+                                if is_ctrl_c {
+                                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                } else {
+                                    crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
+                                }
+                            }
+                            crate::debug_log::input_log("ctrl-key",
+                                &format!("inject_ctrl char='{}' pid={:?}", inject_char, active.child_pid));
+                        }
+                    }
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -1981,7 +2206,7 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
 /// Paste the system clipboard content into the active pane.
 /// This is the Windows Terminal right-click-to-paste behavior.
 fn paste_clipboard_to_active(app: &mut AppState) -> io::Result<()> {
-    if let Some(text) = crate::copy_mode::read_from_system_clipboard() {
+    if let Some(text) = crate::clipboard::read_from_system_clipboard() {
         if !text.is_empty() {
             send_paste_to_active(app, &text)?;
         }
@@ -2010,12 +2235,12 @@ fn forward_mouse_to_pane(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16, bu
 /// MOUSE_EVENT records for crossterm/ratatui apps (ReadConsoleInputW),
 /// and passes VT through for nvim/vim apps.  (fixes #60)
 fn forward_mouse_to_pane_ex(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16,
-                             _button_state: u32, _event_flags: u32,
+                             button_state: u32, event_flags: u32,
                              vt_button: u8, press: bool) {
     let col = abs_x as i16 - area.x as i16;
     let row = abs_y as i16 - area.y as i16;
     crate::window_ops::inject_mouse_combined(
-        pane, col, row, vt_button, press, 0, 0, "client");
+        pane, col, row, vt_button, press, button_state, event_flags, "client");
 }
 
 pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
@@ -2373,7 +2598,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 let wants_mouse = {
                     let win2 = &app.windows[app.active_idx];
                     active_pane(&win2.root, &win2.active_path)
-                        .map_or(false, |p| crate::window_ops::pane_wants_mouse(p))
+                        .map_or(false, |p| crate::window_ops::pane_wants_hover(p))
                 };
                 if wants_mouse {
                     if let Some(area) = active_area {
@@ -2399,9 +2624,13 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             }
         }
         MouseEventKind::Moved => {
-            // Forward bare mouse motion (hover) only when active pane
-            // explicitly wants mouse input. This avoids sending raw
-            // SGR motion bytes (ESC[<35;...) to shell-like prompts.
+            // Forward bare mouse motion (hover) only when the child has
+            // EXPLICITLY enabled mouse motion tracking (DECSET 1002/1003).
+            // Do NOT use the permissive pane_wants_mouse() heuristic here:
+            // sending unsolicited SGR motion sequences to alt-screen apps
+            // that haven't enabled mouse tracking (nvim without mouse=a,
+            // any TUI spawning a child editor) corrupts their input.
+            // (fixes #296: Claude Code → nvim hangs due to hover flooding)
             if app.last_hover_pos == Some((me.column, me.row)) {
                 return Ok(());
             }
@@ -2409,7 +2638,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 
             if let Some(area) = active_area {
                 if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_mouse(active) {
+                    if crate::window_ops::pane_wants_hover(active) {
                         forward_mouse_to_pane_ex(active, area, me.column, me.row,
                             0, crate::platform::mouse_inject::MOUSE_MOVED,
                             35, true);
@@ -2430,24 +2659,14 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 win.active_path = path.clone();
                 active_area = Some(*area);
             }
-            // tmux parity: Only forward scroll to child if alternate screen
-            // is active (real TUI app like nvim/htop).  If not (shell prompt),
-            // auto-enter copy mode.
+            // Forward scroll to child if pane wants mouse events (real TUI app
+            // like nvim/htop).  If not (shell prompt), auto-enter copy mode.
             //
-            // We only check alternate_screen() — NOT is_fullscreen_tui() or
-            // pane_wants_mouse() — because:
-            //   - is_fullscreen_tui() false-positives when shell output (ls/dir)
-            //     fills the screen, preventing scroll-to-copy-mode.
-            //   - pane_wants_mouse() false-positives from PSReadLine's spurious
-            //     mouse tracking on ConPTY.
-            //   - alternate_screen() is reliable: all TUI apps report it correctly.
+            // Uses pane_wants_mouse() which includes heuristic fallback for
+            // older Windows 10 builds where ConPTY strips DECSET 1049h.
+            // (fixes #285)
             let child_in_alt = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| {
-                    if let Ok(parser) = p.term.lock() {
-                        return parser.screen().alternate_screen();
-                    }
-                    false
-                });
+                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
             if child_in_alt {
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
@@ -2485,18 +2704,10 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 win.active_path = path.clone();
                 active_area = Some(*area);
             }
-            // Forward scroll-down to child only if alternate screen is active
-            // (real TUI app).  At a shell prompt, scroll-down without copy
-            // mode is a no-op (can't scroll past live output).
-            // Only check alternate_screen() — NOT is_fullscreen_tui() — to
-            // avoid false-positives when shell output fills the screen.
+            // Forward scroll-down to child only if pane wants mouse events.
+            // Uses pane_wants_mouse() with heuristic fallback. (fixes #285)
             let child_in_alt = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| {
-                    if let Ok(parser) = p.term.lock() {
-                        return parser.screen().alternate_screen();
-                    }
-                    false
-                });
+                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
             if child_in_alt {
                 if let Some(area) = active_area {
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
@@ -2764,7 +2975,21 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
                 input.push(c);
             }
         }
+        refresh_search_prompt(app);
         return Ok(());
+    }
+
+    // A focused floating pane (tmux new-pane) receives input instead of the
+    // tiled active pane, while the layout keeps rendering underneath.
+    {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(fi) = win.floating_focus {
+            if let Some(fp) = win.floating.get_mut(fi) {
+                let _ = fp.pane.writer.write_all(text.as_bytes());
+                let _ = fp.pane.writer.flush();
+                return Ok(());
+            }
+        }
     }
 
     if app.sync_input {
@@ -2800,40 +3025,65 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         }
         return Ok(());
     }
-    // Handle find-char pending state (waiting for char after f/F/t/T)
+    // Handle find-char pending state (waiting for char after f/F/t/T).
+    // Consume any numeric prefix so e.g. "3fx" jumps to the 3rd 'x' (#413).
     if let Some(pending) = app.copy_find_char_pending.take() {
-        match pending {
-            0 => crate::copy_mode::find_char_forward(app, c),
-            1 => crate::copy_mode::find_char_backward(app, c),
-            2 => crate::copy_mode::find_char_to_forward(app, c),
-            3 => crate::copy_mode::find_char_to_backward(app, c),
-            _ => {}
+        let n = app.copy_count.take().unwrap_or(1);
+        for _ in 0..n {
+            match pending {
+                0 => crate::copy_mode::find_char_forward(app, c),
+                1 => crate::copy_mode::find_char_backward(app, c),
+                2 => crate::copy_mode::find_char_to_forward(app, c),
+                3 => crate::copy_mode::find_char_to_backward(app, c),
+                _ => {}
+            }
         }
         return Ok(());
     }
+    // Numeric prefix accumulation for vi-style motions (fixes #413). This path
+    // handles copy-mode chars arriving via send-text (the route the client uses
+    // for every plain printable key), which previously ignored counts entirely
+    // so "5j" moved a single line instead of five.
+    if c.is_ascii_digit() {
+        let digit = c.to_digit(10).unwrap() as usize;
+        if let Some(count) = app.copy_count {
+            // Extend the pending count: "1" then "2" -> 12 (cap at 9999).
+            app.copy_count = Some((count * 10 + digit).min(9999));
+            return Ok(());
+        } else if digit >= 1 {
+            // Start a new count with 1-9.
+            app.copy_count = Some(digit);
+            return Ok(());
+        }
+        // digit == 0 with no existing count -> fall through to the '0'
+        // line-start motion below.
+    }
+    // Any non-digit key consumes the pending count (default 1).
+    let n = app.copy_count.take().unwrap_or(1);
     match c {
         'q' | ']' | '\x1b' => {
             exit_copy_mode(app);
         }
-        'h' => { move_copy_cursor(app, -1, 0); }
-        'l' => { move_copy_cursor(app, 1, 0); }
-        'k' => { move_copy_cursor(app, 0, -1); }
-        'j' => { move_copy_cursor(app, 0, 1); }
+        'h' => { for _ in 0..n { move_copy_cursor(app, -1, 0); } }
+        'l' => { for _ in 0..n { move_copy_cursor(app, 1, 0); } }
+        'k' => { for _ in 0..n { move_copy_cursor(app, 0, -1); } }
+        'j' => { for _ in 0..n { move_copy_cursor(app, 0, 1); } }
         'g' => { scroll_to_top(app); }
         'G' => { scroll_to_bottom(app); }
-        'w' => { crate::copy_mode::move_word_forward(app); }
-        'b' => { crate::copy_mode::move_word_backward(app); }
-        'e' => { crate::copy_mode::move_word_end(app); }
-        'W' => { crate::copy_mode::move_word_forward_big(app); }
-        'B' => { crate::copy_mode::move_word_backward_big(app); }
-        'E' => { crate::copy_mode::move_word_end_big(app); }
+        'w' => { for _ in 0..n { crate::copy_mode::move_word_forward(app); } }
+        'b' => { for _ in 0..n { crate::copy_mode::move_word_backward(app); } }
+        'e' => { for _ in 0..n { crate::copy_mode::move_word_end(app); } }
+        'W' => { for _ in 0..n { crate::copy_mode::move_word_forward_big(app); } }
+        'B' => { for _ in 0..n { crate::copy_mode::move_word_backward_big(app); } }
+        'E' => { for _ in 0..n { crate::copy_mode::move_word_end_big(app); } }
         'H' => { crate::copy_mode::move_to_screen_top(app); }
         'M' => { crate::copy_mode::move_to_screen_middle(app); }
         'L' => { crate::copy_mode::move_to_screen_bottom(app); }
-        'f' => { app.copy_find_char_pending = Some(0); }
-        'F' => { app.copy_find_char_pending = Some(1); }
-        't' => { app.copy_find_char_pending = Some(2); }
-        'T' => { app.copy_find_char_pending = Some(3); }
+        // Preserve the count so e.g. "3fx" finds the 3rd 'x' (consumed above).
+        'f' => { app.copy_find_char_pending = Some(0); app.copy_count = Some(n); }
+        'F' => { app.copy_find_char_pending = Some(1); app.copy_count = Some(n); }
+        't' => { app.copy_find_char_pending = Some(2); app.copy_count = Some(n); }
+        'T' => { app.copy_find_char_pending = Some(3); app.copy_count = Some(n); }
         'D' => { crate::copy_mode::copy_end_of_line(app)?; exit_copy_mode(app); }
         '0' => { crate::copy_mode::move_to_line_start(app); }
         '$' => { crate::copy_mode::move_to_line_end(app); }
@@ -2881,8 +3131,8 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
             }
         }
         'y' => { yank_selection(app)?; exit_copy_mode(app); }
-        '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
-        '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+        '/' => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; refresh_search_prompt(app); }
+        '?' => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; refresh_search_prompt(app); }
         'n' => { search_next(app); }
         'N' => { search_prev(app); }
         'i' => { app.copy_text_object_pending = Some(1); }  // inner text object
@@ -2985,7 +3235,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // --- Copy-search mode: handle esc/enter/backspace ---
     if matches!(app.mode, Mode::CopySearch { .. }) {
         match k {
-            "esc" => { app.mode = Mode::CopyMode; }
+            "esc" => { app.mode = Mode::CopyMode; app.status_message = None; }
             "enter" => {
                 if let Mode::CopySearch { ref input, forward } = app.mode {
                     let query = input.clone();
@@ -2999,9 +3249,11 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     }
                 }
                 app.mode = Mode::CopyMode;
+                app.status_message = None;
             }
             "backspace" => {
                 if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
+                refresh_search_prompt(app);
             }
             _ => {}
         }
@@ -3055,8 +3307,8 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
             "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
             "M-w" | "m-w" => { yank_selection(app)?; exit_copy_mode(app); }
-            "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; }
-            "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; }
+            "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; refresh_search_prompt(app); }
+            "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; refresh_search_prompt(app); }
             "C-c" | "c-c" => {
                 exit_copy_mode(app);
             }
@@ -3088,25 +3340,26 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         return Ok(());
     }
     
-    let win = &mut app.windows[app.active_idx];
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+    // Write a named key to a single pane (extracted for sync_input support).
+    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
+        use std::io::Write as _;
         match k {
-            "enter" | "return" | "cr" => { let _ = write!(p.writer, "\r"); }
-            "tab" => { let _ = write!(p.writer, "\t"); }
-            "btab" | "backtab" => { let _ = write!(p.writer, "\x1b[Z"); }
-            "backspace" => { let _ = p.writer.write_all(&[0x7F]); }
-            "delete" => { let _ = write!(p.writer, "\x1b[3~"); }
-            "esc" => { let _ = write!(p.writer, "\x1b"); }
-            "left" => { let _ = write!(p.writer, "\x1b[D"); }
-            "right" => { let _ = write!(p.writer, "\x1b[C"); }
-            "up" => { let _ = write!(p.writer, "\x1b[A"); }
-            "down" => { let _ = write!(p.writer, "\x1b[B"); }
-            "pageup" => { let _ = write!(p.writer, "\x1b[5~"); }
-            "pagedown" => { let _ = write!(p.writer, "\x1b[6~"); }
-            "home" => { let _ = write!(p.writer, "\x1b[H"); }
-            "end" => { let _ = write!(p.writer, "\x1b[F"); }
-            "insert" => { let _ = write!(p.writer, "\x1b[2~"); }
-            "space" => { let _ = write!(p.writer, " "); }
+            "enter" | "return" | "cr" => write_key_seq(p, b"\r"),
+            "tab" => write_key_seq(p, b"\t"),
+            "btab" | "backtab" => write_key_seq(p, b"\x1b[Z"),
+            "backspace" => write_key_seq(p, b"\x7f"),
+            "delete" => write_key_seq(p, b"\x1b[3~"),
+            "esc" => write_key_seq(p, b"\x1b"),
+            "up" => write_key_seq(p, b"\x1b[A"),
+            "down" => write_key_seq(p, b"\x1b[B"),
+            "right" => write_key_seq(p, b"\x1b[C"),
+            "left" => write_key_seq(p, b"\x1b[D"),
+            "home" => write_key_seq(p, b"\x1b[H"),
+            "end" => write_key_seq(p, b"\x1b[F"),
+            "pageup" => write_key_seq(p, b"\x1b[5~"),
+            "pagedown" => write_key_seq(p, b"\x1b[6~"),
+            "insert" => write_key_seq(p, b"\x1b[2~"),
+            "space" => write_key_seq(p, b" "),
             s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
                 if let Ok(n) = s[1..].parse::<u8>() {
                     let seq = match n {
@@ -3127,11 +3380,108 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
                 }
             }
+            // Ctrl+Shift+<letter>: inject a native KEY_EVENT carrying BOTH the
+            // Ctrl and Shift modifier flags so console-input apps (ReadConsoleInputW)
+            // can distinguish it from a plain Ctrl+<letter> (issue #368: psmux used
+            // to collapse Ctrl+Shift+V to Ctrl+V, stripping Shift).  We deliberately
+            // do NOT also write the raw C0 byte: emitting both double-delivers the
+            // key (issue #363).  VT-pipe apps still receive ConPTY's translation of
+            // this single event.
+            s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
+                && s.chars().count() == 5
+                && s.chars().nth(4).map_or(false, |c| c.is_ascii_alphabetic()) =>
+            {
+                let c = s.chars().nth(4).unwrap().to_ascii_lowercase();
+                let ctrl_char = (c as u8) & 0x1F;
+                #[cfg(windows)]
+                {
+                    let injected = if let Some(pid) = p.child_pid {
+                        crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, true)
+                    } else {
+                        false
+                    };
+                    if !injected {
+                        // No child pid / injection failed: fall back to the raw
+                        // control byte (Shift unrepresentable, but key still arrives).
+                        let _ = p.writer.write_all(&[ctrl_char]);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    // Non-Windows: no console-input modifier channel; legacy VT has
+                    // no distinct Ctrl+Shift+<letter> encoding, so deliver the byte.
+                    let _ = p.writer.write_all(&[ctrl_char]);
+                }
+            }
+            // Ctrl+Shift+<punctuation/digit> that collapses to a single C0 byte.
+            // ConPTY terminals (Alacritty, WezTerm) deliver Ctrl+/ as VK_OEM_MINUS
+            // with Ctrl+Shift, so the client forwards it as "C-S--".  That must
+            // reach the child as 0x1f (^_) — identical to Ctrl+_ and to tmux — so
+            // neovim's Ctrl+/ comment-toggle fires.  Before this branch, "C-S--"
+            // matched neither the alphabetic C-S- arm nor the len==3 C- arm and
+            // was silently dropped (issue #394).  No native KEY_EVENT injection:
+            // the raw byte is enough (ConPTY reconstructs the key) and injecting
+            // both would double-deliver (issue #363).
+            s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
+                && s.chars().count() == 5
+                && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
+            {
+                let c = s.chars().nth(4).unwrap();
+                if let Some(byte) = ctrl_char_send_keys_byte(c) {
+                    let _ = p.writer.write_all(&[byte]);
+                    let _ = p.writer.flush();
+                }
+            }
+            // Ctrl+Break (issue #454).  The attached client traps the Ctrl+Break
+            // console signal — which Windows never delivers as a keystroke — and
+            // forwards it here as `send-key C-Break` so it interrupts the running
+            // program instead of tearing down the client / session.
+            //
+            // We deliver a GENUINE CTRL_BREAK_EVENT to the pane's ConPTY child,
+            // exactly like Windows Terminal.  Ctrl+Break exists to stop a program
+            // that *ignores* Ctrl+C, so the old Ctrl+C path (raw 0x03 + a
+            // CTRL_C_EVENT) was not enough — a Ctrl+C-immune program survived it.
+            // Attaching to the child's console places us in its process group and
+            // the broadcast reaches the child (proven to kill a Ctrl+C-immune
+            // program); the server survives via its own CTRL_BREAK-surviving
+            // console handler.  See platform::mouse_inject::send_ctrl_break_event.
+            "break" | "Break" | "C-Break" | "c-break" | "C-break" => {
+                #[cfg(windows)]
+                if let Some(pid) = p.child_pid {
+                    crate::platform::mouse_inject::send_ctrl_break_event(pid, false);
+                }
+            }
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
-                let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
+                // tmux-parity mapping so C-/ -> 0x1f (^_), not the naive '/' & 0x1f
+                // == 0x0f (^O) collision with C-o (issue #226/#394).  Letters keep
+                // their usual byte (a->0x01 …), so Ctrl+<letter> is unaffected.
+                let ctrl_char = ctrl_char_send_keys_byte(c)
+                    .unwrap_or((c.to_ascii_lowercase() as u8) & 0x1F);
+                // Always write the raw control byte so ConPTY can generate
+                // console control events (e.g. CTRL_C_EVENT for \x03).
+                // Raw bytes do NOT start with \x1b so they never corrupt
+                // ConPTY's VT parser state.
+                //
+                // ConPTY already reconstructs the proper VK + LEFT_CTRL_PRESSED
+                // console key event from this raw C0 byte, so console apps
+                // (PSReadLine, neovim) receive a correct Ctrl+<letter> event
+                // from the byte alone.  We must therefore NOT also inject a
+                // separate KEY_EVENT via WriteConsoleInputW for letters — doing
+                // both delivered the key TWICE (issue #363: a single <C-w>
+                // arrived as <C-w><C-w>, turning neovim's window command into a
+                // no-op and making `<C-w>s` behave like a bare `s`; PSReadLine's
+                // Ctrl+W likewise deleted two words instead of one).
                 let _ = p.writer.write_all(&[ctrl_char]);
-
+                let _ = p.writer.flush();
+                // Ctrl+C is the sole exception: a CTRL_C_EVENT must be raised so
+                // the child's console handler runs (SIGINT parity, issue #338).
+                #[cfg(windows)]
+                if c.eq_ignore_ascii_case(&'c') {
+                    if let Some(pid) = p.child_pid {
+                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                    }
+                }
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('a');
@@ -3178,7 +3528,9 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let has_ctrl = upper.contains("C-");
                 let has_alt = upper.contains("M-");
                 let injected = if has_ctrl {
-                    // Only use native injection for Ctrl combos.
+                    // Only use native injection for Ctrl combos.  For plain
+                    // Ctrl+Enter this carries an LF payload (#409); Ctrl+Shift /
+                    // Ctrl+Alt keep CR.
                     if let Some(pid) = p.child_pid {
                         crate::platform::mouse_inject::send_modified_enter_event(pid, has_ctrl, has_alt, has_shift)
                     } else {
@@ -3188,11 +3540,14 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     false
                 };
                 if !injected {
-                    if (has_shift || has_alt) && !has_ctrl {
+                    if has_ctrl && !has_shift && !has_alt {
+                        // Fallback: plain Ctrl+Enter is LF, matching WT (#409).
+                        let _ = p.writer.write_all(b"\n");
+                    } else if (has_shift || has_alt) && !has_ctrl {
                         // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
                         let _ = p.writer.write_all(b"\x1b\r");
                     } else {
-                        // Ctrl+Enter and other combos: CSI encoding
+                        // Ctrl+Shift/Ctrl+Alt+Enter and other combos: CSI encoding
                         if let Some(seq) = parse_modified_special_key(s) {
                             let _ = p.writer.write_all(seq.as_bytes());
                         }
@@ -3208,6 +3563,37 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         }
         let _ = p.writer.flush();
     }
+
+    // A focused floating pane (tmux new-pane) receives the key instead of the
+    // tiled active pane.
+    {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(fi) = win.floating_focus {
+            if let Some(fp) = win.floating.get_mut(fi) {
+                write_named_key_to_pane(&mut fp.pane, k);
+                return Ok(());
+            }
+        }
+    }
+
+    // Distribute the key to all panes (sync) or just the active pane.
+    if app.sync_input {
+        let win = &mut app.windows[app.active_idx];
+        fn send_key_all_panes(node: &mut crate::types::Node, k: &str) {
+            match node {
+                crate::types::Node::Leaf(p) => write_named_key_to_pane(p, k),
+                crate::types::Node::Split { children, .. } => {
+                    for c in children { send_key_all_panes(c, k); }
+                }
+            }
+        }
+        send_key_all_panes(&mut win.root, k);
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            write_named_key_to_pane(p, k);
+        }
+    }
     Ok(())
 }
 
@@ -3218,3 +3604,23 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue226_ctrl_slash.rs"]
 mod tests_issue226_ctrl_slash;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue394_ctrl_slash_conpty.rs"]
+mod tests_issue394_ctrl_slash_conpty;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue284_pageup_wsl.rs"]
+mod tests_issue284_pageup_wsl;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_last_text_input.rs"]
+mod tests_pane_last_text_input;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_last_special_key.rs"]
+mod tests_pane_last_special_key;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue413_copy_count.rs"]
+mod tests_issue413_copy_count;

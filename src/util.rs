@@ -4,6 +4,22 @@ use serde::{Serialize, Deserialize};
 
 use crate::types::{AppState, Node};
 
+/// Shared lock for tests that mutate the process-global USERPROFILE/HOME env.
+/// `std::env::set_var`/`remove_var` are process-wide, so every test module that
+/// touches them (e.g. test_config_plugin_paths and test_issue167_startup_log)
+/// must serialise through THIS single lock rather than a per-module mutex.
+/// With separate mutexes, a reader in one module can observe a half-swapped env
+/// set by another module and panic (flaky server-startup.log tests under the
+/// full parallel suite). `lock_test_env` recovers a poisoned lock so a panicking
+/// test cannot cascade failures into every later env-touching test.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Expand `~` to the user's home directory in a shell command string,
 /// then rewrite `~/.psmux/plugins/` to `~/.config/psmux/plugins/` when
 /// the classic path does not exist but the XDG path does (issue psmux-plugins#2).
@@ -84,13 +100,13 @@ pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> 
 // resolve_last_session_name and resolve_default_session_name are in session.rs
 
 #[derive(Serialize, Deserialize)]
-pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool, #[serde(default)] pub tab_text: String }
+pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool, #[serde(default)] pub bell: bool, #[serde(default)] pub last: bool, #[serde(default)] pub tab_text: String, #[serde(default)] pub idx: usize }
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneInfo { pub id: usize, pub title: String }
 
 #[derive(Serialize, Deserialize)]
-pub struct WinTree { pub id: usize, pub name: String, pub active: bool, pub panes: Vec<PaneInfo> }
+pub struct WinTree { pub id: usize, pub name: String, pub active: bool, pub panes: Vec<PaneInfo>, #[serde(default)] pub idx: usize }
 
 /// Lightweight layout description for cross-session preview rendering
 /// (issue #257). Mirrors the structural part of `LayoutJson` without any
@@ -107,7 +123,7 @@ pub enum LayoutSimple {
 
 pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     let mut v: Vec<WinInfo> = Vec::new();
-    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, tab_text: String::new() }); }
+    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, bell: w.bell_flag, last: i == app.last_window_idx, tab_text: String::new(), idx: app.win_display_index(i) }); }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }
@@ -129,7 +145,7 @@ pub fn list_windows_tmux(app: &AppState) -> String {
         let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
             (p.last_cols, p.last_rows)
         } else { (120, 30) };
-        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", i + app.window_base_index, w.name, flag, pane_count, width, height));
+        lines.push(format!("{}: {}{} ({} panes) [{}x{}]", app.win_display_index(i), w.name, flag, pane_count, width, height));
     }
     lines.join("\n")
 }
@@ -145,7 +161,7 @@ pub fn list_tree_json(app: &AppState) -> io::Result<String> {
     for (i, w) in app.windows.iter().enumerate() {
         let mut panes = Vec::new();
         collect_panes(&w.root, &mut panes);
-        v.push(WinTree { id: w.id, name: w.name.clone(), active: i == app.active_idx, panes });
+        v.push(WinTree { id: w.id, name: w.name.clone(), active: i == app.active_idx, panes, idx: app.win_display_index(i) });
     }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)

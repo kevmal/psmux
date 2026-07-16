@@ -127,6 +127,7 @@
 
 **kill-server** — `""`
 - No flags
+- Note: bare `kill-server` stops every socket and session (default plus all `-L` namespaces), unlike tmux which only kills the current socket. Use `-L <name> kill-server` to scope it to one namespace. See [compatibility.md](compatibility.md#kill-server-with-multiple-sockets).
 
 **start-server** (`start`) — `""`
 - No flags

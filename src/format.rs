@@ -154,7 +154,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'I' => {
-                    let n = if win_idx < app.windows.len() { win_idx + app.window_base_index } else { 0 };
+                    let n = if win_idx < app.windows.len() { app.win_display_index(win_idx) } else { 0 };
                     result.push_str(&n.to_string());
                     i += 2; continue;
                 }
@@ -318,6 +318,21 @@ pub fn expand_format_for_pane(
     let result = expand_format_for_window(fmt, app, win_idx);
     PANE_POS_OVERRIDE.set(None);
     result
+}
+
+/// Like `expand_format_for_pane` but resolves the pane by its global ID
+/// (e.g. from a bare `%N` -t target). Falls back to the active pane if no
+/// pane with that id exists. (Issue #332.)
+pub fn expand_format_for_pane_by_id(
+    fmt: &str,
+    app: &AppState,
+    pane_id: usize,
+) -> String {
+    if let Some((win_idx, pos)) = crate::tree::find_pane_by_id_global(app, pane_id) {
+        expand_format_for_pane(fmt, app, win_idx, pos)
+    } else {
+        expand_format(fmt, app)
+    }
 }
 
 // ─────────────────── expression dispatcher ───────────────────────
@@ -841,6 +856,7 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "escape-time" => Some(app.escape_time_ms.to_string()),
         "history-limit" => Some(app.history_limit.to_string()),
         "mouse" => Some(if app.mouse_enabled { "on".into() } else { "off".into() }),
+        "bold-is-bright" => Some(if app.bold_is_bright { "on".into() } else { "off".into() }),
         "scroll-enter-copy-mode" => Some(if app.scroll_enter_copy_mode { "on".into() } else { "off".into() }),
         "choose-tree-preview" => Some(if app.choose_tree_preview { "on".into() } else { "off".into() }),
         "mode-keys" => Some(app.mode_keys.clone()),
@@ -1031,6 +1047,9 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                 "session_name" => app.session_name.clone(),
                 "session_windows" => app.windows.len().to_string(),
                 "session_id" => format!("${}", app.session_id),
+                "session_path" => std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 "pid" | "server_pid" => std::process::id().to_string(),
                 "version" => VERSION.to_string(),
                 "host" | "hostname" => hostname_cached(),
@@ -1080,10 +1099,12 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         }
         "session_grouped" => if app.session_group.is_some() { "1".into() } else { "0".into() },
         "session_format" | "session_many_attached" => if app.attached_clients > 1 { "1".into() } else { "0".into() },
-        "session_path" => env::var("HOME").or_else(|_| env::var("USERPROFILE")).unwrap_or_default(),
+        "session_path" => std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
 
         // ── Window ──
-        "window_index" => (win_idx + app.window_base_index).to_string(),
+        "window_index" => app.win_display_index(win_idx).to_string(),
         "window_name" => win.name.clone(),
         "window_active" => if win_idx == app.active_idx { "1".into() } else { "0".into() },
         "window_panes" => count_panes(&win.root).to_string(),
@@ -1136,11 +1157,49 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_height" => {
             if let Some(p) = target_pane() { p.last_rows.to_string() } else { "24".into() }
         }
+        // Milliseconds since this pane last received printable text on the
+        // INTERACTIVE input route (handle_key); empty if none yet. The injected
+        // route (send-keys / send-paste / send-text) does NOT update it. A
+        // read-only route signal — consumers own any policy on top.
+        "pane_last_text_input" => {
+            match target_pane().and_then(|p| p.last_text_input) {
+                Some(t) => t.elapsed().as_millis().to_string(),
+                None => String::new(),
+            }
+        }
+        // The last NON-text key received on the INTERACTIVE input route
+        // (handle_key), by canonical bind-key name (Escape, Enter, Up, F9,
+        // C-c, M-a, ...); companion _ms gives its age in ms. Empty if none yet.
+        // Like pane_last_text_input, the injected route (send-keys /
+        // send-paste / send-text) does NOT update it. A read-only route signal
+        // -- consumers own any policy on top.
+        "pane_last_special_key" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((_, name)) => name.clone(),
+                None => String::new(),
+            }
+        }
+        "pane_last_special_key_ms" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((t, _)) => t.elapsed().as_millis().to_string(),
+                None => String::new(),
+            }
+        }
         "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
         "pane_current_command" => {
             if let Some(p) = target_pane() {
+                // Shell-integration OSC is authoritative (issue #299):
+                // OSC 133;C;cmdline_url=, OSC 1337;SetUserVar=WEZTERM_PROG, or
+                // OSC 633;E is the definitive signal for what's running.
+                if let Ok(parser) = p.term.lock() {
+                    if let Some(cmd) = parser.screen().shell_command() {
+                        return cmd.to_string();
+                    }
+                }
                 if let Some(pid) = p.child_pid {
+                    // Fallback: upstream process-tree heuristic, then shell binary name.
                     crate::platform::process_info::get_foreground_process_name(pid)
+                        .or_else(|| crate::platform::process_info::get_process_name(pid))
                         .unwrap_or_else(|| "shell".into())
                 } else if !p.title.is_empty() {
                     p.title.clone()
@@ -1588,6 +1647,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
 
         // ── Options as format variables ──
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
+        "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
         "choose-tree-preview" => if app.choose_tree_preview { "on".into() } else { "off".into() },
         "prefix" => format_key_binding(&app.prefix_key),

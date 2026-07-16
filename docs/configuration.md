@@ -104,9 +104,10 @@ psmux split-window -- "C:/Program Files/Git/bin/bash.exe"
 | `mouse` | Bool | `on` | Mouse support |
 | `mouse-selection` | Bool | `on` | psmux's client-side drag selection. Set `off` to let in-pane TUI apps (opencode, nvim, etc.) handle their own mouse selection without psmux drawing on top |
 | `scroll-enter-copy-mode` | Bool | `on` | Enter copy mode on mouse scroll (set `off` to disable) |
-| `pwsh-mouse-selection` | Bool | `off` | Windows 11 PowerShell-style word/line selection (double/triple-click) |
+| `pwsh-mouse-selection` | Bool | `off` | tmux-like release-copy selection with word/line multi-click and pane-clipped extraction |
 | `paste-detection` | Bool | `on` | Detect Ctrl+V paste from console host and send as bracketed paste (set `off` to let Ctrl+V reach child apps like neovim) |
 | `choose-tree-preview` | Bool | `off` | Open `choose-session` / `choose-tree` pickers with the live preview pane already visible (saves pressing `p`). See [preview.md](preview.md) |
+| `bold-is-bright` | Bool | `on` | Restore standard SGR codes for the 16 basic colors so the outer terminal renders `bold` as bright (matches a bare shell). Set `off` to keep explicit 256-indexed low colors byte-accurate. See [Bold Is Bright](#bold-is-bright-color-rendering) |
 | `status` | Bool/Int | `on` | Show status bar (number = line count) |
 | `status-position` | Str | `bottom` | `top` or `bottom` |
 | `status-justify` | Str | `left` | `left`, `centre`, `right`, `absolute-centre` |
@@ -121,6 +122,7 @@ psmux split-window -- "C:/Program Files/Git/bin/bash.exe"
 | `visual-activity` | Bool | `off` | Visual indicator for activity |
 | `synchronize-panes` | Bool | `off` | Send input to all panes |
 | `remain-on-exit` | Bool | `off` | Keep panes after process exits |
+| `@kill-descendants` | Bool | `on` | Terminate a self-exited pane shell's background children (psmux extension) |
 | `aggressive-resize` | Bool | `off` | Resize to smallest client |
 | `window-size` | Str | `latest` | `largest`, `smallest`, `manual`, `latest` |
 | `destroy-unattached` | Bool | `off` | Exit server when no clients attached |
@@ -249,10 +251,12 @@ set -g mouse off
 # Disable entering copy mode on mouse scroll
 set -g scroll-enter-copy-mode off
 
-# Enable Windows 11 PowerShell-style word/line selection
+# Enable tmux-like release-copy selection with pane clipping
 # Double-click selects a word, triple-click selects a line
 set -g pwsh-mouse-selection on
 ```
+
+When `pwsh-mouse-selection` is `on`, releasing a left-drag copies the selected text immediately and clears the transient highlight. Right-click copy and `Ctrl+Shift+C` still work as explicit copy actions.
 
 When `scroll-enter-copy-mode` is `off`, scrolling in a pane does not enter copy mode and instead passes scroll events directly to the running application.
 
@@ -282,7 +286,7 @@ What changes when `mouse-selection` is `off`:
 
 - psmux no longer draws its own selection rectangle on left-click drag
 - Right-click clipboard copy via psmux's selection is no longer triggered (selection never starts)
-- The Windows 11 style word/line multi-click (`pwsh-mouse-selection`) is suppressed too while `mouse-selection off` is in effect
+- The `pwsh-mouse-selection` word/line multi-click and release-copy behavior is suppressed too while `mouse-selection off` is in effect
 
 To restore the default behaviour:
 
@@ -330,6 +334,30 @@ set -g choose-tree-preview on
 
 You can still press `p` inside the chooser to hide it for the current session. The setting is read once when the chooser opens, so changes to the option take effect immediately on the next open. See [preview.md](preview.md) for the full feature documentation.
 
+### Bold Is Bright (color rendering)
+
+Many terminals, including Windows Terminal, render bold text in one of the 16 basic ANSI colors as the brighter variant of that color. This is the common "bold is bright" behavior, and a bare shell gets it because it emits the standard SGR codes (`ESC[32m` for green, brightened by `ESC[1m`).
+
+psmux renders its screen through ratatui and crossterm, and crossterm serializes all 16 basic colors as the 256-indexed form (`ESC[38;5;N`) instead of the standard `30`-`37` codes. Windows Terminal only applies "bold is bright" to the standard codes, not the 256-indexed form, so colored bold text like PowerShell's `$PSStyle` output looked muted with a heavier font ([#425](https://github.com/psmux/psmux/issues/425)). psmux rewrites those basic-color sequences back to the standard codes so bold renders bright, exactly matching a bare shell. This is on by default.
+
+```tmux
+# Default: basic colors get "bold is bright" (matches a bare shell)
+set -g bold-is-bright on
+
+# Opt out: pass crossterm output through untouched
+set -g bold-is-bright off
+```
+
+There is one tradeoff. crossterm collapses a basic color (`ESC[32m`) and an explicit 256-indexed low color (`ESC[38;5;2m`) into the identical bytes, so the rewrite cannot tell them apart and brightens both. If a program you use deliberately emits the 256-indexed colors 0 through 15 and you need them to stay exactly as sent, set `bold-is-bright off`. With it off, both basic and explicit 256-indexed low colors are byte-accurate, and you give up "bold is bright" on the basic colors. This is the inherent limitation of crossterm's lossy encoding; real tmux does not have it because it never collapses the two forms.
+
+The option applies from config, at runtime, and reports through `show-options` and `#{bold-is-bright}`:
+
+```powershell
+psmux set-option -g bold-is-bright off
+psmux show-options -g bold-is-bright
+psmux display-message -p '#{bold-is-bright}'
+```
+
 ### Command Chaining
 
 psmux supports tmux-style command chaining with the `;` operator. Multiple commands on a single line are executed sequentially:
@@ -373,6 +401,7 @@ bind-key C-Space send-prefix
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `prediction-dimming` | Bool | `off` | Dim predictive/speculative text |
+| `bold-is-bright` | Bool | `on` | Restore standard SGR codes for the 16 basic colors so bold renders bright (set `off` to keep explicit 256-indexed low colors byte-accurate). See [Bold Is Bright](#bold-is-bright-color-rendering) |
 | `paste-detection` | Bool | `on` | Detect Ctrl+V paste from console host (set `off` for neovim/vim Ctrl+V) |
 | `cursor-style` | Str | | Cursor shape: `block`, `underline`, or `bar` |
 | `cursor-blink` | Bool | `off` | Cursor blinking |
@@ -602,6 +631,23 @@ psmux respawn-pane -- python app.py
 ```
 
 This is useful for monitoring: if a long-running process crashes, you can see its final output and restart it without losing the pane layout.
+
+### Background Processes and `@kill-descendants`
+
+On Unix, tmux relies on the kernel's SIGHUP delivery when a pane's terminal closes, so a process that was deliberately detached (for example with `nohup`) survives its pane. Windows has no SIGHUP and no pty process groups, so psmux instead walks the pane's process tree. By default, when a pane's shell exits on its own, psmux terminates any child processes the shell left behind (for example something launched with `Start-Process`), because otherwise those processes and their `conhost.exe` hosts accumulate invisibly and can exhaust the desktop heap.
+
+If you intentionally launch background processes from a pane and want them to outlive the shell, opt out (psmux extension):
+
+```tmux
+# Let background children survive when their pane's shell exits on its own
+set -g @kill-descendants off
+```
+
+Notes:
+
+- This only affects panes whose shell exits on its own. Explicit `kill-pane`, `kill-window`, and `kill-session` always terminate the pane's full process tree.
+- With `remain-on-exit on` the pane is kept instead of pruned, so no sweep happens either way until the pane is actually closed.
+- Recognized off values: `off`, `0`, `false`, `no`. Anything else, including unset, keeps the sweep enabled.
 
 ## Session Environment Variables
 

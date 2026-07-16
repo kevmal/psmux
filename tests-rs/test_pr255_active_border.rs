@@ -134,8 +134,11 @@ fn render_three_panes_does_not_color_unrelated_separator_active() {
             active_rect,
             "", false, "off", "",
             total,
+            crate::border_lines::border_chars("single"),
+            None,
         );
-        crate::rendering::fix_border_intersections(f.buffer_mut());
+        let border_mask = crate::client::border_mask_from_layout(&layout, area, f.buffer_mut().area, false);
+        crate::rendering::fix_border_intersections(f.buffer_mut(), crate::border_lines::border_chars("single"), &border_mask);
     }).unwrap();
 
     // Inspect every horizontal separator cell '─' on the right side of the
@@ -199,8 +202,11 @@ fn render_two_panes_keeps_half_highlight_path() {
             active_rect,
             "", false, "off", "",
             total,
+            crate::border_lines::border_chars("single"),
+            None,
         );
-        crate::rendering::fix_border_intersections(f.buffer_mut());
+        let border_mask = crate::client::border_mask_from_layout(&layout, area, f.buffer_mut().area, false);
+        crate::rendering::fix_border_intersections(f.buffer_mut(), crate::border_lines::border_chars("single"), &border_mask);
     }).unwrap();
 
     // The vertical separator '│' should have at least some cells colored as

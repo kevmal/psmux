@@ -106,6 +106,21 @@ pub struct Pane {
     pub last_infer_title: Instant,
     /// True when the child process has exited but remain-on-exit keeps the pane visible.
     pub dead: bool,
+    /// Timestamp of the last printable keystroke routed via the INTERACTIVE
+    /// text-input route (`handle_key -> forward_key_to_active`); `None` until
+    /// the first one. NOT updated by the injected route (`send-keys` /
+    /// `send-paste` / `send-text`). Exposed read-only as the
+    /// `#{pane_last_text_input}` format variable. Lives on the pane, so it's
+    /// freed with it (no separate lifecycle / file).
+    pub last_text_input: Option<Instant>,
+    /// The last NON-text key routed via the INTERACTIVE input route
+    /// (`handle_key -> forward_key_to_active`): its canonical bind-key name
+    /// (`Escape`, `Enter`, `Up`, `F9`, `C-c`, `M-a`, ...) + the `Instant` it
+    /// arrived; `None` until the first one. Same route contract as
+    /// `last_text_input` (NOT updated by the injected route). The text vs
+    /// non-text split is `is_text_input_key`. Exposed read-only as
+    /// `#{pane_last_special_key}` / `#{pane_last_special_key_ms}`.
+    pub last_special_key: Option<(Instant, String)>,
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
@@ -131,6 +146,13 @@ pub struct Pane {
     /// the case where pwsh re-issues the CPR after lock/unlock — the single
     /// preemptive write at spawn time is no longer in the pipe at that point.
     pub cpr_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Issue #473: bitmask of terminal color queries detected by the PTY
+    /// reader thread in the child's output.  Bits 0-15 = OSC 4;<i>;? palette
+    /// queries, bit 16 = OSC 10;? (foreground), bit 17 = OSC 11;? (background),
+    /// bit 18 = CSI ?996n (light/dark scheme).  Consumed by the server loop,
+    /// which injects the corresponding color responses so pane applications
+    /// (GitHub Copilot CLI, vim, etc.) can detect the terminal palette.
+    pub color_query_pending: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,
@@ -146,6 +168,14 @@ pub struct Pane {
     /// Per-pane output ring buffer for control mode %output notifications.
     /// Filled by the PTY reader thread, drained by the server loop.
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// When the pane's shell was spawned (monotonic), and only for panes that
+    /// carry a real, restartable default shell. `None` for popup, proxy, and
+    /// empty (`-E`) panes, which must never be auto-respawned. Used by the
+    /// opt-in `@heal-crashed-panes` self-heal: a shell that exits within a
+    /// short grace window of spawn is treated as a crash-on-startup (e.g. the
+    /// #450 pwsh `ReadLineFromFile` FailFast right after a warm-pane transplant)
+    /// and respawned in place, so the user still gets a working window.
+    pub spawned_at: Option<Instant>,
 }
 
 /// Pre-spawned shell ready to be transplanted into a new window instantly.
@@ -161,6 +191,8 @@ pub struct WarmPane {
     pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub bell_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub cpr_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Issue #473: color query bitmask (see `Pane::color_query_pending`).
+    pub color_query_pending: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pub child_pid: Option<u32>,
     pub pane_id: usize,
     pub rows: u16,
@@ -221,6 +253,36 @@ pub struct Window {
     pub zoom_saved: Option<Vec<(Vec<usize>, Vec<u16>)>>,
     /// If this window is a linked reference, stores the source window ID it was linked from.
     pub linked_from: Option<usize>,
+    /// Floating panes overlaid ABOVE this window's tiled layout (tmux `new-pane`).
+    /// Unlike a popup (a modal `Mode`), floating panes are persistent and coexist
+    /// with the tiled panes. Drawn in order, so later entries stack on top.
+    pub floating: Vec<FloatingPane>,
+    /// Index into `floating` of the pane currently holding input focus, if any.
+    /// When `None`, input goes to the tiled active pane.
+    pub floating_focus: Option<usize>,
+}
+
+/// A floating pane: a PTY-backed pane rendered as a positioned overlay above the
+/// tiled layout (tmux `new-pane`). Reuses the full `Pane` infrastructure
+/// (vt100 parsing, ConPTY I/O, screen serialization) exactly like popups do,
+/// but is persistent, positioned, movable, and resizable rather than modal.
+pub struct FloatingPane {
+    pub pane: Pane,
+    /// Top-left position within the window content area (0-based cols/rows).
+    pub x: u16,
+    pub y: u16,
+    /// Outer size in cells, including the 1-cell border on each side.
+    pub w: u16,
+    pub h: u16,
+    /// Border line style: a `pane-border-lines` value
+    /// (single/double/heavy/simple/none). Empty or "single" => default single.
+    pub border: String,
+    /// Unique pane id (shares the `next_pane_id` space with tiled panes).
+    pub id: usize,
+    pub title: String,
+    /// Last `-P` position keyword (top-left/centre/...), kept so the float can
+    /// be re-anchored when the terminal is resized. `None` for explicit coords.
+    pub position: Option<String>,
 }
 
 /// A menu item for display-menu
@@ -370,8 +432,21 @@ pub struct AppState {
     /// Default: off
     pub allow_predictions: bool,
     pub drag: Option<DragState>,
+    /// In-progress mouse drag on a floating pane (move/resize), if any.
+    pub float_drag: Option<FloatDrag>,
     pub last_window_area: Rect,
     pub mouse_enabled: bool,
+    /// bold-is-bright: when on (default), rewrite crossterm's 256-indexed
+    /// `38;5;N`/`48;5;N` (N<=15) back to the standard 30-37/90-97 SGR codes so
+    /// the outer terminal applies "bold is bright" to the 16 basic colors
+    /// (issue #425).  Turn off to pass crossterm's output through untouched,
+    /// which keeps explicit 256-indexed low colors byte-accurate at the cost of
+    /// losing bold-is-bright on basic colors.
+    pub bold_is_bright: bool,
+    /// Issue #473: the host terminal's colors as reported by the most recently
+    /// attached client (or the PSMUX_HOST_COLORS override).  None until a
+    /// client reports; the responder then falls back to the Campbell palette.
+    pub host_colors: Option<HostColors>,
     /// scroll-enter-copy-mode: when off, mouse scroll at a shell prompt does NOT
     /// auto-enter copy mode.  Default: on (tmux parity).
     pub scroll_enter_copy_mode: bool,
@@ -405,6 +480,14 @@ pub struct AppState {
     pub status_left: String,
     pub status_right: String,
     pub window_base_index: usize,
+    /// Stable per-window display indices, parallel to `windows` and kept sorted
+    /// ascending. `window_indices[i]` is the tmux-style number of `windows[i]`.
+    /// Decoupling the display number from the Vec position lets `renumber-windows
+    /// off` (the default) leave gaps when a window is killed, matching tmux.
+    /// When this vec is out of sync with `windows` (e.g. mock AppState in unit
+    /// tests that push windows directly), the helper methods fall back to the
+    /// legacy affine mapping `pos + window_base_index`, so nothing breaks.
+    pub window_indices: Vec<usize>,
     pub copy_anchor: Option<(u16,u16)>,
     /// Scroll offset when copy_anchor was set (for viewport-relative adjustment)
     pub copy_anchor_scroll_offset: usize,
@@ -461,6 +544,11 @@ pub struct AppState {
     pub created_at: chrono::DateTime<Local>,
     pub next_win_id: usize,
     pub next_pane_id: usize,
+    /// Pane ids already auto-healed once by `@heal-crashed-panes`. A pane is
+    /// respawned at most once so a shell that crashes on every startup can't
+    /// spin an infinite respawn loop; after one heal it falls through to the
+    /// normal reap path.
+    pub healed_pane_ids: std::collections::HashSet<usize>,
     /// Whether the attached client is currently in prefix mode (for `client_prefix` format var).
     pub client_prefix_active: bool,
     pub sync_input: bool,
@@ -615,6 +703,14 @@ pub struct AppState {
     pub copy_command: String,
     /// command-alias: map of alias name to expansion
     pub command_aliases: std::collections::HashMap<String, String>,
+    /// Config parse warnings (unknown command/option, malformed value, missing
+    /// args) collected during a config load or source-file, surfaced to the
+    /// user instead of being silently ignored (issue #370 follow-up).
+    pub config_warnings: Vec<String>,
+    /// 1-based line number currently being parsed, used to prefix warnings as
+    /// `file:line: message` (file comes from config::current_config_file()).
+    /// None when parsing a single runtime command.
+    pub config_warn_line: Option<usize>,
     /// set-clipboard: "on", "off", "external" (default "on")
     pub set_clipboard: String,
     /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
@@ -679,6 +775,207 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether this is the hidden `__warm__` pre-spawn server: a server started
+    /// ahead of time so the next `new-session` can claim it instead of paying a
+    /// cold-start. It has no client and no visible session until it is claimed
+    /// and renamed to a real session, so it must sit out anything that assumes a
+    /// real, client-facing session - status-interval timers, startup
+    /// client-attached/session-created hooks, and the like.
+    pub fn is_warm_server(&self) -> bool {
+        self.session_name == "__warm__"
+    }
+
+    /// Whether this server should run the periodic `status-interval` timer,
+    /// which fires user `status-interval` hooks and re-renders the status line
+    /// so time formats (`%H:%M:%S`, `%r`, ...) stay current.
+    ///
+    /// The `__warm__` server has no clients and no visible status bar, so it must
+    /// not run this timer: otherwise a global `status-interval` hook fires twice -
+    /// once on the real server and once on the warm one. Once claimed and renamed,
+    /// it is no longer warm and runs the timer normally.
+    pub fn should_run_status_interval_timer(&self) -> bool {
+        self.status_interval > 0 && !self.is_warm_server()
+    }
+
+    /// Whether a pane whose shell exited on its own should have its surviving
+    /// descendant processes (backgrounded children) force-terminated when the
+    /// pane is pruned. Controlled by the `@kill-descendants` user option;
+    /// defaults to on because Windows has no SIGHUP/pty process groups, so
+    /// without the sweep those descendants (and their conhosts) leak.
+    ///
+    /// `set -g @kill-descendants off` restores tmux-on-Unix semantics, where a
+    /// deliberately backgrounded process outlives its pane's shell. Explicit
+    /// kill-pane/kill-window/kill-session paths always kill the full tree,
+    /// matching psmux's long-standing behavior, and are not affected by this.
+    pub fn kill_descendants_on_exit(&self) -> bool {
+        match self.user_options.get("@kill-descendants") {
+            Some(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            ),
+            None => true,
+        }
+    }
+
+    /// Opt-in self-heal for shells that crash immediately after spawn (issue
+    /// #450). When a newly created pane's shell exits within
+    /// `HEAL_CRASHED_PANE_GRACE` of being spawned, treat it as a
+    /// crash-on-startup (rather than a deliberate `exit`) and respawn a fresh
+    /// shell in place instead of pruning the window. Defaults OFF because it is
+    /// only needed on environments where pwsh's non-PSReadLine fallback reader
+    /// FailFasts on the first ConPTY read; enable per-user with
+    /// `set -g @heal-crashed-panes on`.
+    pub fn heal_crashed_panes(&self) -> bool {
+        match self.user_options.get("@heal-crashed-panes") {
+            Some(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            ),
+            None => false,
+        }
+    }
+
+    /// Reap a dead client's `client_registry` entry exactly once, keeping the
+    /// `attached_clients` counter in lock-step with the registry.
+    ///
+    /// Returns `true` only when an entry was actually present and removed, so
+    /// callers run teardown side effects (resize, hooks, destroy-unattached)
+    /// only on a real reap. It is idempotent: a second reap of the same `cid`
+    /// is a safe no-op that leaves `attached_clients` untouched. This prevents
+    /// the over-decrement that a duplicate `ClientDetach` for one `cid` would
+    /// otherwise cause (registry entry present ⟺ counted, guaranteed by
+    /// `ClientAttach` incrementing and inserting together).
+    pub fn reap_client(&mut self, cid: u64) -> bool {
+        self.client_sizes.remove(&cid);
+        if self.client_registry.remove(&cid).is_some() {
+            self.attached_clients = self.attached_clients.saturating_sub(1);
+            self.client_prefix_active = false;
+            if self.latest_client_id == Some(cid) {
+                self.latest_client_id = self.client_registry.keys().max().copied();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when `window_indices` is a valid parallel array for `windows`.
+    /// When false (e.g. a mock AppState that pushed windows directly), the
+    /// index helpers use the legacy affine mapping so existing behavior holds.
+    pub fn window_indices_valid(&self) -> bool {
+        self.window_indices.len() == self.windows.len() && !self.windows.is_empty()
+    }
+
+    /// move-window: give the active window display index `target`, then keep the
+    /// arrays sorted by index. Refuses (returns false) if another window already
+    /// holds `target`, matching tmux. Returns false when indices are not tracked
+    /// so the caller can use the legacy Vec-position move.
+    pub fn move_active_window_to_index(&mut self, target: usize) -> bool {
+        if !self.window_indices_valid() { return false; }
+        if let Some(p) = self.win_pos(target) {
+            if p != self.active_idx { return false; } // occupied by another window
+            return true; // already at target
+        }
+        self.window_indices[self.active_idx] = target;
+        self.resort_windows_by_index();
+        true
+    }
+
+    /// Display (tmux-style) index of the window at Vec position `pos`.
+    pub fn win_display_index(&self, pos: usize) -> usize {
+        if self.window_indices_valid() {
+            self.window_indices.get(pos).copied()
+                .unwrap_or(pos + self.window_base_index)
+        } else {
+            pos + self.window_base_index
+        }
+    }
+
+    /// Vec position of the window whose display index is `display`, if any.
+    pub fn win_pos(&self, display: usize) -> Option<usize> {
+        if self.window_indices_valid() {
+            self.window_indices.iter().position(|&x| x == display)
+        } else if display >= self.window_base_index {
+            let pos = display - self.window_base_index;
+            if pos < self.windows.len() { Some(pos) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// Next display index for an appended window: one past the current highest
+    /// so the parallel array stays sorted without reordering. (tmux also fills
+    /// interior gaps; psmux appends to avoid reshuffling `active_idx`, which the
+    /// detached new-window restore relies on. Gaps from kills still persist.)
+    ///
+    /// Derived purely from `window_indices` (not `windows.len()`): this is called
+    /// from `on_window_appended` *after* the window was pushed, so the two arrays
+    /// are momentarily out of sync and a length-based computation would collide
+    /// with an existing index.
+    pub fn alloc_window_index(&self) -> usize {
+        self.window_indices.iter().copied().max()
+            .map(|m| m + 1)
+            .unwrap_or(self.window_base_index)
+    }
+
+    /// Rewrite indices to contiguous base, base+1, ... in Vec order.
+    /// tmux does this only when `renumber-windows` is on.
+    fn renumber_windows_contiguous(&mut self) {
+        for i in 0..self.window_indices.len() {
+            self.window_indices[i] = i + self.window_base_index;
+        }
+    }
+
+    /// Keep `windows` and `window_indices` sorted ascending by index, preserving
+    /// which window is active by re-resolving `active_idx` via the window id.
+    fn resort_windows_by_index(&mut self) {
+        if !self.window_indices_valid() { return; }
+        let active_id = self.windows.get(self.active_idx).map(|w| w.id);
+        let mut order: Vec<usize> = (0..self.windows.len()).collect();
+        order.sort_by_key(|&i| self.window_indices[i]);
+        if order.iter().enumerate().all(|(i, &o)| i == o) { return; } // already sorted
+        let mut new_windows: Vec<Window> = Vec::with_capacity(self.windows.len());
+        let mut new_indices: Vec<usize> = Vec::with_capacity(self.windows.len());
+        for &i in &order {
+            new_indices.push(self.window_indices[i]);
+        }
+        // Move windows out in the new order without cloning.
+        let mut taken: Vec<Option<Window>> = self.windows.drain(..).map(Some).collect();
+        for &i in &order {
+            new_windows.push(taken[i].take().unwrap());
+        }
+        self.windows = new_windows;
+        self.window_indices = new_indices;
+        if let Some(aid) = active_id {
+            if let Some(p) = self.windows.iter().position(|w| w.id == aid) {
+                self.active_idx = p;
+            }
+        }
+    }
+
+    /// Call right after a new window was pushed onto `windows`. Assigns it the
+    /// next display index (append semantics; see `alloc_window_index`). Does not
+    /// touch `active_idx` — the caller owns that. Only maintains the parallel
+    /// array when it was already in sync (or when this is the first window), so
+    /// mock AppState that pushes windows directly stays in affine-fallback mode.
+    pub fn on_window_appended(&mut self) {
+        if self.window_indices.len() + 1 == self.windows.len() {
+            let idx = self.alloc_window_index();
+            self.window_indices.push(idx);
+        }
+    }
+
+    /// Call right after `windows.remove(pos)`. Drops the parallel index and,
+    /// when `renumber-windows` is on, renumbers the survivors contiguously.
+    pub fn on_window_removed(&mut self, pos: usize) {
+        if self.window_indices.len() == self.windows.len() + 1 && pos < self.window_indices.len() {
+            self.window_indices.remove(pos);
+            if self.renumber_windows {
+                self.renumber_windows_contiguous();
+            }
+        }
+    }
+
     /// Create a new AppState with sensible defaults.
     /// Caller should set `session_name` and call `load_config()` after construction.
     pub fn new(session_name: String) -> Self {
@@ -696,8 +993,13 @@ impl AppState {
                 .unwrap_or(false),
             allow_predictions: false,
             drag: None,
+            float_drag: None,
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             mouse_enabled: true,
+            bold_is_bright: true,
+            host_colors: std::env::var("PSMUX_HOST_COLORS").ok()
+                .map(|s| HostColors::from_spec(&s))
+                .filter(|hc| hc.has_any() || hc.dark.is_some()),
             scroll_enter_copy_mode: true,
             pwsh_mouse_selection: false,
             mouse_selection: true,
@@ -709,6 +1011,7 @@ impl AppState {
             status_left: "[#S] ".to_string(),
             status_right: "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(),
             window_base_index: 0,
+            window_indices: Vec::new(),
             copy_anchor: None,
             copy_anchor_scroll_offset: 0,
             copy_pos: None,
@@ -734,10 +1037,7 @@ impl AppState {
             run_shell_rx: None,
             run_shell_tx: None,
             session_name,
-            session_id: {
-                static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),
@@ -746,6 +1046,7 @@ impl AppState {
             created_at: Local::now(),
             next_win_id: 1,
             next_pane_id: 1,
+            healed_pane_ids: std::collections::HashSet::new(),
             client_prefix_active: false,
             sync_input: false,
             hooks: std::collections::HashMap::new(),
@@ -829,6 +1130,8 @@ impl AppState {
             allow_passthrough: "off".to_string(),
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
+            config_warnings: Vec::new(),
+            config_warn_line: None,
             set_clipboard: "on".to_string(),
             clipboard_osc52: None,
             bell_forward: false,
@@ -875,6 +1178,23 @@ pub struct DragState {
     pub total_pixels: u16,
 }
 
+/// An in-progress mouse drag on a floating pane (tmux moves/resizes floats by
+/// dragging). Grabbing the body moves it; grabbing the bottom/right edge resizes.
+#[derive(Clone, Copy)]
+pub struct FloatDrag {
+    /// Index into the active window's `floating` vec.
+    pub index: usize,
+    pub mode: FloatDragMode,
+}
+
+#[derive(Clone, Copy)]
+pub enum FloatDragMode {
+    /// Move: the cursor's offset (dx, dy) from the float's top-left at grab time.
+    Move { dx: u16, dy: u16 },
+    /// Resize from the bottom-right corner.
+    Resize,
+}
+
 #[derive(Clone)]
 pub enum Action { 
     DisplayPanes, 
@@ -905,10 +1225,32 @@ pub enum Action {
 pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
-    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>),  // cmd, name, detached, start_dir, format, resp
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp
-    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp
+    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool),  // cmd, name, detached, start_dir, title (-T), empty (-E)
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E)
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T)
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T)
+    /// new-pane: create a floating pane over the active window's layout.
+    /// Flags match tmux: `-X`/`-Y` position, `-x`/`-y` size, `-B` border,
+    /// `-T` title, `-c` dir, `-d` detached, `-P` print (returns the pane id).
+    NewFloat {
+        command: String,
+        /// -X x-position (top-left column); None = centre horizontally.
+        x: Option<u16>,
+        /// -Y y-position (top-left row); None = centre vertically.
+        y: Option<u16>,
+        /// -x width (outer, incl. border).
+        w: Option<u16>,
+        /// -y height (outer, incl. border).
+        h: Option<u16>,
+        border: String,
+        title: Option<String>,
+        start_dir: Option<String>,
+        detached: bool,
+        /// -E: create an empty pane (no command / process).
+        empty: bool,
+        /// -P: reply with the new pane id over `resp`.
+        resp: Option<mpsc::Sender<String>>,
+    },
     KillPane,
     KillPaneById(usize),
     CapturePane(mpsc::Sender<String>),
@@ -952,6 +1294,10 @@ pub enum CtrlReq {
     CopyYank,
     CopyRectToggle,
     ClientSize(u64, u16, u16),
+    /// Issue #473: a client reporting its host terminal's colors (spec string
+    /// in `HostColors::to_spec` form), gathered by querying the host terminal
+    /// at attach time.
+    HostColors(String),
     FocusPaneCmd(usize),
     FocusWindowCmd(usize),
     MouseDown(u64,u16,u16),
@@ -1010,6 +1356,20 @@ pub enum CtrlReq {
     /// Fields: session name, optional client CWD, response sender.
     ClaimSession(String, Option<String>, mpsc::Sender<String>),
     SwapPane(String),
+    /// swap-pane -t <target>: swap the active pane with the pane identified by
+    /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id
+    /// (`%N`); otherwise it is a user-facing pane index that is normalized
+    /// using pane-base-index before resolving a positional pane path.
+    SwapPaneTarget(usize, bool),
+    /// swap-pane -s <src> -t <dst>: swap the two explicit panes named by
+    /// `-s` and `-t` (issue #442).  Each pane is a (value, is_id) pair
+    /// resolved the same way as `SwapPaneTarget`.  `detach` is true when
+    /// `-d` was given: the active pane is left unchanged (following its pane
+    /// to the new slot); otherwise, per tmux, the `-t` pane becomes active.
+    SwapPaneSrcDst { src: usize, src_is_id: bool, dst: usize, dst_is_id: bool, detach: bool },
+    /// swap-pane -t <token>: swap the active pane with the pane at a layout
+    /// position token (e.g. `{top-right}`).  Layout-independent.
+    SwapPanePosition(String),
     ResizePane(String, u16),
     SetBuffer(String),
     /// Set a named buffer: (name, content)
@@ -1026,6 +1386,8 @@ pub enum CtrlReq {
     DeleteNamedBuffer(String),
     PasteBufferAt(usize),
     DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
+    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>),  // resp, format, pane_id, set_status_bar, duration_override_ms
     LastWindow,
     LastPane,
     RotateWindow(bool),
@@ -1042,7 +1404,7 @@ pub enum CtrlReq {
         target_pane: Option<usize>,
         horizontal: bool,
     },
-    RespawnPane(Option<String>, bool),  // optional workdir (-c), kill flag (-k)
+    RespawnPane(Option<String>, bool, Option<String>, bool),  // optional workdir (-c), kill flag (-k), command (-- shell-command), empty (-E)
     BindKey(String, String, String, bool),  // table, key, command, repeat
     UnbindKey(String, Option<String>),  // key, optional table (None = prefix)
     UnbindAll,
@@ -1057,7 +1419,8 @@ pub enum CtrlReq {
     ShowWindowOptions(mpsc::Sender<String>),
     SourceFile(String),
     MoveWindow(Option<usize>),
-    SwapWindow(usize),
+    // (source display index, target display index); source None = active window
+    SwapWindow(Option<usize>, usize),
     /// link-window: (source window index, target insertion index)
     LinkWindow(Option<usize>, Option<usize>),
     UnlinkWindow,
@@ -1252,6 +1615,164 @@ pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Lets the server loop skip the tree walk when no CPR response is needed.
 pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Issue #473: set by the parser thread when any pane's `color_query_pending`
+/// bitmask is raised.  Lets the server loop skip the tree walk when no color
+/// query response is needed.
+pub static COLOR_QUERY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Issue #473: the host terminal color spec captured by the client at startup
+/// (before the input pump starts), consumed by `establish_connection` which
+/// reports it to the server on every (re)connect.  `None` inside means the
+/// query ran but the host reported nothing usable.
+pub static HOST_COLORS_SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Bit assignments for `Pane::color_query_pending` (issue #473).
+/// Bits 0-15 are the OSC 4 palette indexes.
+pub const COLOR_QUERY_FG: u32 = 1 << 16;   // OSC 10;?
+pub const COLOR_QUERY_BG: u32 = 1 << 17;   // OSC 11;?
+pub const COLOR_QUERY_SCHEME: u32 = 1 << 18; // CSI ?996n
+
+/// Issue #473: the host terminal's colors, as reported by an attached client
+/// (which queries its host terminal with OSC 10/11/4 at attach time), or the
+/// `PSMUX_HOST_COLORS` environment override.  Used to answer terminal color
+/// queries issued by pane applications.  All values are RGB triples.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostColors {
+    pub fg: Option<(u8, u8, u8)>,
+    pub bg: Option<(u8, u8, u8)>,
+    pub palette: [Option<(u8, u8, u8)>; 16],
+    /// Some(true) = dark scheme, Some(false) = light. None = derive from bg.
+    pub dark: Option<bool>,
+}
+
+impl HostColors {
+    pub fn empty() -> Self {
+        Self { fg: None, bg: None, palette: [None; 16], dark: None }
+    }
+
+    /// True when enough colors are known to be worth reporting.
+    pub fn has_any(&self) -> bool {
+        self.fg.is_some() || self.bg.is_some() || self.palette.iter().any(|p| p.is_some())
+    }
+
+    /// Windows Terminal "Campbell" defaults, used when no host colors are known.
+    /// A valid (if generic) palette beats no reply: applications at least get a
+    /// well-formed response instead of timing out.
+    pub fn campbell() -> Self {
+        Self {
+            fg: Some((0xCC, 0xCC, 0xCC)),
+            bg: Some((0x0C, 0x0C, 0x0C)),
+            palette: [
+                Some((0x0C, 0x0C, 0x0C)), Some((0xC5, 0x0F, 0x1F)),
+                Some((0x13, 0xA1, 0x0E)), Some((0xC1, 0x9C, 0x00)),
+                Some((0x00, 0x37, 0xDA)), Some((0x88, 0x17, 0x98)),
+                Some((0x3A, 0x96, 0xDD)), Some((0xCC, 0xCC, 0xCC)),
+                Some((0x76, 0x76, 0x76)), Some((0xE7, 0x48, 0x56)),
+                Some((0x16, 0xC6, 0x0C)), Some((0xF9, 0xF1, 0xA5)),
+                Some((0x3B, 0x78, 0xFF)), Some((0xB4, 0x00, 0x9E)),
+                Some((0x61, 0xD6, 0xD6)), Some((0xF2, 0xF2, 0xF2)),
+            ],
+            dark: Some(true),
+        }
+    }
+
+    /// True when the scheme is dark.  Uses the explicit `dark` flag when the
+    /// host reported one (CSI ?997 response), else relative luminance of bg.
+    pub fn is_dark(&self) -> bool {
+        if let Some(d) = self.dark { return d; }
+        match self.bg {
+            Some((r, g, b)) => {
+                // ITU-R BT.709 relative luminance, 0-255 scale.
+                let lum = 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
+                lum < 128.0
+            }
+            None => true,
+        }
+    }
+
+    /// Serialize to the compact single-token wire form used by the client's
+    /// `host-colors` control line: `fg=RRGGBB,bg=RRGGBB,0=RRGGBB,...,dark=1`.
+    pub fn to_spec(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some((r, g, b)) = self.fg { parts.push(format!("fg={:02x}{:02x}{:02x}", r, g, b)); }
+        if let Some((r, g, b)) = self.bg { parts.push(format!("bg={:02x}{:02x}{:02x}", r, g, b)); }
+        for (i, p) in self.palette.iter().enumerate() {
+            if let Some((r, g, b)) = p { parts.push(format!("{}={:02x}{:02x}{:02x}", i, r, g, b)); }
+        }
+        if let Some(d) = self.dark { parts.push(format!("dark={}", if d { 1 } else { 0 })); }
+        parts.join(",")
+    }
+
+    /// Parse the wire form produced by `to_spec`.  Unknown keys are ignored.
+    pub fn from_spec(spec: &str) -> Self {
+        let mut hc = Self::empty();
+        for part in spec.split(',') {
+            let Some((key, val)) = part.split_once('=') else { continue };
+            if key == "dark" {
+                hc.dark = match val { "1" => Some(true), "0" => Some(false), _ => None };
+                continue;
+            }
+            let Some(rgb) = parse_hex_rgb(val) else { continue };
+            match key {
+                "fg" => hc.fg = Some(rgb),
+                "bg" => hc.bg = Some(rgb),
+                _ => {
+                    if let Ok(i) = key.parse::<usize>() {
+                        if i < 16 { hc.palette[i] = Some(rgb); }
+                    }
+                }
+            }
+        }
+        hc
+    }
+}
+
+/// Parse `RRGGBB` (6 hex digits, no `#`).
+pub fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+/// Parse an X11-style color reply payload: `rgb:RR/GG/BB`, `rgb:RRRR/GGGG/BBBB`
+/// (1-4 hex digits per channel, scaled to 8-bit), or `#RRGGBB`.
+pub fn parse_x11_color(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        return parse_hex_rgb(hex);
+    }
+    let body = s.strip_prefix("rgb:")?;
+    let mut chans = body.split('/');
+    let mut out = [0u8; 3];
+    for slot in out.iter_mut() {
+        let c = chans.next()?;
+        if c.is_empty() || c.len() > 4 || !c.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        let v = u16::from_str_radix(c, 16).ok()?;
+        // Scale to 8-bit based on the number of digits given.
+        let max = (16u32.pow(c.len() as u32) - 1) as u32;
+        *slot = ((v as u32 * 255 + max / 2) / max) as u8;
+    }
+    if chans.next().is_some() { return None; }
+    Some((out[0], out[1], out[2]))
+}
+
+/// Issue #440: `pipe-pane` output routing.
+///
+/// A pane's PTY reader thread tees every raw output chunk to any pipe writer
+/// registered under its `pane_id`, so `pipe-pane -o '<cmd>'` actually receives
+/// the pane transcript on the child's stdin (previously the child was spawned
+/// with a piped stdin that nothing ever wrote to, so it blocked on an empty
+/// pipe forever and the sink stayed 0 bytes).
+///
+/// `PIPE_PANE_COUNT` is a cheap gate: it lets every reader thread skip the mutex
+/// entirely in the overwhelmingly common case where no pipe is active, so panes
+/// that are not being piped pay nothing. The server handler (`CtrlReq::PipePane`)
+/// pushes/removes `(pane_id, child_stdin)` entries and keeps the count in sync.
+pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static PIPE_WRITERS: Mutex<Vec<(usize, std::process::ChildStdin)>> = Mutex::new(Vec::new());
+
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly
 /// `shutdown()` them before `process::exit(0)`.  Without this, Windows
@@ -1265,6 +1786,16 @@ pub fn register_persistent_stream(client_id: u64, stream: &std::net::TcpStream) 
         if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
             v.push((client_id, cloned));
         }
+    }
+}
+
+/// Remove a specific client's entry from PERSISTENT_STREAMS without shutting
+/// it down. Called by the writer-thread Guard on normal disconnect — the socket
+/// is already shut down via ws_shutdown at that point, so we only need to drop
+/// the dead clone from the Vec to prevent unbounded accumulation.
+pub fn deregister_persistent_stream(client_id: u64) {
+    if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+        v.retain(|(cid, _)| *cid != client_id);
     }
 }
 
@@ -1290,84 +1821,64 @@ pub fn shutdown_client_stream(client_id: u64) {
             }
         });
     }
-    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
         v.retain(|(cid, _)| *cid != client_id);
     }
     remove_directive_channel(client_id);
 }
 
-/// Server-push frame channels for persistent (attached) clients.
-/// Uses a bounded `sync_channel` with a small capacity to allow short bursts
-/// of frames to queue without dropping, while still bounding memory.
+/// Server-push frame slot for persistent (attached) clients.
 ///
-/// When the channel is full (sustained high-throughput, e.g. rapid scroll in
-/// copy mode), the oldest unconsumed frame is drained before pushing the new
-/// one, so the client always receives the latest frame without unbounded
-/// memory growth.
+/// Each slot holds at most one pending frame. `push_frame()` overwrites any
+/// unconsumed frame; frames are full snapshots, so a stale ready frame has
+/// no value once a newer one exists. Memory is bounded to O(clients), not
+/// O(frames).
 ///
-/// Previous single-slot design (694156e) overwrote unconsumed frames, which
-/// fixed a memory leak during copy-mode scrolling but dropped intermediate
-/// frames during fast typing — the cursor advanced but characters were not
-/// rendered.  A bounded channel preserves intermediate frames under normal
-/// typing speeds while still capping memory for pathological scroll bursts.
-const FRAME_CHANNEL_CAPACITY: usize = 16;
+/// The slot uses `Mutex<Option<String>>`. The producer (main loop's
+/// `push_frame`) locks, replaces, unlocks. The consumer (writer thread)
+/// locks, takes, unlocks, then writes to TCP *outside* the lock. Neither
+/// side ever holds the lock across blocking I/O, so a slow client cannot
+/// stall the main event loop.
+///
+/// Design constraints:
+///   - The lock must not be held across blocking I/O. The writer thread
+///     does TCP writes that can block (slow client, full kernel buffer).
+///     A design where the writer holds a lock during the write -- and the
+///     producer also takes that lock to enqueue -- lets a slow client
+///     stall the server main loop.
+///   - Per-client storage must be bounded. An unbounded queue (e.g. plain
+///     `mpsc::channel`) leaks memory under sustained producer-faster-than-
+///     consumer load (rapid copy-mode scroll).
+///   - `std::sync::atomic` has no atomic-swap for owned heap values;
+///     `AtomicPtr<String>` would require `unsafe` ownership management.
+///     `arc-swap` would be lock-free but adds a third-party dependency
+///     for a path that is not measured-hot.
+pub type FrameSlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
-pub type FrameChannel = std::sync::Arc<FrameChannelInner>;
-
-pub struct FrameChannelInner {
-    pub tx: std::sync::mpsc::SyncSender<String>,
-    pub rx: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
-}
-
-static FRAME_PUSH_CHANNELS: std::sync::Mutex<Vec<(u64, FrameChannel)>> =
+static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Register a bounded frame channel for a persistent connection's writer
-/// thread, tagged with client_id for targeted operations (e.g. force-detach).
-/// Returns the channel Arc for the writer thread to consume from.
-pub fn register_frame_channel(client_id: u64) -> FrameChannel {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(FRAME_CHANNEL_CAPACITY);
-    let channel = std::sync::Arc::new(FrameChannelInner {
-        tx,
-        rx: std::sync::Mutex::new(rx),
-    });
-    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
-        v.push((client_id, channel.clone()));
+/// Register a frame slot for a persistent connection's writer thread.
+/// Returns the slot Arc for the writer thread to consume from.
+pub fn register_frame_channel(client_id: u64) -> FrameSlot {
+    let slot: FrameSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
+        v.push((client_id, slot.clone()));
     }
-    channel
+    slot
 }
 
 /// Push a serialized frame to all persistent clients.
-/// If a client's channel is full, drain the oldest frame first so the
-/// newest frame is always delivered — this bounds memory while ensuring
-/// the client never stalls the server.
-/// Dead channels (writer thread exited) are pruned automatically.
+/// Overwrites any unconsumed frame; frames are full snapshots, so only
+/// the latest matters. The lock is held only for the duration of an
+/// Option::replace, never across I/O.
+/// Dead slots (poisoned mutex) are pruned automatically.
 pub fn push_frame(frame: &str) {
-    if let Ok(mut channels) = FRAME_PUSH_CHANNELS.lock() {
-        channels.retain(|(_, channel)| {
-            match channel.tx.try_send(frame.to_string()) {
-                Ok(()) => true,
-                Err(std::sync::mpsc::TrySendError::Full(frame)) => {
-                    // Frames are full snapshots, not deltas. If the client is
-                    // behind, stale queued frames should not block the newest
-                    // corrective frame from reaching the terminal.
-                    let rx = match channel.rx.lock() {
-                        Ok(rx) => rx,
-                        Err(_) => return false,
-                    };
-                    loop {
-                        match rx.try_recv() {
-                            Ok(_) => {}
-                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
-                        }
-                    }
-                    matches!(
-                        channel.tx.try_send(frame),
-                        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_))
-                    )
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
+        slots.retain(|(_, slot)| {
+            match slot.lock() {
+                Ok(mut s) => { *s = Some(frame.to_string()); true }
+                Err(_) => false, // writer thread panicked; prune
             }
         });
     }
@@ -1375,7 +1886,16 @@ pub fn push_frame(frame: &str) {
 
 /// Check if any persistent clients are registered for push.
 pub fn has_frame_receivers() -> bool {
-    FRAME_PUSH_CHANNELS.lock().map_or(false, |v| !v.is_empty())
+    FRAME_PUSH_SLOTS.lock().map_or(false, |v| !v.is_empty())
+}
+
+/// Remove the frame slot for a specific client. Called by the writer thread
+/// on exit so the server stops pushing to dead slots and has_frame_receivers()
+/// returns false when no live clients remain.
+pub fn deregister_frame_channel(client_id: u64) {
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
+        v.retain(|(cid, _)| *cid != client_id);
+    }
 }
 
 /// Per-client directive channels (queued, not overwritten like frame slots).
@@ -1453,3 +1973,15 @@ pub struct ParsedTarget {
 #[cfg(test)]
 #[path = "../tests-rs/test_pr267_backpressure_proof.rs"]
 mod tests_pr267_backpressure;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue434_reap_client.rs"]
+mod tests_issue434_reap_client;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_kill_descendants_option.rs"]
+mod tests_kill_descendants_option;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue450_heal_option.rs"]
+mod tests_issue450_heal_option;

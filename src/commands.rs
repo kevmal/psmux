@@ -378,9 +378,32 @@ fn generate_show_options(app: &AppState) -> String {
 /// Local join-pane: extract source pane and graft into target window.
 fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pane: Option<usize>,
                    target_win: Option<usize>, target_pane: Option<usize>, horizontal: bool) {
-    let src_idx = src_win.unwrap_or(app.active_idx);
-    let raw_target_win = target_win.unwrap_or(app.active_idx);
-    if src_idx < app.windows.len() && raw_target_win < app.windows.len() && src_idx != raw_target_win {
+    // Resolve source/target display indices to Vec positions (default: active
+    // window). win_pos honors gapped indices left by renumber-windows off.
+    let src_pos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+    let tgt_pos = match target_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+    // tmux surfaces an explicit error rather than silently doing nothing when the
+    // target cannot be resolved. Without this, `join-pane -t :N` where window N does
+    // not exist (common when a user assumes base-index 1) fails with no feedback.
+    let src_idx = match src_pos {
+        Some(p) => p,
+        None => {
+            app.status_message = Some((format!("join-pane: can't find source window: {}", src_win.unwrap_or(0)), Instant::now(), None));
+            return;
+        }
+    };
+    let raw_target_win = match tgt_pos {
+        Some(p) => p,
+        None => {
+            app.status_message = Some((format!("join-pane: can't find window: {}", target_win.unwrap_or(0)), Instant::now(), None));
+            return;
+        }
+    };
+    if src_idx == raw_target_win {
+        app.status_message = Some(("join-pane: can't join a pane to its own window".to_string(), Instant::now(), None));
+        return;
+    }
+    {
         // Resolve source pane path
         let src_path = if let Some(pidx) = src_pane {
             let mut leaves = Vec::new();
@@ -405,6 +428,7 @@ fn join_pane_local(app: &mut AppState, src_win: Option<usize>, src_pane: Option<
             let tgt = if src_empty && raw_target_win > src_idx { raw_target_win - 1 } else { raw_target_win };
             if src_empty {
                 app.windows.remove(src_idx);
+                app.on_window_removed(src_idx);
                 if app.active_idx >= app.windows.len() {
                     app.active_idx = app.windows.len().saturating_sub(1);
                 }
@@ -441,10 +465,10 @@ fn generate_list_commands() -> String {
 
 /// Build the choose-tree data for the WindowChooser mode.
 pub fn build_choose_tree(app: &AppState) -> Vec<crate::session::TreeEntry> {
-    let current_windows: Vec<(String, usize, String, bool)> = app.windows.iter().enumerate().map(|(i, w)| {
+    let current_windows: Vec<(String, usize, String, bool, usize)> = app.windows.iter().enumerate().map(|(i, w)| {
         let panes = crate::tree::count_panes(&w.root);
         let size = format!("{}x{}", app.last_window_area.width, app.last_window_area.height);
-        (w.name.clone(), panes, size, i == app.active_idx)
+        (w.name.clone(), panes, size, i == app.active_idx, app.win_display_index(i))
     }).collect();
     list_all_sessions_tree(&app.session_name, &current_windows)
 }
@@ -473,11 +497,11 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
                 Some(Action::NewWindow)
             }
         }
-        "split-window" | "splitw" => {
+        "split-window" | "splitw" | "split-pane" | "splitp" => {
             // If extra flags like -c, -d, -p, -F, or a shell command are present,
             // store as Command to preserve the full argument string.
             let has_extra = parts.iter().any(|p| matches!(*p, "-c" | "-d" | "-p" | "-l" | "-F" | "-P" | "-b" | "-f" | "-I" | "-Z" | "-e"))
-                || parts.iter().any(|p| !p.starts_with('-') && *p != "split-window" && *p != "splitw");
+                || parts.iter().any(|p| !p.starts_with('-') && *p != "split-window" && *p != "splitw" && *p != "split-pane" && *p != "splitp");
             if has_extra {
                 Some(Action::Command(cmd.to_string()))
             } else if parts.iter().any(|p| *p == "-h") {
@@ -644,6 +668,13 @@ pub fn parse_command_line(line: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_double_quotes = false;
     let mut in_single_quotes = false;
+    // Track whether the current token contained an explicit quote, so an
+    // intentionally-empty quoted argument (e.g. `select-pane -T ""`) is
+    // preserved as an empty string rather than dropped. Without this, an empty
+    // `""`/`''` token is silently discarded and a following flag value is lost
+    // (this was the root cause of #177: `select-pane -T ""` never cleared the
+    // pane title because the empty value never reached SetPaneTitle).
+    let mut had_quote = false;
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
 
@@ -674,20 +705,23 @@ pub fn parse_command_line(line: &str) -> Vec<String> {
             }
         } else if c == '"' {
             in_double_quotes = !in_double_quotes;
+            had_quote = true;
         } else if c == '\'' && !in_double_quotes {
             in_single_quotes = true;
+            had_quote = true;
         } else if c.is_whitespace() && !in_double_quotes {
-            if !current.is_empty() {
+            if !current.is_empty() || had_quote {
                 args.push(current.clone());
                 current.clear();
             }
+            had_quote = false;
         } else {
             current.push(c);
         }
         i += 1;
     }
 
-    if !current.is_empty() {
+    if !current.is_empty() || had_quote {
         args.push(current);
     }
 
@@ -811,7 +845,7 @@ pub fn execute_action(app: &mut AppState, action: &Action) -> io::Result<bool> {
         }
         Action::NewWindow => {
             let pty_system = portable_pty::native_pty_system();
-            create_window(&*pty_system, app, None, None)?;
+            create_window(&*pty_system, app, None, None, false)?;
         }
         Action::SplitHorizontal => {
             split_active(app, LayoutKind::Horizontal)?;
@@ -894,9 +928,9 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
         // execute_command_prompt() is only reached in embedded mode.
         "new-window" | "neww" => {
             let pty_system = portable_pty::native_pty_system();
-            create_window(&*pty_system, app, None, None)?;
+            create_window(&*pty_system, app, None, None, false)?;
         }
-        "split-window" | "splitw" => {
+        "split-window" | "splitw" | "split-pane" | "splitp" => {
             let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
             split_active(app, kind)?;
         }
@@ -936,10 +970,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     match parts[0] {
         "new-window" | "neww" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "new-window\n", &app.session_key);
+                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             }
         }
-        "split-window" | "splitw" => {
+        "split-window" | "splitw" | "split-pane" | "splitp" => {
             if let Some(port) = app.control_port {
                 // Forward the full command string to preserve -c, -d, -p etc. flags
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
@@ -950,8 +984,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "kill-window" | "killw" => {
             if app.windows.len() > 1 {
-                let mut win = app.windows.remove(app.active_idx);
+                let removed_pos = app.active_idx;
+                let mut win = app.windows.remove(removed_pos);
                 kill_all_children(&mut win.root);
+                app.on_window_removed(removed_pos);
                 if app.active_idx >= app.windows.len() {
                     app.active_idx = app.windows.len() - 1;
                 }
@@ -986,14 +1022,11 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
                 if let Some(t) = parts.get(t_pos + 1) {
                     if let Some(idx) = parse_window_target(t) {
-                        if idx >= app.window_base_index {
-                            let internal_idx = idx - app.window_base_index;
-                            if internal_idx < app.windows.len() {
-                                switch_with_copy_save(app, |app| {
-                                    app.last_window_idx = app.active_idx;
-                                    app.active_idx = internal_idx;
-                                });
-                            }
+                        if let Some(internal_idx) = app.win_pos(idx) {
+                            switch_with_copy_save(app, |app| {
+                                app.last_window_idx = app.active_idx;
+                                app.active_idx = internal_idx;
+                            });
                         }
                     }
                 }
@@ -1122,12 +1155,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             toggle_zoom(app);
         }
         "copy-mode" => {
-            enter_copy_mode(app);
             if parts.iter().any(|a| *a == "-u") {
-                let half = app.windows.get(app.active_idx)
-                    .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
-                    .map(|p| p.last_rows as usize).unwrap_or(20);
-                scroll_copy_up(app, half);
+                if app.scroll_enter_copy_mode {
+                    enter_copy_mode(app);
+                    let half = app.windows.get(app.active_idx)
+                        .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
+                        .map(|p| p.last_rows as usize).unwrap_or(20);
+                    scroll_copy_up(app, half);
+                } else {
+                    // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
+                    if let Some(win) = app.windows.get_mut(app.active_idx) {
+                        if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                            let _ = pane.writer.write_all(b"\x1b[5~");
+                        }
+                    }
+                }
+            } else {
+                enter_copy_mode(app);
             }
         }
         "display-panes" | "displayp" => {
@@ -1158,19 +1202,29 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "display-popup" | "popup" => {
+            // Re-tokenize with a quote-aware parser (#470). The raw `parts` above
+            // come from `split_whitespace()`, which does NOT strip shell quotes.
+            // When this command arrives from a display-menu item, the inner popup
+            // command is still quoted (e.g. `display-popup -E 'lazygit'`), so a
+            // naive split leaves the literal quotes on the command (`'lazygit'`),
+            // which is not a runnable executable. The popup shell then exits
+            // immediately and close-on-exit tears the popup back down before the
+            // user ever sees it. parse_command_line() strips the quotes so the
+            // command matches what the CLI/TCP path (connection.rs) already does.
+            let qparts = parse_command_line(cmd);
             // Parse -w width, -h height, -E close-on-exit, -d start-dir flags
             let mut width_spec = "80".to_string();
             let mut height_spec = "24".to_string();
             let mut start_dir: Option<String> = None;
-            let close_on_exit = parts.iter().any(|p| *p == "-E");
+            let close_on_exit = qparts.iter().any(|p| p == "-E");
             let mut skip_indices = std::collections::HashSet::new();
             skip_indices.insert(0); // skip the command name itself
             let mut i = 1;
-            while i < parts.len() {
-                match parts[i] {
-                    "-w" => { if let Some(v) = parts.get(i + 1) { width_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
-                    "-h" => { if let Some(v) = parts.get(i + 1) { height_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
-                    "-d" | "-c" => { if let Some(v) = parts.get(i + 1) { start_dir = Some(v.to_string()); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
+            while i < qparts.len() {
+                match qparts[i].as_str() {
+                    "-w" => { if let Some(v) = qparts.get(i + 1) { width_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
+                    "-h" => { if let Some(v) = qparts.get(i + 1) { height_spec = v.to_string(); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
+                    "-d" | "-c" => { if let Some(v) = qparts.get(i + 1) { start_dir = Some(v.to_string()); skip_indices.insert(i); skip_indices.insert(i + 1); i += 1; } }
                     "-E" | "-K" => { skip_indices.insert(i); }
                     _ => {}
                 }
@@ -1180,13 +1234,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let (term_w, term_h) = crossterm::terminal::size().unwrap_or((120, 40));
             let width = parse_popup_dim_local(&width_spec, term_w, 80);
             let height = parse_popup_dim_local(&height_spec, term_h, 24);
-            // Collect remaining args as the command
-            let rest: String = parts.iter().enumerate()
+            // Collect remaining args as the command (quotes already stripped)
+            let rest: String = qparts.iter().enumerate()
                 .filter(|(idx, _)| !skip_indices.contains(idx))
-                .map(|(_, a)| *a)
+                .map(|(_, a)| a.as_str())
                 .collect::<Vec<&str>>()
                 .join(" ");
-            
+
             // Spawn popup as a real Pane via the popup module
             let pane_result = if !rest.is_empty() {
                 crate::popup::create_popup_pane(
@@ -1199,7 +1253,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     &app.environment,
                 )
             } else { None };
-            
+
             app.mode = Mode::PopupMode {
                 command: rest,
                 output: String::new(),
@@ -1232,11 +1286,47 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
         }
         "swap-pane" | "swapp" => {
-            if let Some(port) = app.control_port {
-                let dir = if parts.iter().any(|p| *p == "-U") { "-U" } else { "-D" };
+            // `-s <src> -t <dst>` swaps the two explicit panes (#442).
+            // `-t <target>` alone swaps the active pane with an explicit target
+            // pane (e.g. `swap-pane -t :.4` or `swap-pane -t %2`).  Without -t,
+            // fall back to the directional -U/-D/-L/-R swap.
+            let source = parts.iter().position(|p| *p == "-s")
+                .and_then(|i| parts.get(i + 1)).map(|s| s.to_string());
+            let target = parts.iter().position(|p| *p == "-t")
+                .and_then(|i| parts.get(i + 1)).map(|s| s.to_string());
+            let detach = parts.iter().any(|p| *p == "-d");
+            if let (Some(src), Some(tgt)) = (source.as_ref(), target.as_ref()) {
+                if let Some(port) = app.control_port {
+                    let d = if detach { " -d" } else { "" };
+                    let _ = send_control_to_port(port, &format!("swap-pane{} -s {} -t {}\n", d, src, tgt), &app.session_key);
+                } else {
+                    match (resolve_swap_pane_target_path(app, src), resolve_swap_pane_target_path(app, tgt)) {
+                        (Some(sp), Some(dp)) => { crate::window_ops::swap_pane_between(app, sp, dp, detach); }
+                        _ => { app.status_message = Some(("swap-pane: can't find pane".to_string(), Instant::now(), None)); }
+                    }
+                }
+            } else if let Some(tgt) = target {
+                if let Some(port) = app.control_port {
+                    let _ = send_control_to_port(port, &format!("swap-pane -t {}\n", tgt), &app.session_key);
+                } else {
+                    let path = resolve_swap_pane_target_path(app, &tgt);
+                    if let Some(path) = path {
+                        crate::window_ops::swap_pane_with_path(app, path);
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", tgt), Instant::now(), None));
+                    }
+                }
+            } else if let Some(port) = app.control_port {
+                let dir = if parts.iter().any(|p| *p == "-U") { "-U" }
+                    else if parts.iter().any(|p| *p == "-L") { "-L" }
+                    else if parts.iter().any(|p| *p == "-R") { "-R" }
+                    else { "-D" };
                 let _ = send_control_to_port(port, &format!("swap-pane {}\n", dir), &app.session_key);
             } else {
-                let dir = if parts.iter().any(|p| *p == "-U") { FocusDir::Up } else { FocusDir::Down };
+                let dir = if parts.iter().any(|p| *p == "-L") { FocusDir::Left }
+                    else if parts.iter().any(|p| *p == "-R") { FocusDir::Right }
+                    else if parts.iter().any(|p| *p == "-U") { FocusDir::Up }
+                    else { FocusDir::Down };
                 crate::window_ops::swap_pane(app, dir);
             }
         }
@@ -1259,8 +1349,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let kill = parts.iter().any(|p| *p == "-k");
-                crate::window_ops::respawn_active_pane(app, None, None, kill)?;
+                let empty = parts.iter().any(|p| *p == "-E");
+                let kill = parts.iter().any(|p| *p == "-k") || empty;
+                // Honor `-- <shell-command>` (issue #399).
+                let command = parts.iter().position(|p| *p == "--")
+                    .map(|i| parts[i + 1..].join(" "))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                crate::window_ops::respawn_active_pane(app, None, None, kill, command.as_deref(), empty)?;
             }
         }
         "toggle-sync" => {
@@ -1317,7 +1413,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         for key in &key_parts {
                             let key_upper = key.to_uppercase();
                             let expanded = match key_upper.as_str() {
-                                "ENTER" => "\r".to_string(),
+                                "ENTER" | "RETURN" | "CR" => "\r".to_string(),
                                 "TAB" => "\t".to_string(),
                                 "BTAB" | "BACKTAB" => "\x1b[Z".to_string(),
                                 "ESCAPE" | "ESC" => "\x1b".to_string(),
@@ -1352,6 +1448,24 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                                     if let Some(c) = key.chars().nth(4) {
                                         if let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) {
                                             format!("\x1b{}", ctrl as char)
+                                        } else {
+                                            String::new()
+                                        }
+                                    } else {
+                                        key.to_string()
+                                    }
+                                }
+                                // Ctrl+Shift+<punctuation/digit> collapsing to a C0 byte,
+                                // e.g. Ctrl+/ arriving as "C-S--" -> 0x1f (^_), matching
+                                // Ctrl+_ and tmux (issue #394).  Must precede the generic
+                                // C- arm, whose nth(2) would read the 'S' and mis-send Ctrl+S.
+                                s if (s.starts_with("C-S-") || s.starts_with("C-s-"))
+                                    && s.chars().count() == 5
+                                    && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
+                                {
+                                    if let Some(c) = s.chars().nth(4) {
+                                        if let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) {
+                                            String::from(ctrl as char)
                                         } else {
                                             String::new()
                                         }
@@ -1396,7 +1510,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             };
                             if let Some(win) = app.windows.get_mut(app.active_idx) {
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                                    let _ = p.writer.write_all(expanded.as_bytes());
+                                    // DECCKM app-cursor mode: SS3, not CSI (see crate::input::write_key_seq).
+                                    crate::input::write_key_seq(p, expanded.as_bytes());
                                     let _ = p.writer.flush();
                                 }
                             }
@@ -1452,16 +1567,20 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             paste_latest(app)?;
         }
         "set-buffer" | "setb" => {
-            // Parse -b name and extract content, skipping flags
+            // Parse -b name, -w (clipboard), and extract content
             let mut i = 1;
             let mut buf_name: Option<String> = None;
             let mut content: Option<String> = None;
+            let mut propagate_to_clipboard = false;
             while i < parts.len() {
                 if parts[i] == "-b" {
                     if let Some(name) = parts.get(i + 1) {
                         buf_name = Some(name.to_string());
                     }
                     i += 2; // skip -b and its value (buffer name)
+                } else if parts[i] == "-w" {
+                    propagate_to_clipboard = true;
+                    i += 1;
                 } else if parts[i].starts_with('-') {
                     i += 1; // skip unknown flags
                 } else {
@@ -1470,11 +1589,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     break;
                 }
             }
-            if let Some(text) = content {
+            if let Some(ref text) = content {
+                if propagate_to_clipboard {
+                    crate::clipboard::copy_to_system_clipboard(text);
+                }
                 if let Some(name) = buf_name {
-                    app.named_buffers.insert(name, text);
+                    app.named_buffers.insert(name, text.clone());
                 } else {
-                    app.paste_buffers.insert(0, text);
+                    app.paste_buffers.insert(0, text.clone());
                     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
                 }
             }
@@ -1704,7 +1826,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         non_flag[1..].join(" ")
                     };
                     if has_append {
-                        app.hooks.entry(hook_name.to_string()).or_default().push(hook_cmd);
+                        // Dedup identical handlers so a re-sourced config does
+                        // not accumulate duplicate hooks that fire every tick
+                        // (issue #459); mirrors the replace path's #133 guard.
+                        let entry = app.hooks.entry(hook_name.to_string()).or_default();
+                        if !entry.contains(&hook_cmd) {
+                            entry.push(hook_cmd);
+                        }
                     } else {
                         app.hooks.insert(hook_name.to_string(), vec![hook_cmd]);
                     }
@@ -1790,7 +1918,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 let mut output = String::new();
                 for (i, win) in app.windows.iter().enumerate() {
                     if win.name.contains(pattern) {
-                        output.push_str(&format!("{}: {}\n", i + app.window_base_index, win.name));
+                        output.push_str(&format!("{}: {}\n", app.win_display_index(i), win.name));
                     }
                 }
                 if output.is_empty() { output.push_str(&format!("(no windows matching '{}')\n", pattern)); }
@@ -1801,10 +1929,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                let target = parts[1..].iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok());
+                // Destination: `-t <win>` (accept ':'-prefixed) or bare positional.
+                let target = parts.windows(2).find(|w| w[0] == "-t")
+                    .and_then(|w| w[1].trim_start_matches(':').parse::<usize>().ok())
+                    .or_else(|| parts[1..].iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .find_map(|s| s.trim_start_matches(':').parse::<usize>().ok()));
                 if let Some(t) = target {
-                    let t: usize = t;
-                    if t < app.windows.len() && app.active_idx != t {
+                    if app.window_indices_valid() {
+                        app.move_active_window_to_index(t);
+                    } else if t < app.windows.len() && app.active_idx != t {
                         let win = app.windows.remove(app.active_idx);
                         let insert_idx = if t > app.active_idx { t - 1 } else { t };
                         app.windows.insert(insert_idx.min(app.windows.len()), win);
@@ -1817,9 +1951,18 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else {
-                if let Some(target) = parts[1..].iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse::<usize>().ok()) {
-                    if target < app.windows.len() && app.active_idx != target {
-                        app.windows.swap(app.active_idx, target);
+                let src = parts.windows(2).find(|w| w[0] == "-s")
+                    .and_then(|w| w[1].trim_start_matches(':').parse::<usize>().ok());
+                let target = parts.windows(2).find(|w| w[0] == "-t")
+                    .and_then(|w| w[1].trim_start_matches(':').parse::<usize>().ok())
+                    .or_else(|| parts[1..].iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .find_map(|s| s.trim_start_matches(':').parse::<usize>().ok()));
+                if let Some(t) = target {
+                    let spos = match src { Some(d) => app.win_pos(d).unwrap_or(d), None => app.active_idx };
+                    let tpos = app.win_pos(t).unwrap_or(t);
+                    if spos != tpos && spos < app.windows.len() && tpos < app.windows.len() {
+                        app.windows.swap(spos, tpos);
                     }
                 }
             }
@@ -1838,12 +1981,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     let src_id = app.windows[src].id;
                     let src_name = app.windows[src].name.clone();
                     let pty_system = portable_pty::native_pty_system();
-                    if let Ok(()) = crate::pane::create_window(&*pty_system, app, None, None) {
+                    if let Ok(()) = crate::pane::create_window(&*pty_system, app, None, None, false) {
                         let new_idx = app.windows.len() - 1;
                         app.windows[new_idx].linked_from = Some(src_id);
                         app.windows[new_idx].name = src_name;
                         if let Some(dst) = dst_idx {
-                            if dst < new_idx {
+                            if app.window_indices_valid() {
+                                app.move_active_window_to_index(dst);
+                            } else if dst < new_idx {
                                 let win = app.windows.remove(new_idx);
                                 app.windows.insert(dst, win);
                             }
@@ -1859,8 +2004,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let Some(port) = app.control_port {
                 let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             } else if app.windows.len() > 1 {
-                let mut win = app.windows.remove(app.active_idx);
+                let removed_pos = app.active_idx;
+                let mut win = app.windows.remove(removed_pos);
                 kill_all_children(&mut win.root);
+                app.on_window_removed(removed_pos);
                 if app.active_idx >= app.windows.len() {
                     app.active_idx = app.windows.len() - 1;
                 }
@@ -2038,8 +2185,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             };
 
             // Check if session already exists
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
+            let port_path = crate::paths::port_file(&port_file_base);
             if std::path::Path::new(&port_path).exists() {
                 if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -2066,7 +2212,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                let warm_port_path = crate::paths::port_file(&warm_base);
                 if std::path::Path::new(&warm_port_path).exists() {
                     if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
                         if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
@@ -2315,6 +2461,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     Ok(())
 }
 
+fn resolve_swap_pane_target_path(app: &AppState, target: &str) -> Option<Vec<usize>> {
+    if target.starts_with('{') {
+        return crate::window_ops::pane_path_at_position(app, target);
+    }
+    if app.windows.is_empty() {
+        return None;
+    }
+    let parsed = crate::cli::parse_target(target);
+    let win = &app.windows[app.active_idx];
+    match parsed.pane {
+        Some(p) if parsed.pane_is_id => crate::tree::find_path_by_id(&win.root, p),
+        Some(p) => p.checked_sub(app.pane_base_index)
+            .and_then(|idx| crate::tree::path_by_position(&win.root, idx)),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests-rs/test_commands.rs"]
 mod tests;
@@ -2404,6 +2567,22 @@ mod tests_issue245_mouse_selection;
 mod tests_pr255_active_border;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_pane_border_lines_render.rs"]
+mod tests_pane_border_lines_render;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_content_box_drawing.rs"]
+mod tests_pane_content_box_drawing;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_copy_line_numbers_render.rs"]
+mod tests_copy_line_numbers_render;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_floating_render.rs"]
+mod tests_floating_render;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_pr207_compat_bugs.rs"]
 mod tests_pr207_compat_bugs;
 
@@ -2414,3 +2593,19 @@ mod tests_named_buffers;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue273_send_prefix.rs"]
 mod tests_issue273_send_prefix;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue383_swap_pane_targets.rs"]
+mod tests_issue383_swap_pane_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue402_parse.rs"]
+mod tests_issue402_parse;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue426_split_pane_alias.rs"]
+mod tests_issue426_split_pane_alias;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue470_menu_popup.rs"]
+mod tests_issue470_menu_popup;

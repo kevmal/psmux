@@ -131,6 +131,8 @@ fn mock_window(name: &str) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -609,4 +611,18 @@ fn test_expand_format_complex_style() {
     let result = expand_format("#[fg=yellow,bg=blue,bold]Styled Text", &app);
     assert_eq!(result, "#[fg=yellow,bg=blue,bold]Styled Text",
         "Complex style directives must be preserved");
+}
+
+#[test]
+fn test_session_path_is_server_cwd() {
+    // tmux: #{session_path} is the working directory of the session. psmux has
+    // no per-session cwd, so it resolves to the server's current directory --
+    // the same source #{pane_current_path} falls back to. It must NOT be the
+    // user's home directory.
+    let app = mock_app();
+    let expected = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert_eq!(expand_format("#{session_path}", &app), expected,
+        "#{{session_path}} must resolve to the session (server) working directory");
 }

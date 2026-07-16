@@ -29,6 +29,13 @@ pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
     pub mode: u8,
+    /// OSC 8 hyperlink id (index into the screen's hyperlink store, +1).
+    /// 0 means no hyperlink.  Part of Attrs so a link change is reflected in
+    /// cell equality (forcing a redraw) and travels with the cell through all
+    /// grid operations, mirroring tmux's grid_cell.link.  It is intentionally
+    /// NOT emitted by write_escape_code_diff (SGR); psmux re-emits OSC 8 in its
+    /// own pane renderer.
+    pub link: u32,
 }
 
 impl Attrs {

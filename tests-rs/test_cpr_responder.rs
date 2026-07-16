@@ -7,8 +7,7 @@
 //   blocks indefinitely.
 //
 // Fix: the parser thread scans every byte batch for ESC[6n via
-// `scan_cpr_query` and sets `cpr_pending` after the first query already
-// covered by psmux's preemptive response; the server loop calls
+// `scan_cpr_query` and sets `cpr_pending`; the server loop calls
 // `drain_cpr_pending` which writes ESC[row;colR and clears the flag.
 
 use super::*;
@@ -63,35 +62,6 @@ fn escapes_without_0x1b_skip_window_scan() {
     assert!(!scan_cpr_query(b"[6n"));
 }
 
-// ── should_signal_reactive_cpr ───────────────────────────────────────────
-
-#[test]
-fn first_cpr_query_is_covered_by_preemptive_response() {
-    let mut preemptive_available = true;
-    assert!(!should_signal_reactive_cpr(true, &mut preemptive_available));
-    assert!(!preemptive_available);
-}
-
-#[test]
-fn second_cpr_query_is_reactive_after_preemptive_response_is_consumed() {
-    let mut preemptive_available = true;
-    assert!(!should_signal_reactive_cpr(true, &mut preemptive_available));
-    assert!(should_signal_reactive_cpr(true, &mut preemptive_available));
-}
-
-#[test]
-fn non_cpr_batch_does_not_consume_preemptive_response() {
-    let mut preemptive_available = true;
-    assert!(!should_signal_reactive_cpr(false, &mut preemptive_available));
-    assert!(preemptive_available);
-}
-
-#[test]
-fn proxy_panes_without_preemptive_response_signal_first_cpr_query() {
-    let mut preemptive_available = false;
-    assert!(should_signal_reactive_cpr(true, &mut preemptive_available));
-}
-
 // ── drain_cpr_pending — response format ──────────────────────────────────
 //
 // We verify the CPR response string format directly since constructing a
@@ -116,4 +86,59 @@ fn cpr_response_fallback_produces_valid_sequence() {
     let (r, c): (u16, u16) = (0, 0);
     let response = format!("\x1b[{};{}R", r + 1, c + 1);
     assert_eq!(response, "\x1b[1;1R");
+}
+
+// ── CprScanner — detection across batch boundaries ───────────────────────
+//
+// The parser thread scans output in coalesced batches. A query that straddles
+// a batch boundary is invisible to the per-batch scan_cpr_query (the
+// partial-sequence tests above pin that a lone prefix must NOT match), so the
+// boundary hides the query, cpr_pending is never set, and the reply is never
+// sent. An unanswered ESC[6n then leaves the asker waiting forever — for
+// conhost's PSUEDOCONSOLE_INHERIT_CURSOR startup query that means the pane's
+// child hangs permanently in ConsoleCreateConnectionObject (reproduced
+// deterministically). CprScanner carries the last bytes of the stream between
+// scans so a boundary cannot hide the query.
+
+#[test]
+fn scanner_detects_in_batch_query() {
+    let mut s = CprScanner::new();
+    assert!(s.scan(b"\x1b[6n"));
+}
+
+#[test]
+fn scanner_detects_query_split_at_every_boundary() {
+    let q = b"\x1b[6n";
+    for cut in 1..q.len() {
+        let mut s = CprScanner::new();
+        assert!(!s.scan(&q[..cut]), "prefix alone must not fire (cut={})", cut);
+        assert!(s.scan(&q[cut..]), "suffix must complete the query (cut={})", cut);
+    }
+}
+
+#[test]
+fn scanner_detects_query_split_across_four_batches() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(b"\x1b"));
+    assert!(!s.scan(b"["));
+    assert!(!s.scan(b"6"));
+    assert!(s.scan(b"n"));
+}
+
+#[test]
+fn scanner_partial_never_completed_does_not_fire() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(b"\x1b[6"));
+    assert!(!s.scan(b"hello world"));
+    assert!(!s.scan(b"n")); // the 'n' no longer completes anything
+}
+
+#[test]
+fn scanner_detects_query_split_after_long_noise_batches() {
+    let mut s = CprScanner::new();
+    assert!(!s.scan(&vec![b'X'; 1024]));
+    let mut batch = vec![b'Y'; 512];
+    batch.extend_from_slice(b"\x1b[6");
+    assert!(!s.scan(&batch));
+    assert!(s.scan(b"n"));
 }

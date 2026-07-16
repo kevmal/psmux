@@ -645,9 +645,33 @@ impl CommandBuilder {
             value,
         } in self.envs.values()
         {
-            block.extend(preferred_key.encode_wide());
+            let key: Vec<u16> = preferred_key.encode_wide().collect();
+
+            // CreateProcessW rejects the WHOLE block with ERROR_INVALID_PARAMETER
+            // (87) if any single entry is malformed.  Tangibly reproduced on
+            // Windows 11 build 26200 (tests/test_issue167_envblock_probe.ps1): a
+            // ConPTY passthrough spawn fails with err 87 when the block contains
+            // an entry with an empty name, a name beginning with '=', or an
+            // interior NUL.  The env map is populated from externally-controlled
+            // sources (the parent process environment and the HKLM/HKCU
+            // Environment registry keys), so a single corrupt value would
+            // otherwise silently break the warm-pane spawn ("flashes black,
+            // returns to prompt").  Sanitise rather than poison the block.
+            // See issue #167.
+            //
+            // - Empty name, or name starting with '=' (cmd.exe "=C:" drive vars):
+            //   skip entirely; pwsh/ConPTY do not need them and they always
+            //   trip err 87 on recent builds.
+            // - Interior NUL anywhere in the name: skip; the name is unusable.
+            if key.is_empty() || key[0] == b'=' as u16 || key.contains(&0) {
+                continue;
+            }
+
+            block.extend_from_slice(&key);
             block.push(b'=' as u16);
-            block.extend(value.encode_wide());
+            // Truncate the value at the first interior NUL rather than drop the
+            // whole variable, preserving as much of a usable value as possible.
+            block.extend(value.encode_wide().take_while(|&c| c != 0));
             block.push(0);
         }
         // and a final terminator for CreateProcessW
@@ -757,3 +781,7 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 #[cfg(test)]
 #[path = "../../../tests-rs/test_cmdbuilder.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue167_envblock.rs"]
+mod tests_issue167_envblock;

@@ -151,7 +151,13 @@ These can appear in:
 
 ### Pane Border Labels
 
-If you use `pane-border-format` with `#{pane_title}`, the border labels will update live as OSC titles change. This can be useful for showing what directory each pane is working in:
+Enabling `pane-border-status top` (or `bottom`) on its own is enough to show pane titles on the border. When `pane-border-format` is not set, psmux falls back to the tmux default of `#{pane_index} "#{pane_title}"`, so this alone shows a labelled border:
+
+```tmux
+set -g pane-border-status top
+```
+
+Set `pane-border-format` only when you want to customize the label. With `#{pane_title}` it updates live as OSC titles change, which is useful for showing what directory each pane is working in:
 
 ```tmux
 set -g pane-border-status top

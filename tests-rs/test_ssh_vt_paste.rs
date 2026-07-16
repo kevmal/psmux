@@ -1,5 +1,5 @@
 use super::*;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -502,4 +502,77 @@ fn dispatch_tilde_ignores_param_201() {
     assert!(csi_events.is_empty(),
         "CSI 201~ should be silently ignored, got {:?}", csi_events);
     assert_eq!(p.state, PS::Ground);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. Modified Enter over SSH (ESC+CR / ESC+LF → Alt+Enter)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Extract the KeyEvent from an Event::Key variant.
+fn key_event(evt: &Event) -> Option<&KeyEvent> {
+    match evt {
+        Event::Key(k) => Some(k),
+        _ => None,
+    }
+}
+
+#[test]
+fn esc_cr_decodes_as_alt_enter() {
+    // Windows Terminal sends ESC+CR (\x1b\r) for Shift+Enter.  The SSH VT
+    // parser must decode it as a single Alt+Enter event so encode_key_event
+    // re-emits \x1b\r and TUI apps insert a newline instead of submitting.
+    // Regression: previously this split into a standalone Esc + plain Enter,
+    // which submitted the prompt.
+    let events = parse("\x1b\r");
+    assert_eq!(events.len(), 1, "expected exactly one event, got {:?}", events);
+    let k = key_event(&events[0]).expect("expected a Key event");
+    assert_eq!(k.code, KeyCode::Enter);
+    assert_eq!(k.modifiers, KeyModifiers::ALT);
+}
+
+#[test]
+fn esc_lf_decodes_as_alt_enter() {
+    let events = parse("\x1b\n");
+    assert_eq!(events.len(), 1, "expected exactly one event, got {:?}", events);
+    let k = key_event(&events[0]).expect("expected a Key event");
+    assert_eq!(k.code, KeyCode::Enter);
+    assert_eq!(k.modifiers, KeyModifiers::ALT);
+}
+
+#[test]
+fn esc_cr_returns_to_ground_and_passes_following_text() {
+    // After Alt+Enter the parser must be back in Ground and decode the
+    // following characters normally.
+    let mut p = VtParser::new();
+    let events = feed_str(&mut p, "\x1b\rhi");
+    assert_eq!(p.state, PS::Ground);
+    assert_eq!(events.len(), 3, "Alt+Enter + 'h' + 'i', got {:?}", events);
+
+    let k = key_event(&events[0]).expect("first event should be a Key");
+    assert_eq!(k.code, KeyCode::Enter);
+    assert_eq!(k.modifiers, KeyModifiers::ALT);
+
+    assert_eq!(key_event(&events[1]).unwrap().code, KeyCode::Char('h'));
+    assert_eq!(key_event(&events[2]).unwrap().code, KeyCode::Char('i'));
+}
+
+#[test]
+fn bare_cr_without_esc_is_plain_enter() {
+    // A CR not preceded by ESC must remain an unmodified Enter so ordinary
+    // prompt submission still works.
+    let events = parse("\r");
+    assert_eq!(events.len(), 1);
+    let k = key_event(&events[0]).expect("expected a Key event");
+    assert_eq!(k.code, KeyCode::Enter);
+    assert_eq!(k.modifiers, KeyModifiers::empty());
+}
+
+#[test]
+fn esc_printable_still_decodes_as_alt_char() {
+    // The new Enter arm must not disturb Alt+<printable> handling.
+    let events = parse("\x1bx");
+    assert_eq!(events.len(), 1);
+    let k = key_event(&events[0]).expect("expected a Key event");
+    assert_eq!(k.code, KeyCode::Char('x'));
+    assert_eq!(k.modifiers, KeyModifiers::ALT);
 }

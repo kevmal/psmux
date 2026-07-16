@@ -263,6 +263,8 @@ pub fn create_proxy_pane(
         last_title_check: epoch,
         last_infer_title: epoch,
         dead: false,
+        last_text_input: None,
+        last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
@@ -271,9 +273,13 @@ pub fn create_proxy_pane(
         // CPR responses written via this field are TCP-forwarded to the source
         // ConPTY via the ProxyMasterPty writer.
         cpr_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         copy_state: None,
         pane_style: None,
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        // Proxy panes mirror a remote pane's ConPTY; respawning a local shell
+        // here would be wrong, so they are never auto-healed.
+        spawned_at: None,
     })
 }

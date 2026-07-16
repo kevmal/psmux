@@ -4,26 +4,28 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = "tmux"
+$SshUser = if ($env:PSMUX_TEST_SSH_USER) { $env:PSMUX_TEST_SSH_USER } else { $env:USERNAME }
+$SshHost = "$SshUser@localhost"
 
 Write-Host "=== VT Parser Paste Path Test (SSH) ===" -ForegroundColor Cyan
 
 # Step 1: Clean up
 Write-Host "[STEP 1] Cleaning up old sessions..." -ForegroundColor Yellow
-ssh gj@localhost "$PSMUX kill-server" 2>$null
+ssh $SshHost "$PSMUX kill-server" 2>$null
 Start-Sleep -Seconds 2
 
 # Step 2: Clear debug log
 Write-Host "[STEP 2] Clearing debug log..." -ForegroundColor Yellow
-ssh gj@localhost "cmd /c echo. > C:\Users\gj\.psmux\ssh_input.log" 2>$null
+ssh $SshHost "cmd /c echo. > %USERPROFILE%\.psmux\ssh_input.log" 2>$null
 Start-Sleep -Milliseconds 500
 
 # Step 3: Start detached session
 Write-Host "[STEP 3] Creating detached session..." -ForegroundColor Yellow
-ssh gj@localhost "$PSMUX new-session -d -s vt_paste"
+ssh $SshHost "$PSMUX new-session -d -s vt_paste"
 Start-Sleep -Seconds 3
 
 # Verify
-$sessions = ssh gj@localhost "$PSMUX list-sessions"
+$sessions = ssh $SshHost "$PSMUX list-sessions"
 Write-Host "  Sessions: $sessions"
 if ($sessions -notmatch "vt_paste") {
     Write-Host "[FATAL] Session not created" -ForegroundColor Red
@@ -32,7 +34,7 @@ if ($sessions -notmatch "vt_paste") {
 
 # Step 4: Clear the pane
 Write-Host "[STEP 4] Clearing pane..." -ForegroundColor Yellow
-ssh gj@localhost "$PSMUX send-keys -t vt_paste 'clear' Enter"
+ssh $SshHost "$PSMUX send-keys -t vt_paste 'clear' Enter"
 Start-Sleep -Seconds 1
 
 # Step 5: Attach via SSH process with redirected stdin, inject bracket paste bytes
@@ -40,7 +42,7 @@ Write-Host "[STEP 5] Attaching via SSH and injecting bracket paste bytes..." -Fo
 
 $proc = New-Object System.Diagnostics.Process
 $proc.StartInfo.FileName = "ssh"
-$proc.StartInfo.Arguments = "-tt gj@localhost $PSMUX attach -t vt_paste"
+$proc.StartInfo.Arguments = "-tt $SshHost $PSMUX attach -t vt_paste"
 $proc.StartInfo.UseShellExecute = $false
 $proc.StartInfo.RedirectStandardInput = $true
 $proc.StartInfo.RedirectStandardOutput = $true
@@ -89,14 +91,14 @@ Start-Sleep -Seconds 1
 
 # Step 9: Capture pane content
 Write-Host "[STEP 9] Capturing pane content..." -ForegroundColor Yellow
-$capture = ssh gj@localhost "$PSMUX capture-pane -t vt_paste -p"
+$capture = ssh $SshHost "$PSMUX capture-pane -t vt_paste -p"
 Write-Host "--- PANE CONTENT ---" -ForegroundColor Cyan
 $capture | ForEach-Object { Write-Host "  $_" }
 Write-Host "--- END ---" -ForegroundColor Cyan
 
 # Step 10: Read debug log
 Write-Host "[STEP 10] Reading SSH debug log..." -ForegroundColor Yellow
-$debugLog = ssh gj@localhost "type C:\Users\gj\.psmux\ssh_input.log"
+$debugLog = ssh $SshHost "type %USERPROFILE%\.psmux\ssh_input.log"
 Write-Host "--- DEBUG LOG (last 30 lines) ---" -ForegroundColor DarkGray
 $debugLog | Select-Object -Last 30 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 Write-Host "--- END ---" -ForegroundColor DarkGray
@@ -144,6 +146,6 @@ if ($debugStr -match "flush_stale_paste") {
 # Cleanup
 Write-Host ""
 Write-Host "Cleaning up..." -ForegroundColor Yellow
-ssh gj@localhost "$PSMUX kill-server" 2>$null
+ssh $SshHost "$PSMUX kill-server" 2>$null
 
 Write-Host "=== DONE ===" -ForegroundColor Cyan

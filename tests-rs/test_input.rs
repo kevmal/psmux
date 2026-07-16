@@ -11,6 +11,66 @@ fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     }
 }
 
+// ── DECCKM (application cursor keys): arrows/Home/End use SS3 in app mode ──
+
+#[test]
+fn cursor_keys_keep_csi_when_app_cursor_off() {
+    // Not in application-cursor mode: None => caller writes the CSI form verbatim.
+    for csi in [b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b[H", b"\x1b[F"] {
+        assert_eq!(csi_cursor_to_ss3(csi, false), None, "app-cursor off must keep CSI");
+    }
+}
+
+#[test]
+fn cursor_keys_become_ss3_when_app_cursor_on() {
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", true), Some(*b"\x1bOA")); // up
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[B", true), Some(*b"\x1bOB")); // down
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[C", true), Some(*b"\x1bOC")); // right
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[D", true), Some(*b"\x1bOD")); // left
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[H", true), Some(*b"\x1bOH")); // home
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[F", true), Some(*b"\x1bOF")); // end
+}
+
+#[test]
+fn non_cursor_and_modified_keys_never_ss3() {
+    // App-cursor mode must NOT touch tilde keys or modified arrows: xterm modified
+    // cursor keys stay CSI (ESC [ 1 ; mod x) and are longer than 3 bytes.
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[5~", true), None);   // PageUp
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[3~", true), None);   // Delete
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[1;5A", true), None); // Ctrl+Up
+    assert_eq!(csi_cursor_to_ss3(b"\x1bOA", true), None);    // already SS3
+    assert_eq!(csi_cursor_to_ss3(b"x", true), None);         // not an escape
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[Z", true), None);    // BackTab: 3-byte CSI, final byte outside A-D/H/F
+    assert_eq!(csi_cursor_to_ss3(b"", true), None);          // empty
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[", true), None);     // truncated (len 2)
+}
+
+// ── Integration: parser DECCKM state drives the encoder (no pane/PTY/server) ──
+
+#[test]
+fn decckm_parser_state_drives_arrow_encoding() {
+    // Walk one terminal through the timeline the encoder observes at keypress time.
+    let mut term = vt100::Parser::new(24, 80, 0);
+
+    // Fresh screen defaults to off, so Up stays CSI.
+    assert!(!term.screen().application_cursor(), "fresh screen defaults to off");
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), None);
+
+    // PSReadLine enables DECCKM, so Up becomes SS3.
+    term.process(b"\x1b[?1h");
+    assert!(term.screen().application_cursor());
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), Some(*b"\x1bOA"));
+
+    // Mode survives later output (the encoder reads it long after the app set it).
+    term.process(b"PS C:\\> \x1b[32mgreen\x1b[m");
+    assert!(term.screen().application_cursor());
+
+    // Reset restores CSI.
+    term.process(b"\x1b[?1l");
+    assert!(!term.screen().application_cursor());
+    assert_eq!(csi_cursor_to_ss3(b"\x1b[A", term.screen().application_cursor()), None);
+}
+
 // ── AltGr characters (Ctrl+Alt on Windows) should be forwarded verbatim ──
 
 #[test]
@@ -140,6 +200,24 @@ fn ctrl_a_produces_soh() {
 }
 
 #[test]
+fn ctrl_c_key_event_detects_uppercase_control_c() {
+    let ev = key(KeyCode::Char('C'), KeyModifiers::CONTROL);
+    assert!(is_ctrl_c_key_event(&ev), "Ctrl+C must be recognized as interrupt key");
+}
+
+#[test]
+fn ctrl_c_key_event_detects_raw_etx() {
+    let ev = key(KeyCode::Char('\u{0003}'), KeyModifiers::NONE);
+    assert!(is_ctrl_c_key_event(&ev), "raw ETX (0x03) must be recognized as Ctrl+C");
+}
+
+#[test]
+fn ctrl_c_key_event_rejects_alt_modified_c() {
+    let ev = key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    assert!(!is_ctrl_c_key_event(&ev), "Ctrl+Alt+C must not be treated as plain Ctrl+C");
+}
+
+#[test]
 fn plain_backslash_no_modifiers() {
     let ev = key(KeyCode::Char('\\'), KeyModifiers::NONE);
     let bytes = encode_key_event(&ev).unwrap();
@@ -169,6 +247,11 @@ fn shift_enter_produces_correct_encoding() {
 fn ctrl_enter_produces_csi_13_5() {
     let ev = key(KeyCode::Enter, KeyModifiers::CONTROL);
     let bytes = encode_key_event(&ev).unwrap();
+    // #409: On Windows, plain Ctrl+Enter is LF (0x0A) to match Windows Terminal's
+    // regular input encoder; other platforms keep xterm CSI 13;5~.
+    #[cfg(windows)]
+    assert_eq!(bytes, b"\n", "Ctrl+Enter on Windows must produce LF");
+    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;5~", "Ctrl+Enter must produce CSI 13;5~");
 }
 
@@ -353,10 +436,13 @@ fn alt_enter_no_ctrl_uses_vt_not_csi() {
 }
 
 #[test]
-fn ctrl_enter_uses_csi_encoding() {
-    // Ctrl+Enter → CSI 13;5~ (must use CSI, not ESC+CR)
+fn ctrl_enter_uses_platform_encoding() {
+    // #409: plain Ctrl+Enter is LF on Windows Terminal, CSI 13;5~ elsewhere.
     let ev = key(KeyCode::Enter, KeyModifiers::CONTROL);
     let bytes = encode_key_event(&ev).unwrap();
+    #[cfg(windows)]
+    assert_eq!(bytes, b"\n", "Ctrl+Enter must use LF on Windows; got {:?}", bytes);
+    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;5~",
         "Ctrl+Enter must use CSI encoding; got {:?}", bytes);
 }
@@ -395,7 +481,7 @@ fn shift_alt_enter_on_non_windows_produces_csi() {
 /// sent BOTH \x1b\r (VT) and a native VK_RETURN injection for Shift+Enter,
 /// causing the child process to receive two Enter events.  After the fix,
 /// only VT encoding is used for Shift/Alt+Enter (no Ctrl), preventing double
-/// delivery.  Ctrl+Enter still uses native injection (with CSI fallback).
+/// delivery.  Plain Ctrl+Enter uses native injection with an LF fallback (#409).
 #[cfg(windows)]
 #[test]
 fn bug3_double_delivery_prevention() {
@@ -416,11 +502,11 @@ fn bug3_double_delivery_prevention() {
     assert_eq!(shift_bytes, b"\x1b\r");
     assert_eq!(alt_bytes, b"\x1b\r");
 
-    // Native injection path (Ctrl+Enter): produces CSI sequence
-    // In the live code, forward_key_to_active only calls
-    // send_modified_enter_event when ctrl==true.  This CSI encoding
-    // is the FALLBACK when native injection fails.
-    assert_eq!(ctrl_bytes, b"\x1b[13;5~");
+    // Plain Ctrl+Enter (#409): LF byte payload.  The live Windows path injects a
+    // VK_RETURN KEY_EVENT with this same LF payload; encode_key_event is the byte
+    // fallback.  LF stays distinct from Shift/Alt+Enter's ESC+CR, so no combination
+    // collapses into a plain CR double-delivery.
+    assert_eq!(ctrl_bytes, b"\n");
 
     // The critical guard in forward_key_to_active:
     //   let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

@@ -16,6 +16,19 @@ use std::sync::{Arc, Mutex};
 use crate::layout::serialize_screen_rows;
 use crate::types::{Pane, AppState, Mode};
 
+/// Diagnostic-only popup logging, gated by PSMUX_POPUP_DEBUG=1 (no-op otherwise).
+/// Writes to %TEMP%\psmux_popup_debug.log (never inside the repo).
+fn popup_debug(msg: &str) {
+    if std::env::var("PSMUX_POPUP_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        let tmp = std::env::var("TEMP").or_else(|_| std::env::var("TMP")).unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}\\psmux_popup_debug.log", tmp);
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = std::io::Write::write_all(&mut f, format!("[{} pid={}] {}\n", ts, std::process::id(), msg).as_bytes());
+        }
+    }
+}
+
 // ── Popup pane creation ─────────────────────────────────────────────
 
 /// Spawn a PTY-backed `Pane` for use inside a popup overlay.
@@ -41,9 +54,19 @@ pub fn create_popup_pane(
     };
     let pair = pty_sys.openpty(pty_size).ok()?;
 
-    let mut cmd_builder = portable_pty::CommandBuilder::new(
-        if cfg!(windows) { "pwsh" } else { "sh" },
-    );
+    let mut cmd_builder = if command.trim().is_empty() {
+        crate::pane::build_command(None, true, false)
+    } else {
+        let mut builder = portable_pty::CommandBuilder::new(
+            if cfg!(windows) { "pwsh" } else { "sh" },
+        );
+        if cfg!(windows) {
+            builder.args(["-NoProfile", "-Command", command]);
+        } else {
+            builder.args(["-c", command]);
+        }
+        builder
+    };
     if let Some(dir) = start_dir {
         cmd_builder.cwd(dir);
     } else if let Ok(dir) = std::env::current_dir() {
@@ -54,50 +77,68 @@ pub fn create_popup_pane(
     cmd_builder.env("COLORTERM", "truecolor");
     cmd_builder.env("PSMUX_SESSION", session_name);
     crate::pane::apply_user_environment(&mut cmd_builder, environment);
-    if cfg!(windows) {
-        cmd_builder.args(["-NoProfile", "-Command", command]);
-    } else {
-        cmd_builder.args(["-c", command]);
-    }
+    // NOTE: the interactive-shell-for-empty-command behavior (tmux parity, #351)
+    // is handled above where cmd_builder is constructed: an empty command uses
+    // build_command(None, true, false) to launch the default shell as a REPL.
+    // The remaining half of the #351 fix (answering ESC[6n so PSReadLine renders)
+    // is the shared spawn_reader_thread + cpr_pending wiring below.
 
     let child = pair.slave.spawn_command(cmd_builder).ok()?;
+    popup_debug(&format!("create_popup_pane: spawned child for command=[{}] rows={} cols={}", command, rows, cols));
     drop(pair.slave); // required for ConPTY
 
     let term: Arc<Mutex<vt100::Parser>> =
         Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
     let term_reader = term.clone();
 
-    // Reader thread (same as regular pane reader)
-    if let Ok(mut reader) = pair.master.try_clone_reader() {
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match std::io::Read::read(&mut reader, &mut buf) {
-                    Ok(n) if n > 0 => {
-                        if let Ok(mut p) = term_reader.lock() {
-                            p.process(&buf[..n]);
-                        }
-                    }
-                    _ => break,
-                }
-            }
-        });
-    }
-
-    let mut pty_writer = pair.master.take_writer().ok()?;
-    crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
-
-    // Brief delay so the reader thread processes initial output before the
-    // first frame is serialized to clients.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
-    let epoch = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    // Shared signal Arcs. Using the SAME reader thread as regular panes is what
+    // makes interactive popups work: spawn_reader_thread scans for ESC[6n (CPR)
+    // queries and raises cpr_pending / CPR_DATA_PENDING so the server can answer
+    // them. Without that, PSReadLine (and fzf, etc.) block forever on startup
+    // waiting for the cursor-position report and the popup renders blank (#351).
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         crate::pane::CURSOR_SHAPE_UNSET,
     ));
     let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+    match pair.master.try_clone_reader() {
+        Ok(reader) => {
+            crate::pane::spawn_reader_thread(
+                reader,
+                term_reader,
+                data_version.clone(),
+                cursor_shape.clone(),
+                bell_pending.clone(),
+                cpr_pending.clone(),
+                color_query_pending.clone(),
+                output_ring.clone(),
+                pane_id,
+            );
+        }
+        Err(e) => {
+            popup_debug(&format!("popup reader: try_clone_reader FAILED: {}", e));
+        }
+    }
+
+    let pty_writer = pair.master.take_writer().ok()?;
+
+    // Brief delay so the reader thread processes initial output before the
+    // first frame is serialized to clients.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if std::env::var("PSMUX_POPUP_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        if let Ok(p) = term.lock() {
+            let contents = p.screen().contents();
+            let preview: String = contents.chars().take(120).collect();
+            popup_debug(&format!("post-50ms screen contents len={} preview=[{}]", contents.len(), preview.replace('\n', "\\n")));
+        }
+    }
+
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    let epoch = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
     Some(Pane {
         master: pair.master,
@@ -114,20 +155,90 @@ pub fn create_popup_pane(
         last_title_check: epoch,
         last_infer_title: epoch,
         dead: false,
+        last_text_input: None,
+        last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
         cursor_shape,
         bell_pending,
-        // cpr_pending is intentionally unused for popups: the popup spawns its
-        // own inline reader thread (see lines ~71-85 of this file) that never
-        // calls scan_cpr_query.  Popups are not expected to run interactive
-        // shells, so CPR detection is not wired up here.
+        // cpr_pending is now driven by the shared spawn_reader_thread above, so
+        // the server can answer ESC[6n queries for interactive popup shells (#351).
+        cpr_pending,
+        color_query_pending,
+        copy_state: None,
+        pane_style: None,
+        squelch_until: None,
+        output_ring,
+        // Popup shells are overlays, never tiled panes; never auto-heal them.
+        spawned_at: None,
+    })
+}
+
+// ── Empty (childless) panes ─────────────────────────────────────────
+
+/// A stand-in `Child` for an empty pane (tmux `-E`), which has no process.
+/// `try_wait` always reports "still running" so the pane is never reaped, and
+/// `kill` is a no-op. This lets a pane exist with a live PTY but no command,
+/// exactly like a tmux empty pane, until `respawn-pane` gives it a command.
+#[derive(Debug, Clone)]
+pub struct NullChild;
+
+impl portable_pty::ChildKiller for NullChild {
+    fn kill(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> { Box::new(NullChild) }
+}
+
+impl portable_pty::Child for NullChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> { Ok(None) }
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> { Ok(portable_pty::ExitStatus::with_exit_code(0)) }
+    fn process_id(&self) -> Option<u32> { None }
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> { None }
+}
+
+/// Create an EMPTY pane (tmux `-E`): a PTY-backed `Pane` with NO child process.
+/// It renders blank and ignores input until `respawn-pane` gives it a command.
+/// No reader thread is spawned since there is never any output.
+pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
+    let pty_sys = portable_pty::native_pty_system();
+    let pty_size = portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    let pair = pty_sys.openpty(pty_size).ok()?;
+    let pty_writer = pair.master.take_writer().ok()?;
+    // Drop the slave: with no child attached the pty stays inert; we never read.
+    drop(pair.slave);
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+    let epoch = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    Some(Pane {
+        master: pair.master,
+        writer: pty_writer,
+        child: Box::new(NullChild),
+        term,
+        last_rows: rows,
+        last_cols: cols,
+        id: pane_id,
+        title: String::new(),
+        title_locked: false,
+        child_pid: None,
+        data_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        last_title_check: epoch,
+        last_infer_title: epoch,
+        dead: false,
+        last_text_input: None,
+        last_special_key: None,
+        vt_bridge_cache: None,
+        vti_mode_cache: None,
+        mouse_input_cache: None,
+        cursor_shape: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET)),
+        bell_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cpr_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        color_query_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         copy_state: None,
         pane_style: None,
         squelch_until: None,
         output_ring: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        // Empty (`-E`) panes have a NullChild that never "exits"; not healable.
+        spawned_at: None,
     })
 }
 
@@ -304,6 +415,68 @@ pub fn serialize_popup_overlay(app: &AppState) -> String {
             out.push_str(",\"display_panes\":false");
         }
     }
+    out
+}
+
+/// Serialize the active window's floating panes into a JSON fragment
+/// (`,"floats":[{x,y,w,h,border,focused,title,rows}]`) for the client to draw
+/// as positioned overlays. Returns an empty string when there are no floats.
+/// Only the active window's floats are emitted, so non-active windows' floats
+/// are correctly hidden.
+pub fn serialize_floats_json(app: &AppState) -> String {
+    use crate::server::helpers::json_escape_string;
+    let win = match app.windows.get(app.active_idx) {
+        Some(w) => w,
+        None => return String::new(),
+    };
+    if win.floating.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(",\"floats\":[");
+    for (i, fp) in win.floating.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let inner_h = fp.h.saturating_sub(2);
+        let inner_w = fp.w.saturating_sub(2);
+        let focused = win.floating_focus == Some(i);
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"border\":\"{}\",\"focused\":{},\"title\":\"",
+                fp.x, fp.y, fp.w, fp.h, json_escape_string(&fp.border), focused
+            ),
+        );
+        out.push_str(&json_escape_string(&fp.title));
+        out.push_str("\",\"rows\":[");
+        if let Ok(parser) = fp.pane.term.lock() {
+            let rows_data = serialize_screen_rows(parser.screen(), inner_h, inner_w);
+            for (j, row) in rows_data.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str("{\"runs\":[");
+                for (k, run) in row.runs.iter().enumerate() {
+                    if k > 0 {
+                        out.push(',');
+                    }
+                    out.push_str("{\"text\":\"");
+                    json_esc_inline(&run.text, &mut out);
+                    out.push_str("\",\"fg\":\"");
+                    out.push_str(&run.fg);
+                    out.push_str("\",\"bg\":\"");
+                    out.push_str(&run.bg);
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("\",\"flags\":{},\"width\":{}}}", run.flags, run.width),
+                    );
+                }
+                out.push_str("]}");
+            }
+        }
+        out.push_str("]}");
+    }
+    out.push(']');
     out
 }
 

@@ -8,6 +8,10 @@ use crate::commands::parse_command_to_action;
 // Track the current config file being parsed (for #{current_file}, #{d:current_file})
 thread_local! {
     static CURRENT_CONFIG_FILE: RefCell<String> = RefCell::new(String::new());
+    // True while a full startup/reload config batch is loading. Used so that a
+    // `source-file` directive *inside* the config does not also set a runtime
+    // status message — startup warnings are surfaced once via the log/client.
+    static IN_STARTUP_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Get the current config file path being parsed.
@@ -20,27 +24,76 @@ fn set_current_config_file(path: &str) {
     CURRENT_CONFIG_FILE.with(|f| *f.borrow_mut() = path.to_string());
 }
 
+fn in_startup_load() -> bool {
+    IN_STARTUP_LOAD.with(|c| c.get())
+}
+
+/// RAII guard that marks the startup-config-load window.
+struct StartupLoadGuard;
+impl Drop for StartupLoadGuard {
+    fn drop(&mut self) {
+        IN_STARTUP_LOAD.with(|c| c.set(false));
+    }
+}
+
 /// Quick scan of the config file to check if `set -g warm off` is present.
 /// Used by the client side before attempting warm server claim.
-pub fn is_warm_disabled_by_config() -> bool {
-    let content = if let Ok(config_file) = env::var("PSMUX_CONFIG_FILE") {
+/// Read the user's effective config file content: the PSMUX_CONFIG_FILE override
+/// (with ~ expansion) if set, otherwise the first existing file in the default
+/// search path.  Shared by the lightweight, server-less config probes that run
+/// in the CLI before any server exists.
+pub fn read_user_config_content() -> Option<String> {
+    // Strip a leading UTF-8 BOM (Notepad / PowerShell Set-Content -Encoding UTF8
+    // on Windows prepend EF BB BF) so first-line directives are recognised,
+    // matching parse_config_content().
+    let strip_bom = |s: String| s.strip_prefix('\u{FEFF}').map(str::to_string).unwrap_or(s);
+    if let Ok(config_file) = env::var("PSMUX_CONFIG_FILE") {
         let expanded = if config_file.starts_with('~') {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
             config_file.replacen('~', &home, 1)
         } else {
             config_file
         };
-        std::fs::read_to_string(expanded).ok()
-    } else {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        let paths = [
-            format!("{}/.psmux.conf", home),
-            format!("{}/.psmuxrc", home),
-            format!("{}/.tmux.conf", home),
-            format!("{}/.config/psmux/psmux.conf", home),
-        ];
-        paths.iter().find_map(|p| std::fs::read_to_string(p).ok())
-    };
+        return std::fs::read_to_string(expanded).ok().map(strip_bom);
+    }
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let paths = [
+        format!("{}/.psmux.conf", home),
+        format!("{}/.psmuxrc", home),
+        format!("{}/.tmux.conf", home),
+        format!("{}/.config/psmux/psmux.conf", home),
+    ];
+    paths.iter().find_map(|p| std::fs::read_to_string(p).ok()).map(strip_bom)
+}
+
+/// If the user's config has a top-level `new-session` (or `new`) directive,
+/// return its arguments (empty for a bare `new-session`); otherwise None.
+///
+/// tmux runs `new-session` from the config at server start, so a later
+/// `attach-session` with no running server still finds a session to attach to.
+/// psmux has no persistent server, so the CLI uses this to bootstrap that
+/// session (see the attach path in main.rs, #362).  Only a simple top-level
+/// directive is matched — `new-session` as the first token of a line — which is
+/// the documented idiom; lines where `new-session` is an argument (e.g.
+/// `bind-key x new-session`) are not matched.
+pub fn config_new_session_args() -> Option<Vec<String>> {
+    let content = read_user_config_content()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        let mut toks = trimmed.split_whitespace();
+        match toks.next() {
+            Some("new-session") | Some("new") => {
+                return Some(toks.map(|s| s.to_string()).collect());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub fn is_warm_disabled_by_config() -> bool {
+    let content = read_user_config_content();
     if let Some(content) = content {
         for line in content.lines() {
             let trimmed = line.trim();
@@ -99,6 +152,13 @@ pub fn populate_default_bindings(app: &mut AppState) {
 }
 
 pub fn load_config(app: &mut AppState) {
+    // Start a fresh warning batch for this load/reload and mark the window so
+    // nested `source-file` directives don't emit a runtime status message.
+    app.config_warnings.clear();
+    app.config_warn_line = None;
+    IN_STARTUP_LOAD.with(|c| c.set(true));
+    let _startup_guard = StartupLoadGuard;
+
     // If -f flag was used, load that specific config file instead of default search
     if let Ok(config_file) = env::var("PSMUX_CONFIG_FILE") {
         let expanded = if config_file.starts_with('~') {
@@ -157,33 +217,105 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
 
     let mut if_stack: Vec<IfState> = Vec::new();
 
-    // Join continuation lines (ending with \)
-    let mut lines: Vec<String> = Vec::new();
+    // Join continuation lines (ending with \). Track the original 1-based line
+    // number where each (possibly joined) logical line began, so config
+    // warnings can be reported as `file:line: message` (issue #370 follow-up).
+    let mut lines: Vec<(usize, String)> = Vec::new();
     let mut continuation = String::new();
-    for line in content.lines() {
+    let mut cont_start: usize = 0;
+    for (idx, line) in content.lines().enumerate() {
+        let lineno = idx + 1;
         let trimmed = line.trim_end();
         if trimmed.ends_with('\\') {
+            if continuation.is_empty() { cont_start = lineno; }
             continuation.push_str(trimmed.trim_end_matches('\\'));
             continuation.push(' ');
         } else {
             if !continuation.is_empty() {
                 continuation.push_str(trimmed);
-                lines.push(continuation.clone());
+                lines.push((cont_start, continuation.clone()));
                 continuation.clear();
             } else {
-                lines.push(trimmed.to_string());
+                lines.push((lineno, trimmed.to_string()));
             }
         }
     }
     if !continuation.is_empty() {
-        lines.push(continuation);
+        lines.push((cont_start, continuation));
     }
 
-    for line in &lines {
+    // Brace-block collection state for if-shell 'cond' { ... } syntax.
+    // When we encounter a line like `if-shell 'false' {`, we collect
+    // subsequent lines until the matching `}` and only execute them
+    // if the condition is true. Supports an optional else block:
+    //   if-shell 'cond' { ... } { ... }
+    use parse_config_content_types::BraceBlock;
+    let mut brace_block: Option<BraceBlock> = None;
+
+    for (orig_lineno, line) in &lines {
+        app.config_warn_line = Some(*orig_lineno);
         let l = line.trim();
 
         // Skip empty lines and comments (but comments start with # not %)
-        if l.is_empty() { continue; }
+        if l.is_empty() {
+            // Still collect empty lines inside brace blocks to preserve structure
+            if let Some(ref mut bb) = brace_block {
+                if bb.in_else { bb.else_lines.push(String::new()); }
+                else { bb.true_lines.push(String::new()); }
+            }
+            continue;
+        }
+
+        // --- Brace-block collection ---
+        if brace_block.is_some() {
+            let bb = brace_block.as_mut().unwrap();
+            // Count braces to handle nesting
+            let opens = l.chars().filter(|&c| c == '{').count();
+            let closes = l.chars().filter(|&c| c == '}').count();
+
+            if l == "}" && bb.depth == 1 {
+                // Closing brace at top level
+                bb.depth = 0;
+                // Continue to see if next line opens an else `{`.
+                continue;
+            } else if bb.depth == 0 && !bb.in_else && l == "{" {
+                // Start of else block (on a separate line after closing `}`)
+                bb.in_else = true;
+                bb.depth = 1;
+                continue;
+            } else if bb.depth == 0 {
+                // We're past the block(s). Process the collected brace block
+                // and then fall through to process the current line normally.
+                let finished = brace_block.take().unwrap();
+                process_brace_if_shell(app, &finished);
+                // Fall through to process `l` as a normal line
+            } else {
+                // Inside a block at depth >= 1
+                bb.depth = bb.depth + opens - closes;
+                if bb.in_else {
+                    bb.else_lines.push(l.to_string());
+                } else {
+                    bb.true_lines.push(l.to_string());
+                }
+                continue;
+            }
+        }
+
+        // --- Check if this line starts an if-shell brace block ---
+        if (l.starts_with("if-shell ") || l.starts_with("if ")) && l.ends_with('{') {
+            // Check %if stack — only start brace block if active
+            let active = if_stack.last().map(|s| s.active).unwrap_or(true);
+            if active {
+                brace_block = Some(BraceBlock {
+                    if_line: l.to_string(),
+                    true_lines: Vec::new(),
+                    else_lines: Vec::new(),
+                    depth: 1,
+                    in_else: false,
+                });
+            }
+            continue;
+        }
 
         // Handle %-directives before checking for # comments
         if l.starts_with('%') {
@@ -269,6 +401,109 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
 
         parse_config_line(app, &l);
     }
+
+    // Process any remaining unclosed brace block at end of file
+    if let Some(finished) = brace_block.take() {
+        process_brace_if_shell(app, &finished);
+    }
+
+    // Clear the line context so a later single runtime command does not inherit
+    // a stale `file:line:` prefix.
+    app.config_warn_line = None;
+}
+
+/// Process a collected if-shell brace block by evaluating the condition
+/// and executing the appropriate branch.
+fn process_brace_if_shell(app: &mut AppState, bb: &parse_config_content_types::BraceBlock) {
+    // Extract the condition from the if-shell line (strip "if-shell " or "if " and trailing "{")
+    let line = bb.if_line.trim();
+    let rest = if line.starts_with("if-shell ") {
+        &line[9..]
+    } else if line.starts_with("if ") {
+        &line[3..]
+    } else {
+        return;
+    };
+    let rest = rest.trim().trim_end_matches('{').trim();
+
+    // Parse flags and extract condition
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let mut format_mode = false;
+    let mut condition = String::new();
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            "-b" => {}
+            "-F" => { format_mode = true; }
+            "-bF" | "-Fb" => { format_mode = true; }
+            "-t" => { i += 1; } // skip target
+            s => {
+                // Handle quoted string
+                if s.starts_with('"') || s.starts_with('\'') {
+                    let quote = s.chars().next().unwrap();
+                    if s.ends_with(quote) && s.len() > 1 {
+                        condition = s[1..s.len()-1].to_string();
+                    } else {
+                        let mut buf = s[1..].to_string();
+                        i += 1;
+                        while i < parts.len() {
+                            buf.push(' ');
+                            buf.push_str(parts[i]);
+                            if parts[i].ends_with(quote) {
+                                buf.truncate(buf.len() - 1);
+                                break;
+                            }
+                            i += 1;
+                        }
+                        condition = buf;
+                    }
+                } else {
+                    condition = s.to_string();
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    if condition.is_empty() { return; }
+
+    // Evaluate the condition
+    let success = if format_mode {
+        let expanded = crate::format::expand_format(&condition, app);
+        !expanded.is_empty() && expanded != "0"
+    } else if condition == "true" || condition == "1" {
+        true
+    } else if condition == "false" || condition == "0" {
+        false
+    } else {
+        let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
+        let mut c = std::process::Command::new(&shell_prog);
+        for a in &shell_args { c.arg(a); }
+        c.arg(&condition);
+        { use crate::platform::HideWindowCommandExt; c.hide_window(); }
+        c.status().map(|s| s.success()).unwrap_or(false)
+    };
+
+    // Execute the appropriate branch
+    let lines = if success { &bb.true_lines } else { &bb.else_lines };
+    for line in lines {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') { continue; }
+        parse_config_line(app, l);
+    }
+}
+
+/// Types used internally by parse_config_content (declared in a module to
+/// allow process_brace_if_shell to reference BraceBlock by path).
+mod parse_config_content_types {
+    pub struct BraceBlock {
+        pub if_line: String,
+        pub true_lines: Vec<String>,
+        pub else_lines: Vec<String>,
+        pub depth: usize,
+        pub in_else: bool,
+    }
 }
 
 /// Expand `$NAME` and `${NAME}` references to %hidden variable values.
@@ -333,10 +568,88 @@ fn is_truthy_config(s: &str) -> bool {
     !s.is_empty() && s != "0"
 }
 
+/// Record a config parse warning, prefixed with `file:line:` when that context
+/// is known (issue #370 follow-up — surface problems instead of swallowing).
+pub(crate) fn warn_config(app: &mut AppState, msg: impl Into<String>) {
+    let m = msg.into();
+    let file = current_config_file();
+    let full = match (file.is_empty(), app.config_warn_line) {
+        (false, Some(line)) => format!("{}:{}: {}", file, line, m),
+        (false, None) => format!("{}: {}", file, m),
+        _ => m,
+    };
+    app.config_warnings.push(full);
+}
+
+/// True if `name` is a recognized psmux command (canonical name or alias),
+/// per the TMUX_COMMANDS catalog plus any user-defined command-aliases.
+/// Used so the unknown-command warning does not fire on valid commands that
+/// the config parser itself does not route (e.g. `new-window`, `display-message`).
+pub(crate) fn is_known_command(app: &AppState, name: &str) -> bool {
+    if app.command_aliases.contains_key(name) {
+        return true;
+    }
+    crate::server::helpers::TMUX_COMMANDS.iter().any(|entry| {
+        let (cmd, alias) = match entry.split_once(" (") {
+            Some((c, a)) => (c, a.trim_end_matches(')')),
+            None => (*entry, ""),
+        };
+        cmd == name || (!alias.is_empty() && alias == name)
+    })
+}
+
+/// Strip a trailing `# comment` from a single config line.
+///
+/// In tmux a `#` begins a comment only when it is unquoted and appears at the
+/// start of the line or immediately after whitespace. A `#` inside single or
+/// double quotes (e.g. a `"#{...}"` format or `'#H'`), one escaped with a
+/// backslash, or one in the middle of a word (e.g. `colour#aabbcc`) is left
+/// untouched. This lets configs use trailing comments such as:
+///
+/// ```text
+/// set -g base-index 1   # start windows at 1
+/// ```
+///
+/// Issue #416.
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_ws = true; // start of line behaves like a word boundary
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Backslash escapes the next byte (outside single quotes), matching
+            // tmux's tokeniser. Skip both bytes so an escaped `#` stays literal.
+            b'\\' if !in_single => {
+                i += 2;
+                prev_ws = false;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double && prev_ws => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+        prev_ws = matches!(bytes[i], b' ' | b'\t');
+        i += 1;
+    }
+    line
+}
+
 pub fn parse_config_line(app: &mut AppState, line: &str) {
     let l = line.trim();
     if l.is_empty() || l.starts_with('#') { return; }
-    
+
+    // Strip a trailing inline `# comment` (issue #416). Done after the
+    // leading-`#` check above so whole-line comments are still skipped, and
+    // before any directive dispatch so trailing comments don't leak into
+    // command arguments.
+    let l = strip_inline_comment(l).trim_end();
+    if l.is_empty() { return; }
+
     let l = if l.ends_with('\\') {
         l.trim_end_matches('\\').trim()
     } else {
@@ -404,8 +717,14 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
                 }
             };
             if append {
-                // -a/-ga: append to existing hook list (tmux multi-handler)
-                app.hooks.entry(hook).or_insert_with(Vec::new).push(cmd);
+                // -a/-ga: append to existing hook list (tmux multi-handler).
+                // Dedup identical commands so a re-sourced config does not
+                // accumulate duplicate handlers that fire every tick (issue
+                // #459); mirrors the replace path's issue #133 guard.
+                let entry = app.hooks.entry(hook).or_insert_with(Vec::new);
+                if !entry.contains(&cmd) {
+                    entry.push(cmd);
+                }
             } else {
                 // Replace (not append) to match tmux – prevents duplicates on
                 // config reload (issue #133).
@@ -422,13 +741,24 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
             app.environment.insert(parts[i].to_string(), val.clone());
             // Also set on the server process so child panes inherit via env block
             std::env::set_var(parts[i], &val);
+        } else {
+            warn_config(app, "set-environment requires a name and value");
+        }
+    }
+    else {
+        // Unrecognized directive. Warn only when the first token is not a known
+        // command (a known-but-unrouted command like `new-window` stays silent
+        // to match prior behavior; a genuine typo like `bnid-key` is surfaced).
+        let cmd = l.split_whitespace().next().unwrap_or("");
+        if !cmd.is_empty() && !is_known_command(app, cmd) {
+            warn_config(app, format!("unknown command: {}", cmd));
         }
     }
 }
 
 fn parse_set_option(app: &mut AppState, line: &str) {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 { return; }
+    if parts.len() < 2 { warn_config(app, "set-option requires an option name"); return; }
     
     let mut i = 1;
     let mut is_global = false;
@@ -454,7 +784,7 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         }
     }
     
-    if i >= parts.len() { return; }
+    if i >= parts.len() { warn_config(app, "set-option requires an option name"); return; }
 
     // Extract key and value
     let key = parts[i];
@@ -468,6 +798,15 @@ fn parse_set_option(app: &mut AppState, line: &str) {
     if unset_mode {
         parse_option_value(app, &format!("{} ", key), is_global);
         return;
+    }
+
+    // No value provided: toggle boolean options (tmux parity #278)
+    if raw_value.is_empty() && !unset_mode && !append_mode {
+        if crate::server::options::is_boolean_option(key) {
+            crate::server::options::toggle_option(app, key);
+            app.user_set_options.insert(key.to_string());
+            return;
+        }
     }
 
     // Handle -o (only set if not currently set)
@@ -524,7 +863,40 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
     } else {
         ""
     };
-    
+
+    // Validate the value against the option's declared type from the catalog
+    // (issue #370 follow-up). Only options that exist in the catalog are
+    // checked, so unmodeled/user options never produce a false warning.
+    if !value.is_empty() {
+        if let Some(def) = crate::server::option_catalog::OPTION_CATALOG
+            .iter()
+            .find(|d| d.name == key)
+        {
+            let v = value.trim();
+            match def.option_type {
+                "number" => {
+                    if v.parse::<i64>().is_err() {
+                        warn_config(app, format!(
+                            "invalid value '{}' for option '{}' (expected a number)", v, key));
+                    }
+                }
+                "boolean" => {
+                    // Accept the usual boolean tokens, and also any integer:
+                    // a few "boolean" options (e.g. `status`) also take counts.
+                    let lv = v.to_ascii_lowercase();
+                    let ok = matches!(lv.as_str(),
+                        "on"|"off"|"true"|"false"|"1"|"0"|"yes"|"no")
+                        || v.parse::<i64>().is_ok();
+                    if !ok {
+                        warn_config(app, format!(
+                            "invalid value '{}' for option '{}' (expected on/off)", v, key));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     match key {
         "status-left" => app.status_left = value.to_string(),
         "status-right" => app.status_right = value.to_string(),
@@ -534,6 +906,10 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "mouse-selection" => app.mouse_selection = matches!(value, "on" | "true" | "1"),
         "paste-detection" => app.paste_detection = matches!(value, "on" | "true" | "1"),
         "choose-tree-preview" => app.choose_tree_preview = matches!(value, "on" | "true" | "1"),
+        "bold-is-bright" => {
+            app.bold_is_bright = matches!(value, "on" | "true" | "1");
+            crate::platform::set_bold_is_bright(app.bold_is_bright);
+        }
         "prefix" => {
             if let Some(key) = parse_key_name(value) {
                 app.prefix_key = key;
@@ -769,8 +1145,19 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 // Options with hyphens are tmux config options, NOT environment
                 // variables.  Storing them in environment causes PowerShell
                 // ParserErrors when injected via $env:NAME syntax (#137).
+                // A non-@ hyphenated key that reached this arm is not a known
+                // option — surface it as a typo (#370 follow-up) but still
+                // store it so forward-compat / plugin behavior is unchanged.
+                // Skip array-style keys (`name[N]`) such as command-alias[0]
+                // or terminal-overrides[1], which are valid tmux syntax.
+                if !key.contains('[') {
+                    warn_config(app, format!("unknown option '{}'", key));
+                }
                 app.user_options.insert(key.to_string(), value.to_string());
             } else {
+                if !key.contains('[') {
+                    warn_config(app, format!("unknown option '{}'", key));
+                }
                 app.environment.insert(key.to_string(), value.to_string());
             }
 
@@ -783,18 +1170,23 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             // Tries:  ~/.psmux/plugins/<full-value>/plugin.conf
             //   then: ~/.psmux/plugins/<last-component>/plugin.conf
             if key == "@plugin" && !value.is_empty() {
-                let plugin_name = value.rsplit('/').next().unwrap_or(value);
+                // Strip an optional '#branch' suffix before deriving the plugin
+                // path. Branch names may contain '/' (e.g. 'temp/integration'),
+                // so splitting the raw value on '/' would treat the branch tail
+                // as the plugin name and never find the installed directory.
+                let base = value.split('#').next().unwrap_or(value);
+                let plugin_name = base.rsplit('/').next().unwrap_or(base);
                 if plugin_name != "ppm" {
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let xdg_config = env::var("XDG_CONFIG_HOME")
                         .unwrap_or_else(|_| format!("{}\\.config", home));
                     let candidates = [
                         // Classic paths: ~/.psmux/plugins/
-                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, value.replace('/', "\\")),
+                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, base.replace('/', "\\")),
                         format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, plugin_name),
                         format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", home, plugin_name),
                         // XDG paths: ~/.config/psmux/plugins/
-                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, value.replace('/', "\\")),
+                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, base.replace('/', "\\")),
                         format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, plugin_name),
                         format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", xdg_config, plugin_name),
                     ];
@@ -815,11 +1207,11 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                     if !found {
                         let ps1_candidates = [
                             // Classic paths
-                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, value.replace('/', "\\"), plugin_name),
+                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, base.replace('/', "\\"), plugin_name),
                             format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
                             format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
                             // XDG paths
-                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, value.replace('/', "\\"), plugin_name),
+                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, base.replace('/', "\\"), plugin_name),
                             format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
                             format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
                         ];
@@ -847,6 +1239,38 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             }
         }
     }
+}
+
+/// Split a string into tokens respecting single and double quotes.
+/// `command-prompt -I '#W' 'rename-window "%%"'` → ["-I", "#W", "rename-window \"%%\""]
+pub fn shell_words(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && !in_single {
+            if let Some(&next) = chars.peek() {
+                current.push(next);
+                chars.next();
+            }
+        } else if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if c.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Split a bind-key command string on `\;` or bare `;` to produce sub-commands.
@@ -1000,9 +1424,29 @@ pub fn ensure_prefix_self_binding(app: &mut AppState) {
 /// Normalize a key tuple for binding comparison.
 /// Strips SHIFT from Char events since the character itself encodes shift information.
 /// e.g., '|' already implies Shift was pressed, so (Char('|'), SHIFT) and (Char('|'), NONE) should match.
+///
+/// On Windows, also strips Ctrl+Alt from non-lowercase-letter Char events.
+/// AltGr on Windows is reported as Ctrl+Alt, so characters produced via AltGr
+/// (e.g. `[` `]` `{` `}` `@` `\` `|` `~` on German/Czech keyboards) arrive
+/// as Char('[') with CONTROL|ALT modifiers.  Stripping those fake modifiers
+/// lets the binding lookup match the registered `[` binding (issue #287).
 pub fn normalize_key_for_binding(key: (KeyCode, KeyModifiers)) -> (KeyCode, KeyModifiers) {
     match key.0 {
-        KeyCode::Char(_) => (key.0, key.1.difference(KeyModifiers::SHIFT)),
+        KeyCode::Char(c) => {
+            let mut mods = key.1.difference(KeyModifiers::SHIFT);
+            // On Windows, AltGr is reported as Ctrl+Alt.  Non-lowercase-letter
+            // chars with both Ctrl and Alt are AltGr-produced — strip the fake
+            // Ctrl+Alt so they match plain bindings like `[`, `]`, `@`, etc.
+            #[cfg(windows)]
+            if mods.contains(KeyModifiers::CONTROL)
+                && mods.contains(KeyModifiers::ALT)
+                && !c.is_ascii_lowercase()
+            {
+                mods = mods.difference(KeyModifiers::CONTROL);
+                mods = mods.difference(KeyModifiers::ALT);
+            }
+            (key.0, mods)
+        }
         _ => key,
     }
 }
@@ -1126,7 +1570,31 @@ pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
     None
 }
 
+thread_local! {
+    // Guards against runaway recursion when a config sources itself (directly or
+    // in a cycle). Without this a self-sourcing psmux.conf overflows the stack and
+    // crashes the server, so the session never comes up ("no server running").
+    static SOURCE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+const MAX_SOURCE_DEPTH: u32 = 16;
+
+struct SourceDepthGuard;
+impl Drop for SourceDepthGuard {
+    fn drop(&mut self) {
+        SOURCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub fn source_file(app: &mut AppState, path: &str) {
+    let depth = SOURCE_DEPTH.with(|d| d.get());
+    if depth >= MAX_SOURCE_DEPTH {
+        eprintln!("psmux: source-file: maximum nesting depth ({}) exceeded; ignoring '{}' (recursive source-file?)", MAX_SOURCE_DEPTH, path);
+        return;
+    }
+    SOURCE_DEPTH.with(|d| d.set(depth + 1));
+    let _depth_guard = SourceDepthGuard; // decrements on every return path
+
     let path = path.trim().trim_matches('"').trim_matches('\'');
 
     // Handle -F flag: expand format strings in the path
@@ -1169,6 +1637,13 @@ pub fn source_file(app: &mut AppState, path: &str) {
         expanded_path
     };
 
+    // A runtime `source-file` (not part of a startup batch and not nested) owns
+    // its own warning batch and surfaces the result as a status message.
+    let outermost_runtime = depth == 0 && !in_startup_load();
+    if outermost_runtime {
+        app.config_warnings.clear();
+    }
+
     // Save and restore current_config_file around the nested parse
     let prev_file = current_config_file();
     set_current_config_file(&expanded_path);
@@ -1178,6 +1653,18 @@ pub fn source_file(app: &mut AppState, path: &str) {
     }
 
     set_current_config_file(&prev_file);
+
+    if outermost_runtime && !app.config_warnings.is_empty() {
+        let n = app.config_warnings.len();
+        let summary = if n == 1 {
+            format!("config warning: {}", app.config_warnings[0])
+        } else {
+            format!("{} config warnings (first: {})", n, app.config_warnings[0])
+        };
+        // Hold the message for 5s (vs the 750ms default) so a config problem is
+        // actually noticed rather than flashing past.
+        app.status_message = Some((summary, std::time::Instant::now(), Some(5000)));
+    }
 }
 
 /// Parse a key string like "C-a", "M-x", "F1", "Space" into (KeyCode, KeyModifiers)
@@ -1631,9 +2118,37 @@ mod tests_issue198_unbind_individual;
 mod tests_issue198_cv_persist;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue198_pastedetect_frame_parity.rs"]
+mod tests_issue198_pastedetect_frame_parity;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_config_exhaustive.rs"]
 mod tests_config_exhaustive;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue268_set_titles.rs"]
 mod tests_issue268_set_titles;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue287_german_keyboard.rs"]
+mod tests_issue287_german_keyboard;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue362_config_new_session.rs"]
+mod tests_issue362_config_new_session;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue370_config_warnings.rs"]
+mod tests_issue370_config_warnings;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue416_inline_comments.rs"]
+mod tests_issue416_inline_comments;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue425_bold_is_bright_option.rs"]
+mod tests_issue425_bold_is_bright_option;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue459_hook_accumulation.rs"]
+mod tests_issue459_hook_accumulation;

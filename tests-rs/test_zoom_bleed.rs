@@ -72,6 +72,8 @@ fn zoomed_left_active_hidden_pane_label_never_rendered() {
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
         );
     }).unwrap();
 
@@ -126,6 +128,8 @@ fn zoomed_right_active_hidden_pane_label_never_rendered() {
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
         );
     }).unwrap();
 
@@ -180,6 +184,8 @@ fn zoomed_top_active_hidden_pane_label_never_rendered() {
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
         );
     }).unwrap();
 
@@ -234,6 +240,8 @@ fn zoomed_bottom_active_hidden_pane_label_never_rendered() {
             active_rect,
             "", true, "bottom", "#{pane_index}",
             2,
+            crate::border_lines::border_chars("single"),
+            None,
         );
     }).unwrap();
 

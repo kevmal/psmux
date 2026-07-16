@@ -39,6 +39,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         pane_mru: vec![],
         zoom_saved: None,
         linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -196,7 +198,7 @@ fn prefix_defaults_d_is_detach_client() {
 #[test]
 fn prefix_defaults_x_is_kill_pane() {
     let action = find_in_defaults("x").expect("'x' missing from PREFIX_DEFAULTS");
-    assert_eq!(action, "kill-pane");
+    assert_eq!(action, "confirm-before -p 'kill-pane #P? (y/n)' kill-pane");
 }
 
 #[test]

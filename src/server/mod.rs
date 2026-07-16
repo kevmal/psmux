@@ -22,7 +22,7 @@ use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all
     get_split_mut, path_exists};
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
-    list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
+    list_windows_json_with_tabs, combined_data_version, take_pane_clipboard, TMUX_COMMANDS};
 use options::{get_option_value, render_window_options, apply_set_option};
 
 use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
@@ -33,7 +33,7 @@ use crate::layout::{dump_layout_json, dump_layout_json_fast, apply_layout, cycle
     cycle_layout_reverse};
 use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remote_mouse_up,
     remote_mouse_button, remote_mouse_motion, remote_scroll_up, remote_scroll_down,
-    swap_pane, break_pane_to_window, unzoom_if_zoomed, resize_pane_vertical,
+    swap_pane, swap_pane_with_path, break_pane_to_window, unzoom_if_zoomed, resize_pane_vertical,
     resize_pane_horizontal, resize_pane_absolute, rotate_panes, respawn_active_pane,
     handle_pane_mouse, handle_pane_scroll, handle_split_set_sizes, handle_split_resize_done};
 use crate::config::{load_config, parse_key_string, format_key_binding, normalize_key_for_binding,
@@ -52,11 +52,17 @@ fn serialize_overlay_json(app: &AppState) -> String {
     // Popup overlay handles PopupMode, MenuMode, ConfirmMode, PaneChooser, and default
     let mut out = crate::popup::serialize_popup_overlay(app);
 
-    // Include status_message for display-message without -p (#110)
+    // Include status_message for display-message without -p (#110).
+    //
+    // tmux(1) display-message: "a delay of zero waits for a key press."
+    // So `-d 0` should keep the message visible until any key is pressed;
+    // the SendKey / SendText handlers clear status_message, which dismisses
+    // it naturally. Treat display_time == 0 as "sticky until keypress" by
+    // skipping the time-based expiry check.
     if let Some((ref msg, since, per_msg_duration)) = app.status_message {
         let elapsed = since.elapsed().as_millis() as u64;
         let display_time = per_msg_duration.unwrap_or(app.display_time_ms);
-        if elapsed < display_time {
+        if display_time == 0 || elapsed < display_time {
             out.push_str(",\"status_message\":\"");
             out.push_str(&json_escape_string(msg));
             out.push('"');
@@ -67,6 +73,83 @@ fn serialize_overlay_json(app: &AppState) -> String {
 
 fn should_spawn_warm_server(app: &AppState) -> bool {
     app.warm_enabled && app.session_name != "__warm__" && !app.destroy_unattached
+}
+
+fn ensure_session_registry_files(app: &AppState) {
+    let Some(port) = app.control_port else { return; };
+    let dir = crate::paths::psmux_dir();
+    let _ = std::fs::create_dir_all(&dir);
+
+    let base = app.port_file_base();
+    let port_path = crate::paths::port_file(&base);
+    let key_path = crate::paths::key_file(&base);
+    let sid_path = crate::paths::sid_file(&base);
+    let port_value = port.to_string();
+    let sid_value = app.session_id.to_string();
+
+    if std::fs::read_to_string(&port_path)
+        .map(|s| s.trim() != port_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&port_path, &port_value);
+    }
+
+    if std::fs::read_to_string(&key_path)
+        .map(|s| s.trim() != app.session_key)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&key_path, &app.session_key);
+    }
+
+    if std::fs::read_to_string(&sid_path)
+        .map(|s| s.trim() != sid_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&sid_path, &sid_value);
+    }
+
+    // Record this server's OS process ID (issue #448). Written together with
+    // port/key/sid so a live server is never listening without a PID anchor, and
+    // re-ensured periodically so the entry self-heals after rename/claim. This is
+    // what lets startup reap live-but-orphaned duplicate servers by identity.
+    //
+    // The body is `pid:creation_filetime`: the creation time lets kill-server's
+    // force-kill fallback confirm identity (exact match) before terminating, so a
+    // recycled pid is never killed. Readers tolerate a bare pid too.
+    let pid_path = crate::paths::pid_file(&base);
+    let self_pid = std::process::id();
+    let pid_value = crate::session::format_pid_file_contents(
+        self_pid,
+        crate::platform::process_kill::process_creation_time(self_pid).unwrap_or(0),
+    );
+    if std::fs::read_to_string(&pid_path)
+        .map(|s| s.trim() != pid_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&pid_path, &pid_value);
+    }
+}
+
+/// Diagnostic-only logging for warm-server lifecycle races. Gated behind
+/// PSMUX_WARM_DEBUG=1 so it is a no-op in normal operation and tests. Writes to
+/// %TEMP%\psmux_warm_debug.log (never inside the repo).
+fn warm_debug(msg: &str) {
+    if std::env::var("PSMUX_WARM_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        let tmp = env::var("TEMP")
+            .or_else(|_| env::var("TMP"))
+            .unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}\\psmux_warm_debug.log", tmp);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = std::io::Write::write_all(
+                &mut f,
+                format!("[{} pid={}] {}\n", ts, std::process::id(), msg).as_bytes(),
+            );
+        }
+    }
 }
 
 /// Check if the active pane is currently squelched (hiding injected cd+cls).
@@ -85,6 +168,48 @@ fn is_active_pane_squelched(app: &AppState) -> bool {
     } else { false }
 }
 
+/// RAII guard for the warm-spawn lock file. Removing the file on drop lets a
+/// later warm spawn proceed.
+struct WarmSpawnLock(std::path::PathBuf);
+impl Drop for WarmSpawnLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Acquire the warm-spawn lock guarding the check->spawn window in
+/// `spawn_warm_server`. Returns `Some(guard)` when this caller owns the lock and
+/// may proceed to spawn, or `None` when another spawn is already in progress (in
+/// which case the caller must NOT spawn). A lock file older than 20s is treated
+/// as abandoned (its owner died mid-spawn) and stolen.
+fn acquire_warm_spawn_lock(lock_path: &str) -> Option<WarmSpawnLock> {
+    use std::io::Write as _;
+    let path = std::path::PathBuf::from(lock_path);
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Some(WarmSpawnLock(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                    .map(|age| age > std::time::Duration::from_secs(20))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
@@ -97,15 +222,29 @@ fn spawn_warm_server(app: &AppState) {
         return;
     }
     // Skip if a warm server already exists
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let warm_base = if let Some(ref sn) = app.socket_name {
         format!("{}____warm__", sn)
     } else {
         "__warm__".to_string()
     };
-    let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+    let warm_port_path = crate::paths::port_file(&warm_base);
+    warm_debug(&format!("spawn_warm_server entry base={} port_exists={}", warm_base, std::path::Path::new(&warm_port_path).exists()));
+    // Serialize the check->spawn window: without this, two callers can both see
+    // "no warm" (a freshly-spawned warm hasn't written its port yet) and each
+    // spawn one, orphaning all but the last. This is the primary process-leak source.
+    let warm_lock_path = crate::paths::spawnlock_file(&warm_base);
+    let spawn_lock = match acquire_warm_spawn_lock(&warm_lock_path) {
+        Some(g) => g,
+        None => { warm_debug("another warm spawn in progress -- skipping"); return; }
+    };
     if std::path::Path::new(&warm_port_path).exists() {
-        // Check if it's actually alive
+        // Check if it's actually a live, unclaimed warm server.
+        // TCP reachability alone is not sufficient: OS ephemeral-port reuse or
+        // duplicated-warm churn can leave __warm__.port pointing at a real
+        // claimed session.  That server answers TCP connects but is NOT warm,
+        // so returning early here means warm never re-establishes and every
+        // subsequent open stays cold (~1-5s) until the pointer is manually removed.
+        let mut is_genuine_warm = false;
         if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
             if let Ok(port) = port_str.trim().parse::<u16>() {
                 let addr = format!("127.0.0.1:{}", port);
@@ -113,15 +252,49 @@ fn spawn_warm_server(app: &AppState) {
                     &addr.parse().unwrap(),
                     Duration::from_millis(100),
                 ).is_ok() {
-                    return; // warm server already running
+                    // TCP is up — verify the session name via AUTH.
+                    let warm_key_path = crate::paths::key_file(&warm_base);
+                    if let Ok(key) = std::fs::read_to_string(&warm_key_path) {
+                        let key = key.trim().to_string();
+                        if !key.is_empty() {
+                            // Ask the server what its session name is.
+                            // Response is the name followed by a newline.
+                            // Timeout is capped at 500ms inside send_auth_cmd_response.
+                            match crate::session::send_auth_cmd_response(
+                                &addr, &key,
+                                b"display-message -p '#{session_name}'\n",
+                            ) {
+                                Ok(resp) if resp.trim() == "__warm__" => {
+                                    warm_debug("early-return: existing warm verified alive");
+                                    is_genuine_warm = true;
+                                }
+                                Ok(resp) => {
+                                    warm_debug(&format!(
+                                        "warm port reachable but session='{}' (not __warm__) — treating as stale",
+                                        resp.trim()
+                                    ));
+                                }
+                                Err(_) => {
+                                    warm_debug("warm port reachable but auth/query failed — treating as stale");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        // Stale port file — remove it (and matching key file)
+        if is_genuine_warm {
+            return;
+        }
+        // Stale or wrong-server port file — remove it (and matching key/sid files)
+        warm_debug("removing STALE warm port/key/sid (unreachable or not a warm server)");
         let _ = std::fs::remove_file(&warm_port_path);
-        let warm_key_path = format!("{}\\.psmux\\{}.key", home, warm_base);
+        let warm_key_path = crate::paths::key_file(&warm_base);
         let _ = std::fs::remove_file(&warm_key_path);
+        let warm_sid_path = crate::paths::sid_file(&warm_base);
+        let _ = std::fs::remove_file(&warm_sid_path);
     }
+    warm_debug("SPAWNING new warm server");
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
     let mut args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
     if let Some(ref sn) = app.socket_name {
@@ -138,7 +311,24 @@ fn spawn_warm_server(app: &AppState) {
         args.push(area.height.to_string());
     }
     #[cfg(windows)]
-    { let _ = crate::platform::spawn_server_hidden(&exe, &args); }
+    {
+        let spawned = crate::platform::spawn_server_hidden(&exe, &args);
+        warm_debug(&format!("spawned warm server pid={:?}", spawned.as_ref().ok()));
+        // Hold the spawn lock until the new warm server registers its port, so a
+        // concurrent caller observes the genuine warm instead of racing another
+        // spawn. Done off-thread to avoid blocking the caller.
+        let port_path = warm_port_path.clone();
+        std::thread::spawn(move || {
+            let _lock = spawn_lock; // released on drop
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(100));
+                if std::path::Path::new(&port_path).exists() {
+                    std::thread::sleep(Duration::from_millis(150));
+                    break;
+                }
+            }
+        });
+    }
     #[cfg(not(windows))]
     {
         let mut cmd = std::process::Command::new(&exe);
@@ -147,6 +337,7 @@ fn spawn_warm_server(app: &AppState) {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         let _ = cmd.spawn();
+        drop(spawn_lock);
     }
 }
 
@@ -209,6 +400,10 @@ fn drain_plugin_req(
                     *map = app.command_aliases.clone();
                 }
             }
+            // pane-border-status changes the effective content height (#288)
+            if option == "pane-border-status" {
+                resize_all_panes(app);
+            }
         }
         CtrlReq::SetOptionQuiet(option, value, quiet) => {
             apply_set_option(app, &option, &value, quiet);
@@ -217,6 +412,9 @@ fn drain_plugin_req(
                 if let Ok(mut map) = shared_aliases.write() {
                     *map = app.command_aliases.clone();
                 }
+            }
+            if option == "pane-border-status" {
+                resize_all_panes(app);
             }
         }
         CtrlReq::SetOptionAppend(option, value) => {
@@ -292,6 +490,8 @@ fn drain_plugin_req(
             app.key_tables.clear();
             crate::config::populate_default_bindings(app);
             crate::config::source_file(app, &path);
+            // source-file may change pane-border-status (#288)
+            resize_all_panes(app);
         }
         CtrlReq::UnbindAll => {
             app.key_tables.clear();
@@ -333,13 +533,9 @@ fn drain_plugin_req(
 /// Best-effort: any error writing the log is swallowed (we are already
 /// reporting the original failure up the call chain).
 pub(crate) fn write_startup_error_log(err: &dyn std::fmt::Display) {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    if home.is_empty() {
+    let Some(dir) = crate::paths::psmux_dir_opt() else {
         return;
-    }
-    let dir = format!("{}\\.psmux", home);
+    };
     let _ = std::fs::create_dir_all(&dir);
     let path = format!("{}\\server-startup.log", dir);
 
@@ -408,14 +604,122 @@ pub(crate) fn write_startup_error_log(err: &dyn std::fmt::Display) {
     let _ = std::fs::write(&path, body);
 }
 
+/// Absolute path to `~/.psmux/server-startup.log`, or None if no home dir.
+pub(crate) fn startup_error_log_path() -> Option<String> {
+    Some(format!("{}\\server-startup.log", crate::paths::psmux_dir_opt()?))
+}
+
+/// Read the real failure reason out of a *fresh* `server-startup.log`.
+///
+/// Issue #370: when the initial pane spawn fails (e.g. a `default-shell`
+/// pointing at a non-existent path), the detached server records the concrete
+/// error here and exits, but the client the user is actually looking at only
+/// printed a generic "failed to create session". This lets the client echo the
+/// real cause to the terminal instead of leaving it buried in a log file.
+///
+/// `since_epoch` is the wall-clock second the current startup attempt began;
+/// logs whose `when (epoch s)` predate it are stale (from an earlier run or an
+/// adopted warm server) and are ignored. Returns `(error_text, log_path)`.
+pub(crate) fn read_fresh_startup_error(since_epoch: u64) -> Option<(String, String)> {
+    let path = startup_error_log_path()?;
+    read_fresh_startup_error_at(&path, since_epoch)
+}
+
+/// Path-injectable core of [`read_fresh_startup_error`] — kept separate so unit
+/// tests can exercise the freshness/parsing logic against a temp file without
+/// mutating the process-global USERPROFILE/HOME env (which would race the
+/// issue-167 log tests sharing this binary).
+fn read_fresh_startup_error_at(path: &str, since_epoch: u64) -> Option<(String, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+
+    // Freshness gate: only surface a log written during this attempt.
+    let when = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("when (epoch s):"))
+        .and_then(|v| v.trim().parse::<u64>().ok())?;
+    // Allow 2s of slack so clock granularity / pre-spawn timing never hides a
+    // genuinely-current failure.
+    if when + 2 < since_epoch {
+        return None;
+    }
+
+    // Extract the indented error block: the lines after the "error:" marker up
+    // to the next blank line.
+    let mut lines = content.lines();
+    let mut err_lines: Vec<String> = Vec::new();
+    while let Some(l) = lines.next() {
+        if l.trim() == "error:" {
+            for body_line in lines.by_ref() {
+                if body_line.trim().is_empty() {
+                    break;
+                }
+                err_lines.push(body_line.trim().to_string());
+            }
+            break;
+        }
+    }
+    if err_lines.is_empty() {
+        return None;
+    }
+    Some((err_lines.join(" "), path.to_string()))
+}
+
+/// Absolute path to `~/.psmux/config-warnings.log`, or None if no home dir.
+pub(crate) fn config_warnings_log_path() -> Option<String> {
+    Some(format!("{}\\config-warnings.log", crate::paths::psmux_dir_opt()?))
+}
+
+/// Persist non-fatal config parse warnings so the attaching client can echo
+/// them to the user's terminal (issue #370 follow-up). The detached server has
+/// no visible stderr, so an unknown option / malformed value / unknown command
+/// would otherwise be silently dropped. A leading `when (epoch s)` line lets
+/// the client ignore a stale file from an earlier run. Writing an empty list
+/// removes any prior log so resolved configs don't keep re-reporting.
+pub(crate) fn write_config_warnings_log(warnings: &[String]) {
+    let Some(path) = config_warnings_log_path() else { return };
+    if warnings.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut body = format!("when (epoch s): {}\n", now);
+    for w in warnings {
+        body.push_str(w);
+        body.push('\n');
+    }
+    let _ = std::fs::write(&path, body);
+}
+
+/// Read fresh config warnings written during the current startup attempt.
+/// `since_epoch` is when the attempt began; a log older than that (minus 2s of
+/// clock slack) is stale and ignored. Returns the warning lines.
+pub(crate) fn read_fresh_config_warnings(since_epoch: u64) -> Vec<String> {
+    let Some(path) = config_warnings_log_path() else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let mut lines = content.lines();
+    let when = lines
+        .next()
+        .and_then(|l| l.trim().strip_prefix("when (epoch s):").map(|v| v.trim().to_string()))
+        .and_then(|v| v.parse::<u64>().ok());
+    match when {
+        Some(w) if w + 2 >= since_epoch => lines.map(|l| l.to_string()).filter(|l| !l.is_empty()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
     let panic_session_name = session_name.clone();
     let panic_socket_name = socket_name.clone();
     std::panic::set_hook(Box::new(move |info| {
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-        let path = format!("{}\\.psmux\\crash.log", home);
+        let path = crate::paths::psmux_dir_file("crash.log");
         let bt = std::backtrace::Backtrace::force_capture();
         let _ = std::fs::write(&path, format!("{info}\n\nBacktrace:\n{bt}"));
         // Remove port/key files to prevent stale entries after a panic
@@ -424,8 +728,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         } else {
             panic_session_name.clone()
         };
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.port", home, base));
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.key", home, base));
+        let _ = std::fs::remove_file(crate::paths::port_file(&base));
+        let _ = std::fs::remove_file(crate::paths::key_file(&base));
+        let _ = std::fs::remove_file(crate::paths::sid_file(&base));
+        let _ = std::fs::remove_file(crate::paths::pid_file(&base));
     }));
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -438,6 +744,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
 
+    // ── P0: single-server-per-name guard (issue #2) ─────────────────────────
+    // Hold a named mutex keyed on this session's base name for the server's whole
+    // life. If another LIVE server already owns the name, we are a duplicate from
+    // a cold-spawn race (has-session false-negatived under load, or two
+    // `new-session -s X` raced) — exit cleanly so the winner stays the single
+    // source of truth. Two servers on one name desync the .port/.key files and
+    // wedge the session ("appears lost"). Warm (standby) servers are exempt (the
+    // warm pool intentionally runs several). Fail-open: any FFI hiccup yields a
+    // live guard, never a blocked legitimate start.
+    let _session_guard = {
+        let base = app.port_file_base();
+        if crate::session::is_warm_session(&base) {
+            None
+        } else {
+            match crate::platform::acquire_session_mutex(&base) {
+                Some(g) => Some(g),
+                None => {
+                    warm_debug(&format!("server STARTUP: session '{}' already owned by a live server — exiting duplicate", base));
+                    return Ok(()); // do NOT touch the winner's .port/.key/.sid
+                }
+            }
+        }
+    };
+
     // Bind the control listener BEFORE loading config so that run-shell
     // commands spawned by load_config can connect back to the server.
     let (tx, rx) = mpsc::channel::<CtrlReq>();
@@ -445,13 +775,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     app.control_port = Some(port);
+    warm_debug(&format!("server STARTUP: session='{}' bound port={}", app.session_name, port));
 
     // Write port and key files IMMEDIATELY after binding, BEFORE loading
     // config or creating windows.  run-shell scripts (e.g. PPM) need the
     // port file to discover the server, and the client polls for it to know
     // the server is ready.
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let dir = format!("{}\\.psmux", home);
+    let dir = crate::paths::psmux_dir();
     let _ = std::fs::create_dir_all(&dir);
 
     // Generate a random session key for security
@@ -467,10 +797,38 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     app.session_key = session_key.clone();
 
-    let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let _ = std::fs::write(&regpath, port.to_string());
-    let keypath = format!("{}\\{}.key", dir, app.port_file_base());
-    let _ = std::fs::write(&keypath, &session_key);
+    // TEST-ONLY fault injection — compiled out of release builds entirely
+    // (gated on debug_assertions); inert in debug unless the env var is set.
+    // Delays the .port file write (which happens inside
+    // ensure_session_registry_files below) while the server is otherwise
+    // healthy, to deterministically reproduce a SLOW server startup under load.
+    // The client's readiness gate must wait for the eventually-reachable server
+    // rather than give up and orphan it. See tests/test_new_session_no_orphan.ps1.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(ms) = env::var("PSMUX_TEST_PORTFILE_DELAY_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
+
+    ensure_session_registry_files(&app);
+
+    // TEST-ONLY fault injection — compiled out of release builds entirely.
+    // Simulates the server dying AFTER writing its .port file but WITHOUT the
+    // panic hook running (a hard exit / kill that leaves a stale .port behind).
+    // The client's readiness gate must detect the dead server PID and fail fast
+    // instead of blocking until the 15s deadline. See tests/test_new_session_hang.ps1.
+    #[cfg(debug_assertions)]
+    {
+        if env::var("PSMUX_TEST_DIE_AFTER_PORTFILE").is_ok() {
+            std::process::exit(3);
+        }
+    }
+
+    let regpath = crate::paths::port_file(&app.port_file_base());
+    let keypath = crate::paths::key_file(&app.port_file_base());
 
     // Expose the server identity via env var so that child processes spawned
     // by run-shell (from hooks, keybindings, etc.) can find this server when
@@ -542,6 +900,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     crate::config::populate_default_bindings(&mut app);
     load_config(&mut app);
+    // Surface any non-fatal config parse warnings to the attaching client
+    // (issue #370 follow-up) instead of silently dropping them.
+    write_config_warnings_log(&app.config_warnings);
+    // Config may set pane-border-status which changes content height (#288)
+    resize_all_panes(&mut app);
 
     // Execute queued plugin .ps1 scripts (e.g. theme plugins that use
     // PowerShell variables and call back to psmux via CLI).  We spawn
@@ -611,14 +974,39 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         *w = app.command_aliases.clone();
     }
 
+    // TEST-ONLY fault injection — compiled out of release builds entirely.
+    // Widens the new-session readiness race deterministically: the .port file
+    // and accept thread are already up (the client's connect check passes), but
+    // the initial window does not yet exist and the main request loop is not yet
+    // answering. A large value (e.g. 60000) also simulates a server that is
+    // ALIVE but whose create_window hangs forever, exercising the client's
+    // bounded 15s deadline (it must return ~15s, never block indefinitely).
+    // See tests/test_new_session_readiness.ps1 and tests/test_new_session_hang.ps1.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(ms) = env::var("PSMUX_TEST_WINDOW_DELAY_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
+
     // Create initial window — if a warm pane was pre-spawned above,
     // create_window's fast path transplants it instantly.
-    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
+    //
+    // Set the server's working directory to the session start directory (the
+    // -c dir if given, otherwise the launch dir) and DO NOT restore it
+    // afterwards. This server process hosts exactly one session, so its cwd is
+    // that session's start directory for the rest of its life. Every later
+    // new-window / split / warm-pane replenish without an explicit -c then
+    // inherits it — which is what makes an attached client's new-window/split
+    // open in the session start directory, while preserving the warm-pane fast
+    // path (warm panes are replenished in this same directory).
     if let Some(ref dir) = start_dir { env::set_current_dir(dir).ok(); }
     let create_result = if let Some(ref raw_args) = raw_command {
         create_window_raw(&*pty_system, &mut app, raw_args)
     } else {
-        create_window(&*pty_system, &mut app, initial_command.as_deref(), None)
+        create_window(&*pty_system, &mut app, initial_command.as_deref(), None, false)
     };
     if let Err(e) = create_result {
         // Issue #167: when the server fails to spawn its initial pane the
@@ -632,11 +1020,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // behind when the pane command fails to spawn (issue #204).
         let _ = std::fs::remove_file(&regpath);
         let _ = std::fs::remove_file(&keypath);
+        crate::session::remove_session_id_file(&app.port_file_base());
         // Kill warm pane if one was pre-spawned
         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
         return Err(e);
     }
-    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
+    // Resize panes now that the initial window exists and config is loaded.
+    // pane-border-status needs 1 row per pane for the border label (#288).
+    resize_all_panes(&mut app);
     // Apply window name if specified via -n.  Setting `manual_rename = true`
     // is critical (issue #266) — it implicitly disables automatic-rename for
     // the initial window of a `new-session -n NAME`, matching tmux semantics
@@ -652,11 +1043,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             Err(e) => { eprintln!("psmux: warm pane pre-spawn failed: {e}"); }
         }
     }
-    // Fire client-attached hooks once at startup so plugins populate initial
-    // data (e.g. CPU/battery) even for detached sessions (tppanel previews).
-    crate::commands::fire_hooks(&mut app, "client-attached");
-    // Fire session-created hook at startup
-    crate::commands::fire_hooks(&mut app, "session-created");
+    // Fire client-attached and session-created hooks once at startup so plugins
+    // populate initial data (e.g. CPU/battery) even for detached sessions
+    // (tppanel previews). Skip the warm server: firing here would double-fire
+    // every client/session hook (e.g. a duplicate continuum auto-save loop). A
+    // claimed warm server gets them once it becomes real (see CtrlReq::ClaimSession).
+    if !app.is_warm_server() {
+        crate::commands::fire_hooks(&mut app, "client-attached");
+        crate::commands::fire_hooks(&mut app, "session-created");
+    }
     // Spawn a warm server for the NEXT new-session when the current session
     // is allowed to keep background state alive.
     if should_spawn_warm_server(&app) {
@@ -693,6 +1088,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Used to ramp down the server loop frequency when truly idle.
     let mut last_client_activity = Instant::now();
 
+    let mut last_registry_check = Instant::now();
+
     // Throttle reap_children: only check for exited processes every 250ms.
     // With hundreds of windows, calling try_wait() on every process each
     // loop iteration wastes CPU.  Exited processes are still reaped promptly
@@ -705,6 +1102,25 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let mut temp_focus_restore: Option<(usize, usize)> = None;
 
     loop {
+        // Tier 3 — keep warm-pane spawning OFF the command path. A warm pane is a
+        // fresh shell + ConPTY; spawning one can block the single event loop for
+        // 100ms–seconds under load. Doing it inline after every new-window/split
+        // stalled *other* clients' commands, surfacing as the intermittent
+        // `os error 10060` timeouts. Instead replenish only during a quiet gap
+        // (no command processed in the last 20ms), so window-create bursts
+        // transplant the ready pane instantly and the blocking spawn lands in idle
+        // time. If no warm pane is ready when a new-window arrives, create_window
+        // still spawns one synchronously — correctness is unchanged.
+        if app.warm_pane.is_none() && last_client_activity.elapsed() >= Duration::from_millis(20) {
+            if let Ok(wp) = spawn_warm_pane(&*pty_system, &mut app) {
+                app.warm_pane = Some(wp);
+            }
+        }
+        if last_registry_check.elapsed() >= Duration::from_secs(5) {
+            last_registry_check = Instant::now();
+            ensure_session_registry_files(&app);
+        }
+
         // Adaptive timeout: ramps from 1ms (active typing/echo) through
         // 5ms (client recently active) up to 50ms (fully idle).  This
         // dramatically reduces CPU usage when the session is idle while
@@ -777,11 +1193,81 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 for win in &mut app.windows {
                     helpers::drain_cpr_pending(&mut win.root);
                 }
+                // Also answer CPR queries for the warm pane — it is not in
+                // any window yet, but pwsh / PSReadLine blocks on the ESC[6n
+                // response during shell startup.  Without this, the warm
+                // pane's shell never finishes loading.
+                if let Some(ref mut wp) = app.warm_pane {
+                    if wp.cpr_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        let (r, c) = wp.term.lock()
+                            .map(|g| g.screen().cursor_position())
+                            .unwrap_or((0, 0));
+                        let response = format!("\x1b[{};{}R", r + 1, c + 1);
+                        use std::io::Write as _;
+                        let _ = wp.writer.write_all(response.as_bytes());
+                        let _ = wp.writer.flush();
+                    }
+                }
+                // Also answer CPR queries for an active popup PTY pane. Like the
+                // warm pane it is not in any window tree, but an interactive popup
+                // shell (PSReadLine / fzf) blocks on the ESC[6n response and would
+                // otherwise render blank forever (#351).
+                if let Mode::PopupMode { popup_pane: Some(ref mut pane), .. } = app.mode {
+                    if pane.cpr_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        let (r, c) = pane.term.lock()
+                            .map(|g| g.screen().cursor_position())
+                            .unwrap_or((0, 0));
+                        let response = format!("\x1b[{};{}R", r + 1, c + 1);
+                        use std::io::Write as _;
+                        let _ = pane.writer.write_all(response.as_bytes());
+                        let _ = pane.writer.flush();
+                    }
+                }
+                // Answer CPR for the active window's floating panes too — same
+                // reason as popups: an interactive float shell blocks on ESC[6n.
+                if let Some(win) = app.windows.get_mut(app.active_idx) {
+                    for fp in win.floating.iter_mut() {
+                        if fp.pane.cpr_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                            let (r, c) = fp.pane.term.lock()
+                                .map(|g| g.screen().cursor_position())
+                                .unwrap_or((0, 0));
+                            let response = format!("\x1b[{};{}R", r + 1, c + 1);
+                            use std::io::Write as _;
+                            let _ = fp.pane.writer.write_all(response.as_bytes());
+                            let _ = fp.pane.writer.flush();
+                        }
+                    }
+                }
+            }
+            // Issue #473: answer terminal color queries (OSC 4/10/11, CSI ?996n)
+            // detected in pane output, so pane applications can discover the
+            // terminal palette.  Colors come from the attached client's report
+            // of its host terminal, else the Campbell defaults.
+            if crate::types::COLOR_QUERY_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let colors = app.host_colors.clone()
+                    .unwrap_or_else(crate::types::HostColors::campbell);
+                for win in &mut app.windows {
+                    helpers::drain_color_queries(&mut win.root, &colors);
+                    for fp in win.floating.iter_mut() {
+                        let bits = fp.pane.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
+                        if bits != 0 {
+                            helpers::answer_color_queries(bits, &mut *fp.pane.writer, fp.pane.child_pid, &colors);
+                        }
+                    }
+                }
+                if let Mode::PopupMode { popup_pane: Some(ref mut pane), .. } = app.mode {
+                    let bits = pane.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
+                    if bits != 0 {
+                        helpers::answer_color_queries(bits, &mut *pane.writer, pane.child_pid, &colors);
+                    }
+                }
             }
         }
-        // When a popup PTY is active, always push frames so interactive
-        // content (e.g. fzf, shell prompts) updates in real-time.
-        if matches!(app.mode, Mode::PopupMode { .. }) {
+        // When a popup PTY or a floating pane is active, always push frames so
+        // interactive content (fzf, shell prompts) updates in real-time.
+        if matches!(app.mode, Mode::PopupMode { .. })
+            || app.windows.get(app.active_idx).map_or(false, |w| !w.floating.is_empty())
+        {
             state_dirty = true;
         }
         let echo_active = echo_pending_until.map_or(false, |t| t.elapsed().as_millis() < 50);
@@ -872,49 +1358,58 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::PaneForwardStatus(..) => "PaneForwardStatus",
                         CtrlReq::PaneForwardKill(..) => "PaneForwardKill",
                         CtrlReq::MoveWindow(..) => "MoveWindow",
-                        CtrlReq::SwapWindow(_) => "SwapWindow",
+                        CtrlReq::SwapWindow(..) => "SwapWindow",
                         _ => "",
                     };
                     match req {
-                CtrlReq::NewWindow(cmd, name, detached, start_dir) => {
+                CtrlReq::NewWindow(cmd, name, detached, start_dir, title, empty) => {
                     if let Some(cmds) = app.hooks.get("before-new-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     let prev_idx = app.active_idx;
                     // Expand format variables like #{pane_current_path} (#111)
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    // Hide the warm pane when an explicit start dir is requested
-                    // so create_window spawns a fresh shell in the correct CWD.
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
-                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref()) {
+                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref(), empty) {
                         eprintln!("psmux: new-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
-                    if detached { app.active_idx = prev_idx; }
-                    // Replenish warm pane pool for next new-window
-                    if app.warm_pane.is_none() {
-                        match spawn_warm_pane(&*pty_system, &mut app) {
-                            Ok(wp) => { app.warm_pane = Some(wp); }
-                            Err(_) => {}
+                    // -T: set the new pane's title at creation (tmux new-window -T).
+                    if let Some(t) = title {
+                        if let Some(win) = app.windows.last_mut() {
+                            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                                p.title_locked = !t.is_empty();
+                                p.title = t;
+                            }
                         }
                     }
+                    if detached { app.active_idx = prev_idx; }
+                    // Replenish warm pane pool for next new-window
+                    // Warm-pane replenish is deferred OFF the command path — it
+                    // runs at the loop top during an idle gap (Tier 3), so a burst
+                    // of window-creates never chains blocking spawns that stall
+                    // other clients' commands.
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
                 }
-                CtrlReq::NewWindowPrint(cmd, name, detached, start_dir, format_str, resp) => {
+                CtrlReq::NewWindowPrint(cmd, name, detached, start_dir, format_str, resp, title, empty) => {
                     if let Some(cmds) = app.hooks.get("before-new-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     let prev_idx = app.active_idx;
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
-                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref()) {
+                    if let Err(e) = create_window(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref(), empty) {
                         eprintln!("psmux: new-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     if let Some(n) = name { app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
+                    if let Some(t) = title {
+                        if let Some(win) = app.windows.last_mut() {
+                            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                                p.title_locked = !t.is_empty();
+                                p.title = t;
+                            }
+                        }
+                    }
                     // Use full format engine for -P output (tmux compatible)
                     let new_win_idx = app.windows.len() - 1;
                     let fmt = format_str.as_deref().unwrap_or("#{session_name}:#{window_index}");
@@ -922,30 +1417,54 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if detached { app.active_idx = prev_idx; }
                     let _ = resp.send(pane_info);
                     // Replenish warm pane pool for next new-window
-                    if app.warm_pane.is_none() {
-                        match spawn_warm_pane(&*pty_system, &mut app) {
-                            Ok(wp) => { app.warm_pane = Some(wp); }
-                            Err(_) => {}
-                        }
-                    }
+                    // Warm-pane replenish is deferred OFF the command path — it
+                    // runs at the loop top during an idle gap (Tier 3), so a burst
+                    // of window-creates never chains blocking spawns that stall
+                    // other clients' commands.
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-new-window");
                 }
-                CtrlReq::SplitWindow(k, cmd, detached, start_dir, split_size, resp) => {
+                CtrlReq::SplitWindow(k, cmd, detached, start_dir, split_size, resp, title) => {
                     if let Some(cmds) = app.hooks.get("before-split-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     // tmux: split-window without -Z permanently unzooms (#82)
                     unzoom_if_zoomed(&mut app);
+                    // tmux: split-window INSIDE a floating pane creates ANOTHER
+                    // floating pane (offset from it), not a tiled split.
+                    let float_src = {
+                        let win = &app.windows[app.active_idx];
+                        win.floating_focus.and_then(|fi| win.floating.get(fi)).map(|fp| (fp.x, fp.y, fp.w, fp.h, fp.border.clone()))
+                    };
+                    if let Some((sx, sy, sw, sh, sborder)) = float_src {
+                        let win_w = app.last_window_area.width.max(10);
+                        let win_h = app.last_window_area.height.max(10);
+                        let nx = (sx + 2).min(win_w.saturating_sub(sw));
+                        let ny = (sy + 2).min(win_h.saturating_sub(sh));
+                        let inner_h = sh.saturating_sub(2).max(1);
+                        let inner_w = sw.saturating_sub(2).max(1);
+                        let cmdstr = cmd.clone().unwrap_or_default();
+                        let sd = start_dir.clone().map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
+                        let pane_id = app.next_pane_id;
+                        if let Some(mut pane) = crate::popup::create_popup_pane(&cmdstr, sd.as_deref(), inner_h, inner_w, pane_id, &app.session_name, &app.environment) {
+                            app.next_pane_id += 1;
+                            let t = title.clone().unwrap_or_default();
+                            if !t.is_empty() { pane.title = t.clone(); pane.title_locked = true; }
+                            let win = &mut app.windows[app.active_idx];
+                            win.floating.push(crate::types::FloatingPane { pane, x: nx, y: ny, w: sw, h: sh, border: sborder, id: pane_id, title: t, position: None });
+                            if !detached { win.floating_focus = Some(win.floating.len() - 1); }
+                            state_dirty = true;
+                        }
+                        let _ = resp.send(String::new());
+                    } else {
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    // Hide warm pane when explicit start_dir is given (wrong CWD)
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref()) {
-                        let _ = resp.send(format!("psmux: split-window: {e}"));
+                        let msg = format!("split-window: {e}");
+                        app.status_message = Some((msg.clone(), std::time::Instant::now(), None));
+                        let _ = resp.send(format!("psmux: {msg}"));
                     } else {
                         let _ = resp.send(String::new());
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     // Apply size if specified: (value, true) = percentage, (value, false) = cell count
                     if let Some((val, is_pct)) = split_size {
                         let pct = if is_pct {
@@ -960,6 +1479,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
                             sizes[0] = 100 - pct;
                             sizes[1] = pct;
+                        }
+                    }
+                    // -T: the just-created pane is currently active in this
+                    // window, so set its title before any detached revert.
+                    if let Some(t) = title {
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                            p.title_locked = !t.is_empty();
+                            p.title = t;
                         }
                     }
                     if detached {
@@ -988,26 +1516,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     // Replenish warm pane for the next new-window/split
-                    if app.warm_pane.is_none() {
-                        match spawn_warm_pane(&*pty_system, &mut app) {
-                            Ok(wp) => { app.warm_pane = Some(wp); }
-                            Err(_) => {}
-                        }
-                    }
+                    // Warm-pane replenish is deferred OFF the command path — it
+                    // runs at the loop top during an idle gap (Tier 3), so a burst
+                    // of window-creates never chains blocking spawns that stall
+                    // other clients' commands.
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
+                    }
                 }
-                CtrlReq::SplitWindowPrint(k, cmd, detached, start_dir, split_size, format_str, resp) => {
+                CtrlReq::SplitWindowPrint(k, cmd, detached, start_dir, split_size, format_str, resp, title) => {
                     if let Some(cmds) = app.hooks.get("before-split-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     unzoom_if_zoomed(&mut app);
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { env::set_current_dir(dir).ok(); }
                     let prev_path = app.windows[app.active_idx].active_path.clone();
-                    let stashed_warm = if start_dir.is_some() { app.warm_pane.take() } else { None };
                     if let Err(e) = split_active_with_command(&mut app, k, cmd.as_deref(), Some(&*pty_system), start_dir.as_deref()) {
+                        app.status_message = Some((format!("split-window: {e}"), std::time::Instant::now(), None));
                         eprintln!("psmux: split-window error: {e}");
                     }
-                    if let Some(wp) = stashed_warm { app.warm_pane = Some(wp); }
                     // Apply size if specified: (value, true) = percentage, (value, false) = cell count
                     if let Some((val, is_pct)) = split_size {
                         let pct = if is_pct {
@@ -1021,6 +1547,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &prev_path) {
                             sizes[0] = 100 - pct;
                             sizes[1] = pct;
+                        }
+                    }
+                    // -T: set the new (currently active) pane's title.
+                    if let Some(t) = title {
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                            p.title_locked = !t.is_empty();
+                            p.title = t;
                         }
                     }
                     // Use full format engine for -P output (tmux compatible)
@@ -1046,17 +1580,32 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(pane_info);
                     if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
                     // Replenish warm pane
-                    if app.warm_pane.is_none() {
-                        match spawn_warm_pane(&*pty_system, &mut app) {
-                            Ok(wp) => { app.warm_pane = Some(wp); }
-                            Err(_) => {}
-                        }
-                    }
+                    // Warm-pane replenish is deferred OFF the command path — it
+                    // runs at the loop top during an idle gap (Tier 3), so a burst
+                    // of window-creates never chains blocking spawns that stall
+                    // other clients' commands.
                     resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-split-window");
                 }
                 CtrlReq::KillPane => {
                     if let Some(cmds) = app.hooks.get("before-kill-pane") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    unzoom_if_zoomed(&mut app); let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-kill-pane");
+                    // A focused floating pane is closed by kill-pane instead of a
+                    // tiled pane. The child is dropped with the FloatingPane.
+                    let closed_float = {
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(fi) = win.floating_focus {
+                            if fi < win.floating.len() {
+                                let mut fp = win.floating.remove(fi);
+                                let _ = fp.pane.child.kill();
+                                win.floating_focus = if win.floating.is_empty() { None } else { Some(win.floating.len() - 1) };
+                                true
+                            } else { false }
+                        } else { false }
+                    };
+                    if closed_float {
+                        state_dirty = true;
+                    } else {
+                        unzoom_if_zoomed(&mut app); let _ = kill_active_pane(&mut app); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-kill-pane");
+                    }
                 }
                 CtrlReq::KillPaneById(pid) => {
                     if let Some(cmds) = app.hooks.get("before-kill-pane") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
@@ -1079,9 +1628,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::FocusWindow(wid) => {
                     // wid is a display index (same as tmux window number), convert to internal array index
-                    if wid >= app.window_base_index {
-                        let internal_idx = wid - app.window_base_index;
-                        if internal_idx < app.windows.len() && internal_idx != app.active_idx {
+                    if let Some(internal_idx) = app.win_pos(wid) {
+                        if internal_idx != app.active_idx {
                             switch_with_copy_save(&mut app, |app| {
                                 app.last_window_idx = app.active_idx;
                                 app.active_idx = internal_idx;
@@ -1165,11 +1713,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         ).unwrap_or(usize::MAX);
                         temp_focus_restore = Some((app.active_idx, pane_id));
                     }
-                    if wid >= app.window_base_index {
-                        let internal_idx = wid - app.window_base_index;
-                        if internal_idx < app.windows.len() {
-                            app.active_idx = internal_idx;
-                        }
+                    if let Some(internal_idx) = app.win_pos(wid) {
+                        app.active_idx = internal_idx;
                     }
                 }
                 CtrlReq::FocusWindowByNameTemp(ref name) => {
@@ -1268,32 +1813,32 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::ClientDetach(cid) => {
-                    app.attached_clients = app.attached_clients.saturating_sub(1);
-                    app.client_sizes.remove(&cid);
-                    app.client_registry.remove(&cid);
-                    app.client_prefix_active = false;
-                    if app.latest_client_id == Some(cid) {
-                        app.latest_client_id = None;
-                    }
-                    // Recompute effective size from remaining clients
-                    if let Some((w, h)) = compute_effective_client_size(&app) {
-                        app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
-                        resize_all_panes(&mut app);
-                    }
-                    hook_event = Some("client-detached");
-                    if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::types::shutdown_persistent_streams();
-                        tree::kill_all_children_batch(&mut app.windows);
-                        if let Some(mut wp) = app.warm_pane.take() {
-                            wp.child.kill().ok();
+                    // Route through the idempotent reaper so a duplicate detach
+                    // for one `cid` (e.g. reader-EOF and writer-teardown both
+                    // observing the same dead connection) cannot over-decrement
+                    // `attached_clients` or re-run the destroy-unattached path.
+                    // Side effects run only on a real reap.
+                    if app.reap_client(cid) {
+                        // Recompute effective size from remaining clients
+                        if let Some((w, h)) = compute_effective_client_size(&app) {
+                            app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
+                            resize_all_panes(&mut app);
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        hook_event = Some("client-detached");
+                        if app.attached_clients == 0 && app.destroy_unattached {
+                            let regpath = crate::paths::port_file(&app.port_file_base());
+                            let keypath = crate::paths::key_file(&app.port_file_base());
+                            let _ = std::fs::remove_file(&regpath);
+                            let _ = std::fs::remove_file(&keypath);
+                            crate::session::remove_session_id_file(&app.port_file_base());
+                            crate::types::shutdown_persistent_streams();
+                            tree::kill_all_children_batch(&mut app.windows);
+                            if let Some(mut wp) = app.warm_pane.take() {
+                                wp.child.kill().ok();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::process::exit(0);
+                        }
                     }
                 }
                 CtrlReq::DumpLayout(resp) => {
@@ -1403,18 +1948,26 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let layout_json = dump_layout_json_fast(&mut app)?;
                     let _layout_ms = _t_layout.elapsed().as_micros();
                     combined_buf.clear();
-                    let ss_escaped = json_escape_string(&cached_status_style);
+                    // #372: style options must be format-expanded too, so a
+                    // #{@var} colour reference resolves before the client's
+                    // colour parser sees it (otherwise status-style falls back
+                    // to bright green). wsf/wscf stay raw: they are per-window
+                    // formats the client expands with each window's own context.
+                    let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
                     let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
                     let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-                    let pbs_escaped = json_escape_string(&app.pane_border_style);
-                    let pabs_escaped = json_escape_string(&app.pane_active_border_style);
-                    let pbhs_escaped = json_escape_string(&app.pane_border_hover_style);
+                    let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
+                    let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
+                    let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
                     let wsf_escaped = json_escape_string(&app.window_status_format);
                     let wscf_escaped = json_escape_string(&app.window_status_current_format);
-                    let wss_escaped = json_escape_string(&app.window_status_separator);
-                    let ws_style_escaped = json_escape_string(&app.window_status_style);
-                    let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
-                    let mode_style_escaped = json_escape_string(&app.mode_style);
+                    let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
+                    let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
+                    let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
+                    let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+                    // #372: message-style was never sent to the client (it
+                    // hard-coded bg=yellow,fg=black). Send it, format-expanded.
+                    let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
                     let status_position_escaped = json_escape_string(&app.status_position);
                     let status_justify_escaped = json_escape_string(&app.status_justify);
                     // Build status_format JSON array for multi-line status bar
@@ -1431,11 +1984,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                     let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
-                        mode_style_escaped, status_position_escaped, status_justify_escaped,
+                        mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                         cursor_style_code, app.status_visible, app.repeat_time_ms,
                         app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
                         app.defaults_suppressed,
@@ -1443,7 +1996,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.mouse_selection,
                         app.paste_detection,
                         app.choose_tree_preview,
+                        app.scroll_enter_copy_mode,
+                        app.bold_is_bright,
                     ));
+                    // #451: append status-bar style options dropped in the
+                    // app.rs->client.rs modularization.
+                    helpers::append_extra_style_json(&mut combined_buf, &app);
                     // Inject overlay state (popup, menu, confirm, display_panes)
                     {
                         // Inject clock_colour if set
@@ -1470,6 +2028,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 combined_buf.push('}');
                             }
                         }
+                        // Inject pane-border-lines independently — it may be set
+                        // without pane-border-status.
+                        if let Some(pbl) = app.user_options.get("pane-border-lines") {
+                            if combined_buf.ends_with('}') {
+                                combined_buf.pop();
+                                combined_buf.push_str(",\"pane_border_lines\":\"");
+                                combined_buf.push_str(&json_escape_string(pbl));
+                                combined_buf.push('"');
+                                combined_buf.push('}');
+                            }
+                        }
+                        helpers::append_copy_ln_json(&app, &mut combined_buf);
+                        helpers::append_floats_json(&app, &mut combined_buf);
                         // set-titles: when on, expand set-titles-string and ship
                         // it so the client emits OSC 0 to its host terminal.
                         if app.set_titles && combined_buf.ends_with('}') {
@@ -1504,6 +2075,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     cached_dump_state.clear();
                     cached_dump_state.push_str(&combined_buf);
+                    // Forward OSC 52 from pane child processes (e.g. Claude
+                    // Code's `/copy`).  The pane's parser stages incoming
+                    // OSC 52 onto its Screen; drain it and decode to plain
+                    // text so the existing dump-state injection below
+                    // re-emits it as OSC 52 on the client's stdout to the
+                    // host terminal.  Gated by `set-clipboard` option.
+                    if app.set_clipboard != "off" && app.clipboard_osc52.is_none() {
+                        if let Some((_sel, b64)) = take_pane_clipboard(&app) {
+                            if let Ok(b64_str) = std::str::from_utf8(&b64) {
+                                if let Some(text) = crate::util::base64_decode(b64_str) {
+                                    app.clipboard_osc52 = Some(text);
+                                }
+                            }
+                        }
+                    }
                     // Inject one-shot clipboard data for OSC 52 delivery to
                     // the client.  Only the *response* includes this field;
                     // the cached copy does not, so subsequent NC frames won't
@@ -1534,7 +2120,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         use std::io::Write as _;
                         static SRV_LOG: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
                         let log = SRV_LOG.get_or_init(|| {
-                            let p = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\gj".into())).join("psmux_server_latency.log");
+                            let base = std::env::var("USERPROFILE")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|_| std::env::temp_dir());
+                            let p = base.join("psmux_server_latency.log");
                             std::sync::Mutex::new(std::fs::File::create(p).expect("create latency log"))
                         });
                         if let Ok(mut f) = log.lock() {
@@ -1561,12 +2150,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::PrefixEnd => { app.client_prefix_active = false; state_dirty = true; }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); hook_event = Some("pane-mode-changed"); }
                 CtrlReq::CopyEnterPageUp => {
-                    enter_copy_mode(&mut app);
-                    let half = app.windows.get(app.active_idx)
-                        .and_then(|w| active_pane(&w.root, &w.active_path))
-                        .map(|p| p.last_rows as usize).unwrap_or(20);
-                    scroll_copy_up(&mut app, half);
-                    hook_event = Some("pane-mode-changed");
+                    if app.scroll_enter_copy_mode {
+                        enter_copy_mode(&mut app);
+                        let half = app.windows.get(app.active_idx)
+                            .and_then(|w| active_pane(&w.root, &w.active_path))
+                            .map(|p| p.last_rows as usize).unwrap_or(20);
+                        scroll_copy_up(&mut app, half);
+                        hook_event = Some("pane-mode-changed");
+                    } else {
+                        // scroll-enter-copy-mode is off: forward PageUp to the
+                        // active pane so apps like less/vim/WSL receive it (#284).
+                        send_text_to_active(&mut app, "\x1b[5~")?;
+                        echo_pending_until = Some(Instant::now());
+                    }
                 }
                 CtrlReq::ClockMode => { app.mode = Mode::ClockMode; state_dirty = true; hook_event = Some("pane-mode-changed"); }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
@@ -1601,6 +2197,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let sync = crate::warm_pane_sync::for_resize(&app, eh, ew);
                     crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
                     hook_event = Some("client-resized");
+                }
+                CtrlReq::HostColors(spec) => {
+                    // Issue #473: a client reported its host terminal's colors.
+                    // Keep the most recent report — the newest attached client
+                    // is what the user is actually looking at.
+                    let hc = crate::types::HostColors::from_spec(&spec);
+                    if hc.has_any() || hc.dark.is_some() {
+                        app.host_colors = Some(hc);
+                    }
                 }
                 CtrlReq::FocusPaneCmd(pid) => {
                     let old_path = app.windows[app.active_idx].active_path.clone();
@@ -1727,12 +2332,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 "ESCAPE" | "ESC" => send_text_to_active(&mut app, "\x1b")?,
                                 "SPACE" => send_text_to_active(&mut app, " ")?,
                                 "BSPACE" | "BACKSPACE" => send_text_to_active(&mut app, "\x7f")?,
-                                "UP" => send_text_to_active(&mut app, "\x1b[A")?,
-                                "DOWN" => send_text_to_active(&mut app, "\x1b[B")?,
-                                "RIGHT" => send_text_to_active(&mut app, "\x1b[C")?,
-                                "LEFT" => send_text_to_active(&mut app, "\x1b[D")?,
-                                "HOME" => send_text_to_active(&mut app, "\x1b[H")?,
-                                "END" => send_text_to_active(&mut app, "\x1b[F")?,
+                                // DECCKM app-cursor mode: SS3, not CSI (see crate::input::csi_cursor_to_ss3).
+                                "UP" => send_key_to_active(&mut app, "up")?,
+                                "DOWN" => send_key_to_active(&mut app, "down")?,
+                                "RIGHT" => send_key_to_active(&mut app, "right")?,
+                                "LEFT" => send_key_to_active(&mut app, "left")?,
+                                "HOME" => send_key_to_active(&mut app, "home")?,
+                                "END" => send_key_to_active(&mut app, "end")?,
                                 "PAGEUP" | "PPAGE" => send_text_to_active(&mut app, "\x1b[5~")?,
                                 "PAGEDOWN" | "NPAGE" => send_text_to_active(&mut app, "\x1b[6~")?,
                                 "DELETE" | "DC" => send_text_to_active(&mut app, "\x1b[3~")?,
@@ -1762,9 +2368,54 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                         }
                                     }
                                 }
+                                // Ctrl+Shift+<punctuation/digit> that collapses to a single
+                                // C0 byte, e.g. Ctrl+/ delivered by ConPTY terminals
+                                // (Alacritty, WezTerm) as "C-S--" (VK_OEM_MINUS + Ctrl +
+                                // Shift).  It must reach the child as 0x1f (^_), matching
+                                // Ctrl+_ and tmux, so neovim's Ctrl+/ comment toggle fires
+                                // (issue #394).  This MUST precede the generic C- arm below,
+                                // whose nth(2) extraction would otherwise read the 'S' and
+                                // mis-send Ctrl+S.
+                                s if (s.starts_with("C-S-") || s.starts_with("C-s-"))
+                                    && s.chars().count() == 5
+                                    && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
+                                {
+                                    if let Some(c) = s.chars().nth(4) {
+                                        if let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) {
+                                            send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                        }
+                                    }
+                                }
                                 s if s.starts_with("C-") => {
                                     if let Some(c) = s.chars().nth(2) {
                                         let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) else { continue };
+                                        // On Windows with Win32 input mode, write the key as
+                                        // a Win32 input mode escape sequence so ConPTY generates
+                                        // a proper KEY_EVENT with VK + LEFT_CTRL_PRESSED (#305).
+                                        #[cfg(windows)]
+                                        {
+                                            if c.is_ascii_alphabetic() {
+                                                // Keep Ctrl+C on the legacy interrupt path:
+                                                // raw 0x03 + send_ctrl_c_event below.
+                                                if ctrl == 0x03 {
+                                                    send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                                } else {
+                                                    let vk = crate::platform::mouse_inject::char_to_vk(c);
+                                                    let scan = crate::platform::mouse_inject::vk_to_scan(vk);
+                                                    let u_char = (c.to_ascii_lowercase() as u16) & 0x1F;
+                                                    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+                                                    let seq = format!(
+                                                        "\x1b[{};{};{};1;{};1_\x1b[{};{};{};0;{};1_",
+                                                        vk, scan, u_char, LEFT_CTRL_PRESSED,
+                                                        vk, scan, u_char, LEFT_CTRL_PRESSED
+                                                    );
+                                                    send_text_to_active(&mut app, &seq)?;
+                                                }
+                                            } else {
+                                                send_text_to_active(&mut app, &String::from(ctrl as char))?;
+                                            }
+                                        }
+                                        #[cfg(not(windows))]
                                         send_text_to_active(&mut app, &String::from(ctrl as char))?;
                                         // On Windows, writing 0x03 to the PTY pipe doesn't
                                         // generate CTRL_C_EVENT when ENABLE_PROCESSED_INPUT
@@ -1942,9 +2593,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "scroll-down" => { scroll_copy_down(&mut app, 1); }
                         "search-forward" | "search-forward-incremental" => {
                             app.mode = Mode::CopySearch { input: String::new(), forward: true };
+                            let prompt = "(search down) ".to_string();
+                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
                         }
                         "search-backward" | "search-backward-incremental" => {
                             app.mode = Mode::CopySearch { input: String::new(), forward: false };
+                            let prompt = "(search up) ".to_string();
+                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
                         }
                         "search-again" => { crate::copy_mode::search_next(&mut app); }
                         "search-reverse" => { crate::copy_mode::search_prev(&mut app); }
@@ -2185,9 +2840,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SelectWindow(idx) => {
                     if let Some(cmds) = app.hooks.get("before-select-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    if idx >= app.window_base_index {
-                        let internal_idx = idx - app.window_base_index;
-                        if internal_idx < app.windows.len() && internal_idx != app.active_idx {
+                    if let Some(internal_idx) = app.win_pos(idx) {
+                        if internal_idx != app.active_idx {
                             switch_with_copy_save(&mut app, |app| {
                                 app.last_window_idx = app.active_idx;
                                 app.active_idx = internal_idx;
@@ -2249,7 +2903,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let mut panes = Vec::new();
                         collect_all_panes(&win.root, &mut panes);
                         for (id, cols, rows) in panes {
-                            output.push_str(&format!("{}:{}: %{} [{}x{}]\n", app.session_name, wi + app.window_base_index, id, cols, rows));
+                            output.push_str(&format!("{}:{}: %{} [{}x{}]\n", app.session_name, app.win_display_index(wi), id, cols, rows));
                         }
                     }
                     let _ = resp.send(output);
@@ -2263,25 +2917,41 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::KillWindow => {
                     if app.windows.len() > 1 {
-                        let mut win = app.windows.remove(app.active_idx);
+                        let removed_pos = app.active_idx;
+                        let mut win = app.windows.remove(removed_pos);
                         kill_all_children(&mut win.root);
+                        app.on_window_removed(removed_pos);
                         if app.active_idx >= app.windows.len() { app.active_idx = app.windows.len() - 1; }
                     } else {
                         // Last window: kill all children; reaper will detect empty session and exit
                         kill_all_children(&mut app.windows[0].root);
                     }
+                    // Killing a window changes the active window and the window
+                    // list, so resize the now-active window's panes and force a
+                    // status-bar/window-list rebuild + push to attached clients.
+                    // Without meta_dirty the cached window tabs stay stale and
+                    // without state_dirty the no-change fast path skips the frame,
+                    // leaving the bottom bar showing the killed window until the
+                    // next input (issue #359). Mirrors every other structural
+                    // mutation (new-window, kill-pane, select-window) and tmux's
+                    // server_kill_window -> server_redraw_session_group.
+                    resize_all_panes(&mut app);
+                    meta_dirty = true;
+                    state_dirty = true;
                     hook_event = Some("window-closed");
                 }
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    // Remove port/key files FIRST so clients see the session
+                    // Remove port/key/sid files FIRST so clients see the session
                     // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let regpath = crate::paths::port_file(&app.port_file_base());
+                    let keypath = crate::paths::key_file(&app.port_file_base());
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
+                    crate::session::remove_session_id_file(&app.port_file_base());
+                    crate::types::send_directive_to_all_clients("DETACH");
+                    std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -2297,24 +2967,33 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::RenameSession(name) => {
                     if let Some(cmds) = app.hooks.get("before-rename-session") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let old_keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let old_path = crate::paths::port_file(&app.port_file_base());
+                    let old_keypath = crate::paths::key_file(&app.port_file_base());
                     // Compute new port file base with socket_name prefix
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
-                    let new_path = format!("{}\\.psmux\\{}.port", home, new_base);
-                    let new_keypath = format!("{}\\.psmux\\{}.key", home, new_base);
+                    let new_path = crate::paths::port_file(&new_base);
+                    let new_keypath = crate::paths::key_file(&new_base);
                     if let Some(port) = app.control_port {
                         let _ = std::fs::remove_file(&old_path);
                         let _ = std::fs::write(&new_path, port.to_string());
-                        if let Ok(key) = std::fs::read_to_string(&old_keypath) {
-                            let _ = std::fs::remove_file(&old_keypath);
-                            let _ = std::fs::write(&new_keypath, key);
-                        }
+                        // Write this server's OWN in-memory key, NOT a copy of the
+                        // old .key file. Under warm-server replenish churn the
+                        // __warm__.key file may have been overwritten by a LATER warm
+                        // server, so copying it would give the renamed/claimed session
+                        // a key that does not match this server (seen as "Invalid
+                        // session key" on a later command). app.session_key is correct.
+                        let _ = std::fs::remove_file(&old_keypath);
+                        let _ = std::fs::write(&new_keypath, &app.session_key);
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
+                        // Re-anchor the PID sentinel to the new base (issue #448):
+                        // remove_session_id_file above dropped the old .pid.
+                        crate::session::write_session_pid_file(&new_base, std::process::id());
                     }
                     app.session_name = name;
                     // Update env so run-shell/hooks from this server target the new name
@@ -2322,27 +3001,59 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     hook_event = Some("after-rename-session");
                 }
                 CtrlReq::ClaimSession(name, client_cwd, resp) => {
+                    // Guard against clobbering an already-claimed session. Under
+                    // rapid `new-session`, a stale __warm__.port (or OS ephemeral
+                    // port reuse) can route a claim to a server that has ALREADY
+                    // been claimed — its session_name is no longer "__warm__".
+                    // Renaming it again would rename the live session away and
+                    // destroy it (observed as rapid new-session intermittently
+                    // losing 1-4 of N sessions ~2s after creation). Refuse the
+                    // claim so the CLI falls back to a cold-spawn, which is the
+                    // reliable path. Only a genuine warm server may be claimed.
+                    if app.session_name != "__warm__" {
+                        warm_debug(&format!("CLAIM REFUSED: this server is '{}' (port={:?}), requested name='{}'", app.session_name, app.control_port, name));
+                        let _ = resp.send("ERR: not a warm server (already claimed)\n".to_string());
+                    } else {
+                    warm_debug(&format!("CLAIM ACCEPT: __warm__ (port={:?}) -> '{}'", app.control_port, name));
                     // Same as RenameSession but with a synchronous response
                     // so the CLI knows the rename completed before attaching.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let old_keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let old_path = crate::paths::port_file(&app.port_file_base());
+                    let old_keypath = crate::paths::key_file(&app.port_file_base());
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
-                    let new_path = format!("{}\\.psmux\\{}.port", home, new_base);
-                    let new_keypath = format!("{}\\.psmux\\{}.key", home, new_base);
+                    let new_path = crate::paths::port_file(&new_base);
+                    let new_keypath = crate::paths::key_file(&new_base);
                     if let Some(port) = app.control_port {
                         let _ = std::fs::remove_file(&old_path);
                         let _ = std::fs::write(&new_path, port.to_string());
-                        if let Ok(key) = std::fs::read_to_string(&old_keypath) {
-                            let _ = std::fs::remove_file(&old_keypath);
-                            let _ = std::fs::write(&new_keypath, key);
-                        }
+                        // Write this server's OWN in-memory key, NOT a copy of the
+                        // old .key file. Under warm-server replenish churn the
+                        // __warm__.key file may have been overwritten by a LATER warm
+                        // server, so copying it would give the renamed/claimed session
+                        // a key that does not match this server (seen as "Invalid
+                        // session key" on a later command). app.session_key is correct.
+                        let _ = std::fs::remove_file(&old_keypath);
+                        let _ = std::fs::write(&new_keypath, &app.session_key);
+                        // Rename .sid file to match new session name
+                        crate::session::remove_session_id_file(&app.port_file_base());
+                        crate::session::write_session_id_file(&new_base, app.session_id);
+                        // Re-anchor the PID sentinel to the new base (issue #448):
+                        // remove_session_id_file above dropped the old .pid.
+                        crate::session::write_session_pid_file(&new_base, std::process::id());
                     }
                     app.session_name = name;
+                    // Warm server's created_at is the warm process start time, not the
+                    // user's session-creation time — reset on claim or list-sessions /
+                    // session_created / uptime would report the warm pool's age.
+                    app.created_at = chrono::Local::now();
+                    // Same reason for the status-interval phase: the warm server skips
+                    // the timer (see should_run_status_interval_timer), so its last-fire
+                    // stamp is the warm start time — reset it so a claimed session fires
+                    // one interval after creation, not immediately.
+                    app.last_status_interval_fire = std::time::Instant::now();
                     // Update env so run-shell/hooks from this server target the new name
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
                     // Honour the client's working directory: the warm server
@@ -2361,30 +3072,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 .unwrap_or(true);
                             if server_cwd_differs {
                                 env::set_current_dir(cwd_path).ok();
-                                // Inject cd + clear into the active pane so
-                                // the directory change is invisible to the
-                                // user.  Leading space keeps it out of shell
-                                // history; the clear wipes visible traces.
-                                //
-                                // The vt100 parser watches for the CSI 2J
-                                // that cls/clear generates, which tells the
-                                // layout serialiser the clear finished
-                                // (event-driven, no guessing).  A safety
-                                // timeout is a fallback for unusual shells.
+                                // Silently re-home the warm server's active pane
+                                // to the client's CWD (invisible cd + clear), so
+                                // the shell it pre-spawned adopts the right dir.
                                 if let Some(win) = app.windows.last_mut() {
                                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                                        use std::io::Write as _;
-                                        let escaped = cwd.replace('\'', "''");
-                                        let clear = if cfg!(windows) { "cls" } else { "clear" };
-                                        let cd_cmd = format!(" cd '{}'; {}\r", escaped, clear);
-                                        // Tell the vt100 parser to watch for the
-                                        // next screen-clear event (CSI 2J/3J).
-                                        if let Ok(mut parser) = p.term.lock() {
-                                            parser.screen_mut().set_squelch_clear_pending(true);
-                                        }
-                                        p.squelch_until = Some(Instant::now() + Duration::from_millis(500));
-                                        let _ = p.writer.write_all(cd_cmd.as_bytes());
-                                        let _ = p.writer.flush();
+                                        crate::pane::silent_rehome(p, cwd);
                                     }
                                 }
                             }
@@ -2397,14 +3090,28 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // its own startup, but the user may have changed their
                     // config since then (or the warm server was spawned by a
                     // different session with a different PSMUX_CONFIG_FILE).
+                    // Clear config-derived state first so the reload is authoritative:
+                    // hooks removed from the config drop out, and `set-hook -a`
+                    // append hooks don't stack a second copy onto the warm server's.
                     app.key_tables.clear();
+                    app.hooks.clear();
                     app.defaults_suppressed = false;
                     crate::config::populate_default_bindings(&mut app);
                     load_config(&mut app);
+                    // Surface config warnings to the claiming client (#370 follow-up).
+                    write_config_warnings_log(&app.config_warnings);
+                    // Config may set pane-border-status (#288)
+                    resize_all_panes(&mut app);
                     // Update shared aliases after config reload
                     if let Ok(mut w) = shared_aliases_main.write() {
                         *w = app.command_aliases.clone();
                     }
+                    // Fire client-attached/session-created for the now-real session:
+                    // the startup path skips these while warm, so this is where a
+                    // claimed session gets them - exactly once - starting plugins
+                    // like continuum's auto-save and auto-restore.
+                    crate::commands::fire_hooks(&mut app, "client-attached");
+                    crate::commands::fire_hooks(&mut app, "session-created");
                     // Fire client-session-changed hook (warm server claimed by new session)
                     if let Some(cmds) = app.hooks.get("client-session-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     meta_dirty = true;
@@ -2413,26 +3120,131 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Spawn a replacement warm server for the NEXT new-session
                     spawn_warm_server(&app);
                     hook_event = Some("after-rename-session");
+                    }
                 }
                 CtrlReq::SwapPane(dir) => {
                     // tmux: swap-pane without -Z permanently unzooms (#82)
                     unzoom_if_zoomed(&mut app);
-                    match dir.as_str() {
-                        "U" => { swap_pane(&mut app, FocusDir::Up); }
-                        "D" => { swap_pane(&mut app, FocusDir::Down); }
-                        _ => { swap_pane(&mut app, FocusDir::Down); }
+                    let swapped = match dir.as_str() {
+                        "U" => swap_pane(&mut app, FocusDir::Up),
+                        "D" => swap_pane(&mut app, FocusDir::Down),
+                        "L" => swap_pane(&mut app, FocusDir::Left),
+                        "R" => swap_pane(&mut app, FocusDir::Right),
+                        _ => swap_pane(&mut app, FocusDir::Down),
+                    };
+                    if swapped {
+                        meta_dirty = true;
+                        hook_event = Some("after-swap-pane");
                     }
-                    hook_event = Some("after-swap-pane");
+                }
+                CtrlReq::SwapPaneTarget(target, is_id) => {
+                    // tmux: swap-pane without -Z permanently unzooms (#82)
+                    unzoom_if_zoomed(&mut app);
+                    let path = {
+                        let win = &app.windows[app.active_idx];
+                        if is_id {
+                            crate::tree::find_path_by_id(&win.root, target)
+                        } else {
+                            match target.checked_sub(app.pane_base_index) {
+                                Some(idx) => crate::tree::path_by_position(&win.root, idx),
+                                None => None,
+                            }
+                        }
+                    };
+                    if let Some(path) = path {
+                        if swap_pane_with_path(&mut app, path) {
+                            meta_dirty = true;
+                            hook_event = Some("after-swap-pane");
+                        }
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", target), std::time::Instant::now(), None));
+                    }
+                }
+                CtrlReq::SwapPaneSrcDst { src, src_is_id, dst, dst_is_id, detach } => {
+                    // swap-pane -s <src> -t <dst>: swap two explicit panes (#442).
+                    // tmux: swap-pane without -Z permanently unzooms (#82)
+                    unzoom_if_zoomed(&mut app);
+                    fn resolve_pane_path(app: &AppState, val: usize, is_id: bool) -> Option<Vec<usize>> {
+                        let win = &app.windows[app.active_idx];
+                        if is_id {
+                            crate::tree::find_path_by_id(&win.root, val)
+                        } else {
+                            val.checked_sub(app.pane_base_index)
+                                .and_then(|idx| crate::tree::path_by_position(&win.root, idx))
+                        }
+                    }
+                    let sp = resolve_pane_path(&app, src, src_is_id);
+                    let dp = resolve_pane_path(&app, dst, dst_is_id);
+                    match (sp, dp) {
+                        (Some(sp), Some(dp)) => {
+                            if crate::window_ops::swap_pane_between(&mut app, sp, dp, detach) {
+                                meta_dirty = true;
+                                hook_event = Some("after-swap-pane");
+                            }
+                        }
+                        _ => {
+                            app.status_message = Some(("swap-pane: can't find pane".to_string(), std::time::Instant::now(), None));
+                        }
+                    }
+                }
+                CtrlReq::SwapPanePosition(token) => {
+                    // tmux: swap-pane without -Z permanently unzooms (#82)
+                    unzoom_if_zoomed(&mut app);
+                    if let Some(path) = crate::window_ops::pane_path_at_position(&app, &token) {
+                        if swap_pane_with_path(&mut app, path) {
+                            meta_dirty = true;
+                            hook_event = Some("after-swap-pane");
+                        }
+                    } else {
+                        app.status_message = Some((format!("swap-pane: can't find pane: {}", token), std::time::Instant::now(), None));
+                    }
                 }
                 CtrlReq::ResizePane(dir, amount) => {
-                    unzoom_if_zoomed(&mut app);
-                    match dir.as_str() {
-                        "U" | "D" => { resize_pane_vertical(&mut app, if dir == "U" { -(amount as i16) } else { amount as i16 }); }
-                        "L" | "R" => { resize_pane_horizontal(&mut app, if dir == "L" { -(amount as i16) } else { amount as i16 }); }
-                        _ => {}
+                    // A focused floating pane resizes itself (and its PTY) instead
+                    // of the tiled layout.
+                    let mut handled_float = false;
+                    {
+                        let win_w = app.last_window_area.width.max(10);
+                        let win_h = app.last_window_area.height.max(10);
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(fi) = win.floating_focus {
+                            if let Some(fp) = win.floating.get_mut(fi) {
+                                let d = amount as i16;
+                                match dir.as_str() {
+                                    "L" => fp.w = (fp.w as i16 - d).max(3) as u16,
+                                    "R" => fp.w = (fp.w as i16 + d).max(3) as u16,
+                                    "U" => fp.h = (fp.h as i16 - d).max(3) as u16,
+                                    "D" => fp.h = (fp.h as i16 + d).max(3) as u16,
+                                    _ => {}
+                                }
+                                fp.w = fp.w.min(win_w);
+                                fp.h = fp.h.min(win_h);
+                                let (nx, ny) = crate::floating::clamp_into(fp.x, fp.y, fp.w, fp.h, win_w, win_h);
+                                fp.x = nx; fp.y = ny;
+                                let inner_h = fp.h.saturating_sub(2).max(1);
+                                let inner_w = fp.w.saturating_sub(2).max(1);
+                                if fp.pane.last_rows != inner_h || fp.pane.last_cols != inner_w {
+                                    let _ = fp.pane.master.resize(portable_pty::PtySize { rows: inner_h, cols: inner_w, pixel_width: 0, pixel_height: 0 });
+                                    if let Ok(mut parser) = fp.pane.term.lock() { parser.screen_mut().set_size(inner_h, inner_w); }
+                                    fp.pane.last_rows = inner_h;
+                                    fp.pane.last_cols = inner_w;
+                                }
+                                handled_float = true;
+                            }
+                        }
                     }
-                    resize_all_panes(&mut app); meta_dirty = true;
-                    hook_event = Some("after-resize-pane");
+                    if handled_float {
+                        state_dirty = true;
+                    } else {
+                        unzoom_if_zoomed(&mut app);
+                        match dir.as_str() {
+                            "U" | "D" => { resize_pane_vertical(&mut app, if dir == "U" { -(amount as i16) } else { amount as i16 }); }
+                            "L" | "R" => { resize_pane_horizontal(&mut app, if dir == "L" { -(amount as i16) } else { amount as i16 }); }
+                            _ => {}
+                        }
+                        resize_all_panes(&mut app); meta_dirty = true;
+                        hook_event = Some("after-resize-pane");
+                    }
                 }
                 CtrlReq::SetBuffer(content) => {
                     app.paste_buffers.insert(0, content);
@@ -2522,6 +3334,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let _ = resp.send(result);
                 }
+                CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms) => {
+                    // Bare %N pane targeting (#332) — resolve the pane ID
+                    // globally across all windows and expand the format with
+                    // PANE_POS_OVERRIDE pointing at it.
+                    helpers::propagate_osc_titles(&mut app);
+                    let result = crate::format::expand_format_for_pane_by_id(&fmt, &app, pane_id);
+                    if set_status_bar {
+                        app.status_message = Some((result.clone(), Instant::now(), duration_ms));
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(result);
+                }
                 CtrlReq::LastWindow => {
                     if app.windows.len() > 1 && app.last_window_idx < app.windows.len() {
                         switch_with_copy_save(&mut app, |app| {
@@ -2588,11 +3412,26 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::JoinPane { src_win, src_pane, target_win, target_pane, horizontal }
                 | CtrlReq::MovePane { src_win, src_pane, target_win, target_pane, horizontal } => {
                     unzoom_if_zoomed(&mut app);
-                    // Resolve source window index (default: active window)
-                    let src_idx = src_win.unwrap_or(app.active_idx);
-                    // Resolve target window index (default: active window, but must differ from source)
-                    let raw_target_win = target_win.unwrap_or(app.active_idx);
-                    if src_idx < app.windows.len() && raw_target_win < app.windows.len() && src_idx != raw_target_win {
+                    // Resolve source/target display indices to Vec positions
+                    // (default: active window). win_pos honors gapped indices.
+                    let src_pos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+                    let tgt_pos = match target_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
+                    // Surface an explicit error instead of silently doing nothing when the
+                    // target cannot be resolved (issue #437). psmux defaults base-index to 0,
+                    // so a tmux user typing `join-pane -t :2` on a 2-window session targets a
+                    // non-existent window; the old silent no-op made join-pane appear broken.
+                    if src_pos.is_none() {
+                        app.status_message = Some((format!("join-pane: can't find source window: {}", src_win.unwrap_or(0)), Instant::now(), None));
+                        meta_dirty = true;
+                    } else if tgt_pos.is_none() {
+                        app.status_message = Some((format!("join-pane: can't find window: {}", target_win.unwrap_or(0)), Instant::now(), None));
+                        meta_dirty = true;
+                    } else if src_pos == tgt_pos {
+                        app.status_message = Some(("join-pane: can't join a pane to its own window".to_string(), Instant::now(), None));
+                        meta_dirty = true;
+                    } else {
+                        let src_idx = src_pos.unwrap();
+                        let raw_target_win = tgt_pos.unwrap();
                         // Resolve source pane path within source window
                         let src_path = if let Some(pidx) = src_pane {
                             // Get Nth pane path in DFS order
@@ -2626,6 +3465,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let tgt = if src_empty && raw_target_win > src_idx { raw_target_win - 1 } else { raw_target_win };
                             if src_empty {
                                 app.windows.remove(src_idx);
+                                app.on_window_removed(src_idx);
                                 if app.active_idx >= app.windows.len() {
                                     app.active_idx = app.windows.len().saturating_sub(1);
                                 }
@@ -2704,8 +3544,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = fp.child.kill();
                     }
                 }
-                CtrlReq::RespawnPane(workdir, kill) => {
-                    respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), kill)?;
+                CtrlReq::RespawnPane(workdir, kill, command, empty) => {
+                    respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), kill, command.as_deref(), empty)?;
                     hook_event = Some("after-respawn-pane");
                 }
                 CtrlReq::BindKey(table_name, key, command, repeat) => {
@@ -2777,6 +3617,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             *map = app.command_aliases.clone();
                         }
                     }
+                    // pane-border-status changes the effective content height (#288)
+                    if option == "pane-border-status" {
+                        resize_all_panes(&mut app);
+                    }
                     meta_dirty = true;
                     state_dirty = true;
                 }
@@ -2795,6 +3639,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         if let Ok(mut map) = shared_aliases_main.write() {
                             *map = app.command_aliases.clone();
                         }
+                    }
+                    // pane-border-status changes the effective content height (#288)
+                    if option == "pane-border-status" {
+                        resize_all_panes(&mut app);
                     }
                     meta_dirty = true;
                     state_dirty = true;
@@ -3022,6 +3870,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         crate::config::source_file(&mut app, &path);
                     }
+                    // source-file may change pane-border-status which
+                    // affects pane content height (#288)
+                    resize_all_panes(&mut app);
                     // Mark dirty so the client receives updated config
                     // (status bar, bindings, styles, etc.) on the next
                     // dump-state instead of getting an NC fast-path reply.
@@ -3030,7 +3881,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::MoveWindow(target) => {
                     if let Some(t) = target {
-                        if t < app.windows.len() && app.active_idx != t {
+                        if app.window_indices_valid() {
+                            // t is a display index; give it to the active window.
+                            app.move_active_window_to_index(t);
+                        } else if t < app.windows.len() && app.active_idx != t {
+                            // legacy Vec-position move (mock AppState)
                             let win = app.windows.remove(app.active_idx);
                             let insert_idx = if t > app.active_idx { t - 1 } else { t };
                             app.windows.insert(insert_idx.min(app.windows.len()), win);
@@ -3038,9 +3893,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::SwapWindow(target) => {
-                    if target < app.windows.len() && app.active_idx != target {
-                        app.windows.swap(app.active_idx, target);
+                CtrlReq::SwapWindow(src, target) => {
+                    // Both are display indices; map to Vec positions honoring gaps.
+                    // The two windows trade Vec positions while `window_indices`
+                    // stays put, so they exchange display numbers (tmux swap-window).
+                    let spos = match src { Some(d) => app.win_pos(d).unwrap_or(d), None => app.active_idx };
+                    let tpos = app.win_pos(target).unwrap_or(target);
+                    if spos != tpos && spos < app.windows.len() && tpos < app.windows.len() {
+                        app.windows.swap(spos, tpos);
                     }
                 }
                 CtrlReq::LinkWindow(src_idx_opt, dst_idx_opt) => {
@@ -3051,18 +3911,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if src < app.windows.len() {
                         let src_id = app.windows[src].id;
                         let src_name = app.windows[src].name.clone();
-                        let dst = dst_idx_opt.unwrap_or(app.windows.len());
                         let pty_system = portable_pty::native_pty_system();
-                        match crate::pane::create_window(&*pty_system, &mut app, None, None) {
+                        match crate::pane::create_window(&*pty_system, &mut app, None, None, false) {
                             Ok(()) => {
                                 let new_idx = app.windows.len() - 1;
                                 app.windows[new_idx].linked_from = Some(src_id);
                                 app.windows[new_idx].name = src_name;
-                                if dst < new_idx {
-                                    let win = app.windows.remove(new_idx);
-                                    app.windows.insert(dst, win);
-                                    if app.active_idx > dst && app.active_idx <= new_idx {
-                                        app.active_idx = app.active_idx.saturating_sub(1);
+                                if let Some(dst) = dst_idx_opt {
+                                    if app.window_indices_valid() {
+                                        // dst is a display index; place the newly
+                                        // created (active) linked window there.
+                                        app.move_active_window_to_index(dst);
+                                    } else if dst < new_idx {
+                                        let win = app.windows.remove(new_idx);
+                                        app.windows.insert(dst, win);
+                                        if app.active_idx > dst && app.active_idx <= new_idx {
+                                            app.active_idx = app.active_idx.saturating_sub(1);
+                                        }
                                     }
                                 }
                                 resize_all_panes(&mut app);
@@ -3080,8 +3945,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::UnlinkWindow => {
                     if app.windows.len() > 1 {
-                        let mut win = app.windows.remove(app.active_idx);
+                        let removed_pos = app.active_idx;
+                        let mut win = app.windows.remove(removed_pos);
                         kill_all_children(&mut win.root);
+                        app.on_window_removed(removed_pos);
                         if app.active_idx >= app.windows.len() {
                             app.active_idx = app.windows.len() - 1;
                         }
@@ -3098,19 +3965,41 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let mut output = String::new();
                     for (i, win) in app.windows.iter().enumerate() {
                         if win.name.contains(&pattern) {
-                            output.push_str(&format!("{}: {} []\n", i + app.window_base_index, win.name));
+                            output.push_str(&format!("{}: {} []\n", app.win_display_index(i), win.name));
                         }
                     }
                     let _ = resp.send(output);
                 }
                 CtrlReq::PipePane(cmd, stdin, stdout, toggle) => {
+                    // The `-t` target (if any) was temp-focused by the connection
+                    // layer before this request ran, so the active pane here IS the
+                    // requested target pane (issue #440 defect 2). The pipe binds to
+                    // this concrete pane_id and keeps receiving that pane's output
+                    // even after focus moves elsewhere.
                     let win = &app.windows[app.active_idx];
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
                     let has_existing = app.pipe_panes.iter().any(|p| p.pane_id == pane_id);
-                    
+
+                    // Drop any writer this pane's reader thread was teeing to
+                    // (issue #440). Dropping the ChildStdin closes the pipe so the
+                    // child sees EOF; the count gate is kept in sync so idle panes
+                    // pay nothing.
+                    let unregister_writer = |pid: usize| {
+                        if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
+                            let before = writers.len();
+                            writers.retain(|(id, _)| *id != pid);
+                            let removed = before - writers.len();
+                            if removed > 0 {
+                                crate::types::PIPE_PANE_COUNT
+                                    .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    };
+
                     if cmd.is_empty() {
                         // No command: close any existing pipe on this pane
                         if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            unregister_writer(pane_id);
                             if let Some(ref mut proc) = app.pipe_panes[idx].process {
                                 let _ = proc.kill();
                             }
@@ -3119,6 +4008,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else if toggle && has_existing {
                         // -o flag with existing pipe: close it (toggle off), don't start new
                         if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            unregister_writer(pane_id);
                             if let Some(ref mut proc) = app.pipe_panes[idx].process {
                                 let _ = proc.kill();
                             }
@@ -3127,6 +4017,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         // Close any existing pipe first (replace)
                         if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            unregister_writer(pane_id);
                             if let Some(ref mut proc) = app.pipe_panes[idx].process {
                                 let _ = proc.kill();
                             }
@@ -3134,7 +4025,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         // Start new pipe
                         let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
-                        let process = {
+                        let mut process = {
                             let mut c = std::process::Command::new(&shell_prog);
                             for a in &shell_args { c.arg(a); }
                             c.arg(&cmd);
@@ -3144,7 +4035,25 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             { use crate::platform::HideWindowCommandExt; c.hide_window(); }
                             c.spawn().ok()
                         };
-                        
+
+                        // Issue #440: hand the child's stdin to this pane's reader
+                        // thread so pane output is actually fed to the pipe command.
+                        // Without this the child blocked on an empty pipe forever and
+                        // the sink stayed 0 bytes. Only the output direction (`-O` /
+                        // default) registers a writer; `-I` (child stdout -> pane
+                        // input) is unchanged.
+                        if stdout {
+                            if let Some(child) = process.as_mut() {
+                                if let Some(stdin_handle) = child.stdin.take() {
+                                    if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
+                                        writers.push((pane_id, stdin_handle));
+                                        crate::types::PIPE_PANE_COUNT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+
                         app.pipe_panes.push(PipePaneState {
                             pane_id,
                             process,
@@ -3225,6 +4134,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if app.latest_client_id == Some(target_cid) {
                         app.latest_client_id = app.client_registry.keys().max().copied();
                     }
+                    // Send a clean DETACH directive first so the client exits instead
+                    // of treating the stream drop as a transient disconnect and
+                    // reconnecting. Only wait if the directive was actually queued; a
+                    // failed send means the client is already gone, so blocking the
+                    // server loop would buy nothing.
+                    if crate::types::send_directive_to_client(target_cid, "DETACH") {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     // Shut down the TCP stream to force disconnect
                     crate::types::shutdown_client_stream(target_cid);
                     // Recompute effective size from remaining clients
@@ -3238,11 +4155,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     });
                     hook_event = Some("client-detached");
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                        let regpath = crate::paths::port_file(&app.port_file_base());
+                        let keypath = crate::paths::key_file(&app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3258,9 +4175,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         .find(|(_, ci)| ci.tty_name == tty)
                         .map(|(cid, _)| *cid);
                     if let Some(cid) = target_cid {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(cid, "DETACH-KILL-PARENT");
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        // Send a clean directive first so the client exits instead of
+                        // reconnecting on the stream drop. -P also kills the parent.
+                        // Only wait if the directive was actually queued; a failed send
+                        // means the client is already gone.
+                        let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                        if crate::types::send_directive_to_client(cid, directive) {
+                            std::thread::sleep(Duration::from_millis(50));
                         }
                         app.client_sizes.remove(&cid);
                         let was_present = app.client_registry.remove(&cid).is_some();
@@ -3288,13 +4209,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         .filter(|(cid, _)| **cid != except_cid)
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
-                    for (cid, _tty) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        }
+                    // Send a clean directive to each target first so they exit instead
+                    // of reconnecting on the stream drop. -P also kills the parent.
+                    let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                    let mut any_sent = false;
+                    for (cid, _) in &targets {
+                        any_sent |= crate::types::send_directive_to_client(*cid, directive);
                     }
-                    if kill_parent && !targets.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Only wait if at least one directive was actually queued.
+                    if any_sent {
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
                         app.client_sizes.remove(cid);
@@ -3317,11 +4241,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                        let regpath = crate::paths::port_file(&app.port_file_base());
+                        let keypath = crate::paths::key_file(&app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3336,13 +4260,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let targets: Vec<(u64, String)> = app.client_registry.iter()
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
+                    // Send a clean directive to each client first so they exit instead
+                    // of reconnecting on the stream drop. -P also kills the parent.
+                    let directive = if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" };
+                    let mut any_sent = false;
                     for (cid, _) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        }
+                        any_sent |= crate::types::send_directive_to_client(*cid, directive);
                     }
-                    if kill_parent && !targets.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Only wait if at least one directive was actually queued.
+                    if any_sent {
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
                         app.client_sizes.remove(cid);
@@ -3364,11 +4291,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                        let regpath = crate::paths::port_file(&app.port_file_base());
+                        let keypath = crate::paths::key_file(&app.port_file_base());
                         let _ = std::fs::remove_file(&regpath);
                         let _ = std::fs::remove_file(&keypath);
+                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
@@ -3414,8 +4341,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         'l' => {
                             // Last session (read from last_session file)
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            let last_path = format!("{}\\.psmux\\last_session", home);
+                            let last_path = crate::paths::psmux_dir_file("last_session");
                             std::fs::read_to_string(&last_path).ok()
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty() && s != &current && all_sessions.contains(s))
@@ -3530,7 +4456,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::AppendHook(hook, cmd) => {
                     // -a/-ga: append to existing hook list so multiple
                     // plugins can register separate handlers (tmux semantics).
-                    app.hooks.entry(hook).or_insert_with(Vec::new).push(cmd);
+                    // Skip an identical command that is already registered: a
+                    // config re-sourced N times (e.g. a plugin panel firing
+                    // "Configuration reloaded" repeatedly) would otherwise
+                    // accumulate N copies of the same handler and fire all of
+                    // them every tick, spawning a runaway of processes for a
+                    // status-interval run-shell hook (issue #459). This mirrors
+                    // the replace path's dedup guard for issue #133.
+                    let entry = app.hooks.entry(hook).or_insert_with(Vec::new);
+                    if !entry.contains(&cmd) {
+                        entry.push(cmd);
+                    }
                 }
                 CtrlReq::ShowHooks(resp) => {
                     let mut output = String::new();
@@ -3569,11 +4505,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     // Remove port/key files FIRST so clients see the session
                     // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let regpath = crate::paths::port_file(&app.port_file_base());
+                    let keypath = crate::paths::key_file(&app.port_file_base());
                     let _ = std::fs::remove_file(&regpath);
                     let _ = std::fs::remove_file(&keypath);
+                    crate::types::send_directive_to_all_clients("DETACH");
+                    std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
                     // Kill all child processes using a single process snapshot
                     tree::kill_all_children_batch(&mut app.windows);
@@ -3639,21 +4576,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
                     if let Some(dir) = &start_dir { let _ = env::set_current_dir(dir); }
-                    if !command.is_empty() {
-                        // Spawn popup as a real Pane via the popup module
-                        let inner_h = height.saturating_sub(2);
-                        let inner_w = width.saturating_sub(2);
-                        let pane_result = crate::popup::create_popup_pane(
-                            &command,
-                            start_dir.as_deref(),
-                            inner_h,
-                            inner_w,
-                            app.next_pane_id,
-                            &app.session_name,
-                            &app.environment,
-                        );
-                        if let Some(prev) = saved_dir { let _ = env::set_current_dir(prev); }
-                        
+                    // Spawn the popup as a real PTY-backed Pane. An EMPTY command
+                    // means "run an interactive shell" (tmux parity, issue #351):
+                    // create_popup_pane() launches the shell as a REPL in that case.
+                    let inner_h = height.saturating_sub(2);
+                    let inner_w = width.saturating_sub(2);
+                    let pane_result = crate::popup::create_popup_pane(
+                        &command,
+                        start_dir.as_deref(),
+                        inner_h,
+                        inner_w,
+                        app.next_pane_id,
+                        &app.session_name,
+                        &app.environment,
+                    );
+                    if let Some(prev) = saved_dir { let _ = env::set_current_dir(prev); }
+
+                    if pane_result.is_some() {
                         app.mode = Mode::PopupMode {
                             command: command.clone(),
                             output: String::new(),
@@ -3664,12 +4603,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             popup_pane: pane_result,
                             scroll_offset: 0,
                         };
-                        state_dirty = true;
                     } else {
-                        if let Some(prev) = saved_dir { let _ = env::set_current_dir(prev); }
+                        // PTY spawn failed — fall back to a static, closable popup
+                        // so the user is never stuck with a blank, unresponsive box.
                         app.mode = Mode::PopupMode {
-                            command: String::new(),
-                            output: "Press 'q' or Escape to close\n".to_string(),
+                            command: command.clone(),
+                            output: "Failed to start popup shell. Press 'q' or Escape to close\n".to_string(),
                             process: None,
                             width,
                             height,
@@ -3677,7 +4616,71 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             popup_pane: None,
                             scroll_offset: 0,
                         };
+                    }
+                    state_dirty = true;
+                }
+                CtrlReq::NewFloat { command, x, y, w, h, border, title, start_dir, detached, empty, resp } => {
+                    // A floating pane (tmux new-pane): a PTY-backed pane rendered
+                    // over the active window's tiled layout. Flags match tmux:
+                    // -x/-y are SIZE, -X/-Y are POSITION. Reuses the popup pane
+                    // constructor for all PTY/vt100/reader-thread infrastructure.
+                    let win_w = app.last_window_area.width.max(10);
+                    let win_h = app.last_window_area.height.max(10);
+                    let (dw, dh) = crate::floating::default_size(win_w, win_h);
+                    // Panic-free clamp: min then max (win_w/win_h are >= 10 above).
+                    let fw = w.unwrap_or(dw).min(win_w).max(3);
+                    let fh = h.unwrap_or(dh).min(win_h).max(3);
+                    // Position via -X/-Y (top-left); else centred (tmux default).
+                    let (fx, fy) = if x.is_some() || y.is_some() {
+                        crate::floating::clamp_into(x.unwrap_or(0), y.unwrap_or(0), fw, fh, win_w, win_h)
+                    } else {
+                        crate::floating::resolve_position("centre", win_w, win_h, fw, fh)
+                    };
+                    let sd = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
+                    let inner_h = fh.saturating_sub(2).max(1);
+                    let inner_w = fw.saturating_sub(2).max(1);
+                    let pane_id = app.next_pane_id;
+                    // -E: an empty pane has no process (blank until respawn-pane).
+                    let pane_opt = if empty {
+                        crate::popup::create_empty_pane(inner_h, inner_w, pane_id)
+                    } else {
+                        crate::popup::create_popup_pane(
+                            &command,
+                            sd.as_deref(),
+                            inner_h,
+                            inner_w,
+                            pane_id,
+                            &app.session_name,
+                            &app.environment,
+                        )
+                    };
+                    if let Some(mut pane) = pane_opt {
+                        app.next_pane_id += 1;
+                        let title_str = title.clone().unwrap_or_default();
+                        if !title_str.is_empty() {
+                            pane.title = title_str.clone();
+                            pane.title_locked = true;
+                        }
+                        let border_style = if border.is_empty() { "single".to_string() } else { border.clone() };
+                        let fp = crate::types::FloatingPane {
+                            pane,
+                            x: fx, y: fy, w: fw, h: fh,
+                            border: border_style,
+                            id: pane_id,
+                            title: title_str,
+                            position: None,
+                        };
+                        let win = &mut app.windows[app.active_idx];
+                        win.floating.push(fp);
+                        if !detached {
+                            win.floating_focus = Some(win.floating.len() - 1);
+                        }
                         state_dirty = true;
+                        // -P: print the new pane id (tmux new-pane -P).
+                        if let Some(r) = resp { let _ = r.send(format!("%{}", pane_id)); }
+                    } else {
+                        app.status_message = Some(("new-pane: failed to start pane".to_string(), std::time::Instant::now(), None));
+                        if let Some(r) = resp { let _ = r.send(String::new()); }
                     }
                 }
                 CtrlReq::ConfirmBefore(prompt, cmd) => {
@@ -3700,10 +4703,42 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                 }
                 CtrlReq::ResizePaneAbsolute(axis, size) => {
-                    unzoom_if_zoomed(&mut app);
-                    resize_pane_absolute(&mut app, &axis, size);
-                    resize_all_panes(&mut app);
-                    hook_event = Some("after-resize-pane");
+                    // tmux: resize-pane -x/-y sets the focused float's absolute
+                    // OUTER size (and its PTY) instead of the tiled pane.
+                    let mut handled_float = false;
+                    {
+                        let win_w = app.last_window_area.width.max(10);
+                        let win_h = app.last_window_area.height.max(10);
+                        let win = &mut app.windows[app.active_idx];
+                        if let Some(fi) = win.floating_focus {
+                            if let Some(fp) = win.floating.get_mut(fi) {
+                                match axis.as_str() {
+                                    "x" => fp.w = size.max(3).min(win_w),
+                                    "y" => fp.h = size.max(3).min(win_h),
+                                    _ => {}
+                                }
+                                let (nx, ny) = crate::floating::clamp_into(fp.x, fp.y, fp.w, fp.h, win_w, win_h);
+                                fp.x = nx; fp.y = ny;
+                                let inner_h = fp.h.saturating_sub(2).max(1);
+                                let inner_w = fp.w.saturating_sub(2).max(1);
+                                if fp.pane.last_rows != inner_h || fp.pane.last_cols != inner_w {
+                                    let _ = fp.pane.master.resize(portable_pty::PtySize { rows: inner_h, cols: inner_w, pixel_width: 0, pixel_height: 0 });
+                                    if let Ok(mut parser) = fp.pane.term.lock() { parser.screen_mut().set_size(inner_h, inner_w); }
+                                    fp.pane.last_rows = inner_h;
+                                    fp.pane.last_cols = inner_w;
+                                }
+                                handled_float = true;
+                            }
+                        }
+                    }
+                    if handled_float {
+                        state_dirty = true;
+                    } else {
+                        unzoom_if_zoomed(&mut app);
+                        resize_pane_absolute(&mut app, &axis, size);
+                        resize_all_panes(&mut app);
+                        hook_event = Some("after-resize-pane");
+                    }
                 }
                 CtrlReq::ResizePanePercent(axis, pct) => {
                     unzoom_if_zoomed(&mut app);
@@ -3752,8 +4787,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.windows.len(),
                         (chrono::Local::now() - app.created_at).num_seconds(),
                         {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            format!("{}\\.psmux\\{}.port", home, app.port_file_base())
+                            crate::paths::port_file(&app.port_file_base())
                         }
                     );
                     let _ = resp.send(info);
@@ -3849,8 +4883,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::RespawnWindow => {
-                    // Kill all panes in the active window and respawn	
-                    respawn_active_pane(&mut app, Some(&*pty_system), None, true)?;
+                    // Kill all panes in the active window and respawn
+                    respawn_active_pane(&mut app, Some(&*pty_system), None, true, None, false)?;
                     state_dirty = true;
                 }
                 CtrlReq::PopupInput(data) => {
@@ -4057,8 +5091,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::ControlDeregister { client_id } => {
                     app.control_clients.remove(&client_id);
-                    app.client_registry.remove(&client_id);
-                    app.attached_clients = app.attached_clients.saturating_sub(1);
+                    // Idempotent reap keeps the counter in lock-step with the
+                    // registry even if a control client is deregistered twice.
+                    app.reap_client(client_id);
                 }
                 CtrlReq::CustomizeMode => {
                     let options = crate::server::option_catalog::build_option_list(&app);
@@ -4332,18 +5367,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
             let layout_json = dump_layout_json_fast(&mut app)?;
             combined_buf.clear();
-            let ss_escaped = json_escape_string(&cached_status_style);
+            // #372: style options must be format-expanded too (see persistent
+            // path above). wsf/wscf stay raw: per-window formats the client
+            // expands with each window's own context.
+            let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
             let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
             let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-            let pbs_escaped = json_escape_string(&app.pane_border_style);
-            let pabs_escaped = json_escape_string(&app.pane_active_border_style);
-            let pbhs_escaped = json_escape_string(&app.pane_border_hover_style);
+            let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
+            let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
+            let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
             let wsf_escaped = json_escape_string(&app.window_status_format);
             let wscf_escaped = json_escape_string(&app.window_status_current_format);
-            let wss_escaped = json_escape_string(&app.window_status_separator);
-            let ws_style_escaped = json_escape_string(&app.window_status_style);
-            let wsc_style_escaped = json_escape_string(&app.window_status_current_style);
-            let mode_style_escaped = json_escape_string(&app.mode_style);
+            let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
+            let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
+            let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
+            let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+            // #372: message-style was never sent to the client (it hard-coded
+            // bg=yellow,fg=black). Send it, format-expanded.
+            let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
             let status_position_escaped = json_escape_string(&app.status_position);
             let status_justify_escaped = json_escape_string(&app.status_justify);
             let status_format_json = {
@@ -4359,17 +5400,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             };
             let cursor_style_code = crate::rendering::configured_cursor_code();
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"choose_tree_preview\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
-                mode_style_escaped, status_position_escaped, status_justify_escaped,
+                mode_style_escaped, message_style_escaped, status_position_escaped, status_justify_escaped,
                 cursor_style_code, app.status_visible, app.repeat_time_ms,
                 app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
                 app.pwsh_mouse_selection,
                 app.mouse_selection,
+                app.paste_detection,
                 app.choose_tree_preview,
+                app.scroll_enter_copy_mode,
+                app.bold_is_bright,
             ));
+            // #451: append status-bar style options dropped in the
+            // app.rs->client.rs modularization.
+            helpers::append_extra_style_json(&mut combined_buf, &app);
             // Inject overlay state (popup, menu, confirm, display_panes)
             {
                 // Inject clock_colour if set
@@ -4396,6 +5443,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         combined_buf.push('}');
                     }
                 }
+                // Inject pane-border-lines independently — it may be set
+                // without pane-border-status.
+                if let Some(pbl) = app.user_options.get("pane-border-lines") {
+                    if combined_buf.ends_with('}') {
+                        combined_buf.pop();
+                        combined_buf.push_str(",\"pane_border_lines\":\"");
+                        combined_buf.push_str(&json_escape_string(pbl));
+                        combined_buf.push('"');
+                        combined_buf.push('}');
+                    }
+                }
+                helpers::append_copy_ln_json(&app, &mut combined_buf);
+                helpers::append_floats_json(&app, &mut combined_buf);
                 // set-titles: when on, expand set-titles-string and ship
                 // it so the client emits OSC 0 to its host terminal.
                 if app.set_titles && combined_buf.ends_with('}') {
@@ -4426,6 +5486,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     combined_buf.push('}');
                 }
             }
+            // Forward OSC 52 from pane child processes (e.g. Claude Code
+            // `/copy`).  See sibling block in the dump-state response path
+            // for full context.  Gated by `set-clipboard`.
+            if app.set_clipboard != "off" && app.clipboard_osc52.is_none() {
+                if let Some((_sel, b64)) = take_pane_clipboard(&app) {
+                    if let Ok(b64_str) = std::str::from_utf8(&b64) {
+                        if let Some(text) = crate::util::base64_decode(b64_str) {
+                            app.clipboard_osc52 = Some(text);
+                        }
+                    }
+                }
+            }
             // Inject clipboard data if pending
             if let Some(clip_text) = app.clipboard_osc52.take() {
                 let clip_b64 = base64_encode(&clip_text);
@@ -4451,7 +5523,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             crate::types::push_frame(&combined_buf);
         }
         // ── Status-interval timer: fire hooks periodically ──
-        if app.status_interval > 0 {
+        if app.should_run_status_interval_timer() {
             let elapsed = app.last_status_interval_fire.elapsed().as_secs();
             if elapsed >= app.status_interval {
                 app.last_status_interval_fire = std::time::Instant::now();
@@ -4560,9 +5632,80 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 state_dirty = true;
             }
         }
+        // Reap exited floating panes (tmux new-pane) across all windows: a float
+        // whose child process has exited is removed, and the focus index is
+        // fixed up so it never dangles past the end of the vec.
+        for win in app.windows.iter_mut() {
+            if win.floating.is_empty() { continue; }
+            let before = win.floating.len();
+            win.floating.retain_mut(|fp| !matches!(fp.pane.child.try_wait(), Ok(Some(_))));
+            if win.floating.len() != before {
+                // Simplest correct focus fix: focus the last remaining float, or
+                // drop focus entirely when none remain.
+                win.floating_focus = if win.floating.is_empty() {
+                    None
+                } else {
+                    Some(win.floating.len() - 1)
+                };
+                state_dirty = true;
+            }
+        }
         // Check if all windows/panes have exited (throttled to every 250ms)
         if last_reap.elapsed() >= Duration::from_millis(100) {
             last_reap = Instant::now();
+            // #450: self-heal the warm pane pool.  The spare shell can die
+            // while idling (shell crash, external kill, dead conhost); the
+            // consume-time gate in create_window/split then falls back to a
+            // cold spawn, but replacing the corpse here keeps the next
+            // new-window on the instant warm path.
+            let warm_dead = app.warm_pane.as_mut()
+                .map(|wp| !crate::pane::warm_pane_is_live(wp))
+                .unwrap_or(false);
+            if warm_dead {
+                if let Some(mut dead) = app.warm_pane.take() { dead.child.kill().ok(); }
+                if let Ok(nw) = spawn_warm_pane(&*pty_system, &mut app) {
+                    app.warm_pane = Some(nw);
+                }
+            }
+            // #450 (opt-in `@heal-crashed-panes`): a shell can FailFast on its
+            // very first ConPTY read right after a warm-pane transplant (pwsh
+            // whose PSReadLine is not the active reader hits ERROR_INVALID_PARAMETER
+            // in its fallback ReadLineFromFile). The pane passed the consume-time
+            // liveness gate, then died a beat later, so the reaper would prune it
+            // to a broken/empty window. If a pane's shell exits within a short
+            // grace window of being spawned, treat it as crash-on-startup and
+            // respawn a fresh shell IN PLACE (at most once per pane) so the user
+            // still gets a working window. Runs BEFORE reap so the revived pane
+            // is not pruned.
+            if app.heal_crashed_panes() {
+                let grace = Duration::from_millis(4000);
+                let mut to_heal: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+                for wi in 0..app.windows.len() {
+                    for id in tree::collect_pane_ids(&app.windows[wi].root) {
+                        if app.healed_pane_ids.contains(&id) { continue; }
+                        let Some(path) = tree::find_path_by_id(&app.windows[wi].root, id) else { continue; };
+                        if let Some(pane) = tree::active_pane_mut(&mut app.windows[wi].root, &path) {
+                            let young = pane.spawned_at.map(|t| t.elapsed() < grace).unwrap_or(false);
+                            if !young { continue; }
+                            if matches!(pane.child.try_wait(), Ok(Some(_))) {
+                                to_heal.push((wi, path, id));
+                            }
+                        }
+                    }
+                }
+                for (wi, path, id) in to_heal {
+                    match crate::window_ops::heal_respawn_pane(&mut app, &*pty_system, wi, &path) {
+                        Ok(()) => {
+                            app.healed_pane_ids.insert(id);
+                            state_dirty = true;
+                            crate::debug_log::server_log("heal", &format!(
+                                "respawned crashed pane {} in window {} (@heal-crashed-panes)", id, wi));
+                        }
+                        Err(e) => crate::debug_log::server_log("heal", &format!(
+                            "heal respawn failed for pane {}: {}", id, e)),
+                    }
+                }
+            }
             // Snapshot per-window state BEFORE reap so we can diff and emit
             // accurate %window-close / %layout-change / %window-pane-changed
             // notifications to control-mode clients (iTerm2 etc.).  Without
@@ -4638,6 +5781,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 crate::commands::fire_hooks(&mut app, "pane-exited");
             }
             if app.exit_empty && all_empty {
+                warm_debug(&format!("EXIT_EMPTY firing for session '{}' (all panes empty/dead) -> removing port file + process::exit", app.session_name));
                 // Notify CC clients that the session is ending so iTerm2
                 // closes the native window cleanly (same path as KillServer).
                 if !app.control_clients.is_empty() {
@@ -4649,11 +5793,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // the DCS stream before we tear down the process.
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                let regpath = crate::paths::port_file(&app.port_file_base());
+                let keypath = crate::paths::key_file(&app.port_file_base());
                 let _ = std::fs::remove_file(&regpath);
                 let _ = std::fs::remove_file(&keypath);
+                crate::types::send_directive_to_all_clients("DETACH");
+                std::thread::sleep(Duration::from_millis(50));
                 crate::types::shutdown_persistent_streams();
                 // Kill warm pane's child (process::exit skips Drop)
                 if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
@@ -4690,3 +5835,7 @@ mod test_new_session_env;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue167_startup_log.rs"]
 mod test_issue167_startup_log;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
+mod test_issue370_startup_error_passthrough;

@@ -1,10 +1,10 @@
 use super::*;
 use std::fs;
-use std::sync::Mutex;
 
-/// Global mutex to serialize tests that modify environment variables.
-/// Prevents race conditions when cargo runs tests in parallel.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+// Env-mutating tests serialise through crate::util::lock_test_env(), a single
+// process-wide lock shared with the other env-touching test modules (see
+// util.rs). A per-module mutex is not enough: USERPROFILE/HOME are
+// process-global, so two modules with separate mutexes can still collide.
 
 /// Helper: build a fresh AppState for testing.
 fn mock_app() -> AppState {
@@ -46,7 +46,7 @@ impl Drop for EnvGuard {
 /// the @plugin auto-source must find it — not only check ~/.psmux/plugins/.
 #[test]
 fn plugin_discovery_finds_xdg_path() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join("psmux_test_xdg_plugin");
     let _ = fs::remove_dir_all(&tmp);
 
@@ -74,7 +74,7 @@ fn plugin_discovery_finds_xdg_path() {
 /// it should still be found (regression guard).
 #[test]
 fn plugin_discovery_still_finds_classic_path() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join("psmux_test_classic_plugin");
     let _ = fs::remove_dir_all(&tmp);
 
@@ -101,7 +101,7 @@ fn plugin_discovery_still_finds_classic_path() {
 /// at ~/.config/psmux/plugins/, psmux's run-shell should fall back to the XDG path.
 #[test]
 fn run_shell_tilde_psmux_fallback_to_xdg() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join("psmux_test_runshell_fallback");
     let _ = fs::remove_dir_all(&tmp);
 
@@ -125,7 +125,7 @@ fn run_shell_tilde_psmux_fallback_to_xdg() {
 /// XDG path with short plugin name (no org/ prefix) should also be found.
 #[test]
 fn plugin_discovery_xdg_short_name() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join("psmux_test_xdg_short");
     let _ = fs::remove_dir_all(&tmp);
 
@@ -152,7 +152,7 @@ fn plugin_discovery_xdg_short_name() {
 /// XDG PS1 plugin discovery should also work.
 #[test]
 fn plugin_discovery_xdg_ps1_entry() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = crate::util::lock_test_env();
     let tmp = std::env::temp_dir().join("psmux_test_xdg_ps1");
     let _ = fs::remove_dir_all(&tmp);
 
@@ -175,6 +175,42 @@ fn plugin_discovery_xdg_ps1_entry() {
             "Pending script path should use XDG location, got: {}", script
         );
     }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A '#branch' suffix on the spec must not shadow the plugin name. Branch names
+/// may contain '/' (e.g. 'temp/integration'), so deriving the name from the last
+/// '/' segment of 'MattKotsenas/psmux-plugins/psmux-test-branch#temp/integration'
+/// would pick 'integration' and miss the plugin; the '#branch' suffix is stripped
+/// first. Regression guard.
+#[test]
+fn plugin_discovery_strips_branch_suffix() {
+    let _lock = crate::util::lock_test_env();
+    let tmp = std::env::temp_dir().join("psmux_test_branch_suffix");
+    let _ = fs::remove_dir_all(&tmp);
+
+    let plugin_dir = tmp.join(".psmux").join("plugins").join("psmux-test-branch");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("plugin.conf"),
+        "set -g @test-branch-option 'branch-found'\n",
+    ).unwrap();
+
+    let _env = EnvGuard::new(tmp.to_str().unwrap());
+
+    let mut app = mock_app();
+    parse_config_content(
+        &mut app,
+        "set -g @plugin 'MattKotsenas/psmux-plugins/psmux-test-branch#temp/integration'\n",
+    );
+
+    let val = app.user_options.get("@test-branch-option");
+    assert_eq!(
+        val.map(|s| s.as_str()),
+        Some("branch-found"),
+        "A '#temp/integration' branch suffix must not shadow the plugin name"
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }

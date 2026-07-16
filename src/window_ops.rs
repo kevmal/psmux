@@ -158,6 +158,29 @@ pub(crate) fn is_fullscreen_tui(pane: &Pane) -> bool {
         if screen.alternate_screen() {
             return true;
         }
+
+        // Issue #381: a plain shell whose output has merely filled the screen
+        // is NOT a fullscreen TUI. Under git bash the fill heuristic below
+        // false-positives once enough output fills the bottom rows with the
+        // prompt at the cursor, so psmux forwarded mouse motion to the shell,
+        // which echoed it as raw SGR text ("15M65;61;..."). If the foreground
+        // process is a shell, skip the heuristic and report "not fullscreen".
+        //
+        // Gate on `== Some(true)`, NOT `.is_some()`: foreground_is_shell returns
+        // Some(false) for a genuine NON-shell fullscreen app (nvim, htop), and
+        // that case must still fall through to the heuristic that #285 relies on
+        // for mouse support on ConPTY builds that strip the mouse DECSETs. Using
+        // `.is_some()` here fires for Some(false) too and would suppress
+        // detection of real TUIs, regressing #285.
+        let foreground_is_shell = pane
+            .child_pid
+            .and_then(crate::platform::process_info::foreground_is_shell)
+            == Some(true);
+
+        if foreground_is_shell {
+            return false;
+        }
+
         // Heuristic: check if many of the last rows are non-blank AND the
         // cursor is near the bottom.  Fullscreen TUI apps fill the entire
         // screen and keep the cursor near the bottom (status bars, menus).
@@ -193,38 +216,81 @@ pub(crate) fn is_fullscreen_tui(pane: &Pane) -> bool {
     false
 }
 
-/// Check if the child process in this pane has enabled mouse tracking
-/// (DECSET 1000/1002/1003) and therefore wants to receive scroll wheel events.
+/// Check if the child process in this pane wants to receive mouse events.
 ///
-/// This is the same logic tmux uses: if mouse_protocol_mode != None, the
-/// child app (vim, htop, less -R, etc.) handles mouse itself, so psmux
-/// forwards scroll events to it.  If None (shell prompt), psmux enters
-/// copy mode on scroll-up, matching tmux behavior with `set -g mouse on`.
+/// Uses a three-tier detection strategy:
 ///
-/// Note: ConPTY strips DECSET mouse mode escape sequences from the output
-/// stream, so for native Windows console apps `mouse_protocol_mode()` is
-/// always `None`.  This is correct: native Windows TUI apps receive mouse
-/// via Win32 MOUSE_EVENT injection (separate path), and shell prompts
-/// (PowerShell, cmd) don't want scroll events at all — scrollback is the
-/// right behavior.
+///   1. **mouse_protocol_mode** (DECSET 1000/1002/1003) — authoritative for
+///      VT bridge children (WSL, SSH) where escape sequences pass through.
+///   2. **alternate_screen** (DECSET 1049h) — works on Windows 11+ where
+///      ConPTY passes DECSET 1049h to the output stream.
+///   3. **is_fullscreen_tui heuristic** — fallback for older Windows 10
+///      builds where ConPTY strips both DECSET 1000 and DECSET 1049h.
+///      Detects fullscreen TUI apps (nvim, htop, vim) by checking that the
+///      last rows are filled and the cursor is near the bottom.
 ///
-/// For apps running through a VT bridge (WSL, SSH), the VT escape sequences
-/// DO pass through, so `mouse_protocol_mode()` correctly reflects the
-/// child's actual mouse tracking state.
+/// Without tier 3, native TUI apps on older Windows never receive mouse
+/// events because ConPTY makes both tier 1 and tier 2 return false.
+/// (fixes #285, regression from commit 719e604)
 pub(crate) fn pane_wants_mouse(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
         let screen = parser.screen();
-        // Primary check (tmux parity): did the child enable mouse protocol?
+        // Tier 1: did the child enable mouse protocol? (VT bridge children)
         if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
             return true;
         }
-        // Secondary check: alternate screen active (ConPTY may strip DECSET
-        // 1000 but some builds pass DECSET 1049h through).
+        // Tier 2: alternate screen active (newer ConPTY passes DECSET 1049h)
+        if screen.alternate_screen() {
+            return true;
+        }
+    }
+    // Tier 3: heuristic for older ConPTY that strips DECSET 1049h —
+    // detect fullscreen TUI apps by screen content analysis.
+    is_fullscreen_tui(pane)
+}
+
+/// Stricter than `pane_wants_mouse`, used ONLY for the scroll-wheel decision.
+///
+/// The wheel must auto-enter copy mode for an ordinary shell pane (tmux parity,
+/// issue #360).  `pane_wants_mouse`'s tier-3 `is_fullscreen_tui` content
+/// heuristic returns true for a normal shell that has filled the screen with
+/// the prompt sitting at the bottom, which wrongly forwarded the wheel to the
+/// shell (it ignores SGR wheel) instead of entering copy mode.  For scroll we
+/// only forward when the child RELIABLY wants the mouse: it enabled a mouse
+/// protocol (e.g. nvim `set mouse=a`) or is on the alternate screen.  TUI apps
+/// that genuinely consume the wheel satisfy one of these even on older ConPTY
+/// (the mouse protocol DECSETs are not stripped); apps that satisfy neither do
+/// not interpret the wheel anyway, so copy-mode scrollback is the right thing.
+pub(crate) fn pane_wants_scroll_forward(pane: &Pane) -> bool {
+    if let Ok(parser) = pane.term.lock() {
+        let screen = parser.screen();
+        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            return true;
+        }
         if screen.alternate_screen() {
             return true;
         }
     }
     false
+}
+
+/// Strict check for hover/motion events.  Returns true only when the child
+/// has EXPLICITLY enabled mouse motion tracking (DECSET 1002 ButtonMotion or
+/// DECSET 1003 AnyMotion).
+///
+/// Unlike `pane_wants_mouse()`, this does NOT use alt-screen or fullscreen
+/// heuristics.  Sending unsolicited SGR motion sequences to apps that haven't
+/// enabled mouse tracking (e.g. nvim without `set mouse=a`, or any TUI app
+/// that only uses alt-screen for rendering) corrupts their input and makes
+/// them appear hung.  (fixes #296)
+pub(crate) fn pane_wants_hover(pane: &Pane) -> bool {
+    if let Ok(parser) = pane.term.lock() {
+        let screen = parser.screen();
+        matches!(screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion)
+    } else {
+        false
+    }
 }
 
 /// Detect whether a pane has a VT bridge descendant (wsl.exe, ssh.exe, etc.)
@@ -482,7 +548,7 @@ pub fn update_tab_positions(app: &mut AppState) {
     cursor_x += session_label_len;
     // Window tabs: "idx: window_name " for each window
     for (i, w) in app.windows.iter().enumerate() {
-        let display_idx = i + app.window_base_index;
+        let display_idx = app.win_display_index(i);
         let label = format!("{}: {} ", display_idx, w.name);
         let start_x = cursor_x;
         cursor_x += label.len() as u16;
@@ -498,6 +564,34 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     let status_row = app.last_window_area.y + app.last_window_area.height;
     if y == status_row {
         return;
+    }
+
+    // Floating panes sit above the tiled layout: a click inside a float grabs
+    // it (tmux moves/resizes floats by dragging) and gives it focus. The
+    // bottom-right edge starts a resize; the body starts a move.
+    {
+        let ox = app.last_window_area.x;
+        let oy = app.last_window_area.y;
+        let hit = {
+            let win = &app.windows[app.active_idx];
+            win.floating.iter().enumerate().rev().find_map(|(i, fp)| {
+                let x0 = ox + fp.x; let y0 = oy + fp.y;
+                if x >= x0 && x < x0 + fp.w && y >= y0 && y < y0 + fp.h {
+                    Some((i, x0, y0, fp.w, fp.h))
+                } else { None }
+            })
+        };
+        if let Some((i, x0, y0, w, h)) = hit {
+            let on_edge = x >= x0 + w.saturating_sub(1) || y >= y0 + h.saturating_sub(1);
+            let mode = if on_edge {
+                crate::types::FloatDragMode::Resize
+            } else {
+                crate::types::FloatDragMode::Move { dx: x - x0, dy: y - y0 }
+            };
+            app.windows[app.active_idx].floating_focus = Some(i);
+            app.float_drag = Some(crate::types::FloatDrag { index: i, mode });
+            return;
+        }
     }
 
     let win = &mut app.windows[app.active_idx];
@@ -560,6 +654,44 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+
+    // A floating-pane drag moves or resizes the grabbed float, following the
+    // cursor. Runs before any tiled handling and short-circuits it.
+    if let Some(fd) = app.float_drag {
+        let ox = app.last_window_area.x;
+        let oy = app.last_window_area.y;
+        let win_w = app.last_window_area.width.max(10);
+        let win_h = app.last_window_area.height.max(10);
+        let win = &mut app.windows[app.active_idx];
+        if let Some(fp) = win.floating.get_mut(fd.index) {
+            match fd.mode {
+                crate::types::FloatDragMode::Move { dx, dy } => {
+                    let nx = x.saturating_sub(ox).saturating_sub(dx);
+                    let ny = y.saturating_sub(oy).saturating_sub(dy);
+                    let (cx, cy) = crate::floating::clamp_into(nx, ny, fp.w, fp.h, win_w, win_h);
+                    fp.x = cx; fp.y = cy;
+                }
+                crate::types::FloatDragMode::Resize => {
+                    let x0 = ox + fp.x;
+                    let y0 = oy + fp.y;
+                    fp.w = (x.saturating_sub(x0) + 1).max(3).min(win_w);
+                    fp.h = (y.saturating_sub(y0) + 1).max(3).min(win_h);
+                    let (cx, cy) = crate::floating::clamp_into(fp.x, fp.y, fp.w, fp.h, win_w, win_h);
+                    fp.x = cx; fp.y = cy;
+                    let inner_h = fp.h.saturating_sub(2).max(1);
+                    let inner_w = fp.w.saturating_sub(2).max(1);
+                    if fp.pane.last_rows != inner_h || fp.pane.last_cols != inner_w {
+                        let _ = fp.pane.master.resize(portable_pty::PtySize { rows: inner_h, cols: inner_w, pixel_width: 0, pixel_height: 0 });
+                        if let Ok(mut parser) = fp.pane.term.lock() { parser.screen_mut().set_size(inner_h, inner_w); }
+                        fp.pane.last_rows = inner_h;
+                        fp.pane.last_cols = inner_w;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -602,6 +734,11 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // End any floating-pane drag.
+    if app.float_drag.is_some() {
+        app.float_drag = None;
+        return;
+    }
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -691,10 +828,13 @@ pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press
 
 /// Forward bare mouse motion (hover) to the child PTY.
 ///
-/// Only forwarded when the active pane explicitly wants mouse input
-/// (`pane_wants_mouse`).  Shell prompts and ClaudeCode-style inputs are
-/// excluded because they do not enable mouse tracking, and sending raw SGR
-/// motion bytes (ESC[<35;...) would appear as visible garbage.
+/// Only forwarded when the child has EXPLICITLY enabled mouse motion
+/// tracking (`pane_wants_hover`, DECSET 1002/1003).  Do NOT use the
+/// permissive pane_wants_mouse() heuristic here: its is_fullscreen_tui
+/// tier false-positives on a filled screen with a NON-shell foreground
+/// (podman/docker interactive containers, discussion #349), spraying raw
+/// SGR motion bytes (35;x;yM...) into the container tty as visible garbage.
+/// This matches the local input path, which was fixed the same way in #296.
 ///
 /// SGR button 35 = bare motion with no button held (WT parity).
 /// Windows Terminal encodes hover as WM_MOUSEMOVE -> button 3 + 0x20 = 35.
@@ -713,16 +853,16 @@ pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    // Forward hover only when the active pane explicitly wants mouse input.
+    // Forward hover only when the child explicitly enabled motion tracking.
     // This avoids leaking raw SGR motion bytes (ESC[<35;...) into shell-style
-    // prompts such as claudecode input boxes.
+    // prompts such as claudecode input boxes and container ttys (#349).
     mouse_log(&format!("remote_mouse_motion: x={} y={}", x, y));
 
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
         let (col, row) = pane_inner_cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            if pane_wants_mouse(active) {
+            if pane_wants_hover(active) {
                 inject_mouse_combined(active, col, row, 35, true,
                     0, mouse_inject::MOUSE_MOVED, &win_name);
             }
@@ -775,21 +915,18 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         return;
     }
 
-    // Determine target pane, switch focus, and check if child is in alternate screen.
+    // Determine target pane, switch focus, and check if child is a TUI app
+    // that should receive scroll events.
     //
-    // IMPORTANT (tmux parity): For scroll events, we ONLY check alternate_screen()
-    // to decide whether to forward to the child or enter copy mode.
+    // Detection strategy (same as pane_wants_mouse, fixes #285):
+    //   1. alternate_screen() — authoritative on newer Windows 11+ ConPTY
+    //   2. is_fullscreen_tui() heuristic — fallback for older Windows 10
+    //      builds where ConPTY strips DECSET 1049h.
     //
-    // We do NOT use:
-    //   - pane_wants_mouse() / mouse_protocol_mode(): PSReadLine on ConPTY
-    //     spuriously enables AnyMotion mouse tracking.
-    //   - is_fullscreen_tui() heuristic: A shell prompt after `ls` / `dir` can
-    //     fill the last rows + leave the cursor at the bottom, causing a false
-    //     positive that prevents scroll-to-copy-mode.
-    //
-    // alternate_screen() is reliable: all modern TUI apps (nvim, htop, vim,
-    // opencode) correctly report alternate screen through ConPTY.  Testing
-    // confirms nvim shows alternate_on=1.  Shell prompts always show 0.
+    // Note: is_fullscreen_tui() may false-positive after `ls`/`dir` fills
+    // the screen (preventing scroll-to-copy-mode briefly), but this is far
+    // less harmful than completely breaking scroll in TUI apps like Neovim
+    // on older Windows.
     let (child_in_alt_screen, target_area_opt, sgr_btn, button_state) = {
         let win = &mut app.windows[app.active_idx];
         let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
@@ -811,12 +948,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         }
 
         let alt = active_pane(&win.root, &win.active_path)
-            .map_or(false, |p| {
-                if let Ok(parser) = p.term.lock() {
-                    return parser.screen().alternate_screen();
-                }
-                false
-            });
+            .map_or(false, |p| pane_wants_mouse(p));
         let sgr_btn: u8 = if up { 64 } else { 65 };
         let wheel_delta: i16 = if up { 120 } else { -120 };
         let bs = ((wheel_delta as i32) << 16) as u32;
@@ -923,11 +1055,21 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
         return;
     }
 
-    // Forward mouse event to PTY if pane wants it
+    // Forward mouse event to PTY if pane wants it.
+    //
+    // Bare motion (SGR button 35, no button held) requires the child to have
+    // EXPLICITLY enabled motion tracking (pane_wants_hover, DECSET 1002/1003).
+    // The permissive pane_wants_mouse() heuristic false-positives on a filled
+    // screen with a non-shell foreground (podman/docker interactive containers,
+    // discussion #349), which sprayed "35;x;yM" as visible garbage into the
+    // container tty on every mouse move.  Clicks/drags/wheel keep the
+    // permissive gate so TUI mouse support on ConPTY builds that strip the
+    // DECSETs keeps working (#285).
     let win = &mut app.windows[app.active_idx];
     let win_name = win.name.clone();
     if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
-        if pane_wants_mouse(pane) {
+        let wants = if button == 35 { pane_wants_hover(pane) } else { pane_wants_mouse(pane) };
+        if wants {
             let button_state = match (button, press) {
                 (0, true) => mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
                 (1, true) => mouse_inject::FROM_LEFT_2ND_BUTTON_PRESSED,
@@ -971,11 +1113,13 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         }
     }
 
-    // Check if target pane is in alternate screen (TUI app)
+    // Use the stricter scroll-forward check (mouse protocol or alternate
+    // screen only).  The permissive pane_wants_mouse() heuristic misclassifies
+    // a normal shell that has filled the screen (prompt at the bottom) as a TUI
+    // app, so the wheel was forwarded to the shell instead of entering copy
+    // mode (#360).
     let alt = active_pane(&win.root, &win.active_path)
-        .map_or(false, |p| {
-            p.term.lock().ok().map_or(false, |t| t.screen().alternate_screen())
-        });
+        .map_or(false, |p| pane_wants_scroll_forward(p));
 
     if alt {
         // Forward scroll to TUI app
@@ -1035,7 +1179,7 @@ pub fn handle_split_resize_done(app: &mut AppState) {
     resize_all_panes(app);
 }
 
-pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
+pub fn swap_pane(app: &mut AppState, dir: FocusDir) -> bool {
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -1044,21 +1188,255 @@ pub fn swap_pane(app: &mut AppState, dir: FocusDir) {
     for (i, (path, _)) in rects.iter().enumerate() { 
         if *path == win.active_path { active_idx = Some(i); break; } 
     }
-    let Some(ai) = active_idx else { return; };
+    let Some(ai) = active_idx else { return false; };
     let (_, arect) = &rects[ai];
     
     // Collect pane IDs for MRU-based tie-breaking (issue #70)
     let pane_ids: Vec<usize> = rects.iter().map(|(path, _)| {
         crate::tree::get_active_pane_id(&win.root, path).unwrap_or(usize::MAX)
     }).collect();
-    // Try direct neighbour first, then wrap to opposite edge (tmux parity #61)
-    let target = crate::input::find_best_pane_in_direction(&rects, ai, arect, dir, &pane_ids, &win.pane_mru)
-        .or_else(|| crate::input::find_wrap_target(&rects, ai, arect, dir, &pane_ids, &win.pane_mru));
+    // Pick the pane to swap with.  tmux defines `swap-pane -U`/`-D` by pane
+    // *index* order, not spatial geometry: -U swaps with the previous pane and
+    // -D with the next pane in the window's pane list, wrapping at the ends
+    // (cmd-swap-pane.c uses TAILQ_PREV / TAILQ_NEXT with wrap to LAST / FIRST).
+    // `rects` is already in pane-index order (DFS leaf order, same as
+    // pane_index_in_window), so prev/next is simply ai-1 / ai+1 with wrap.
+    // `-L`/`-R` have no tmux swap-pane equivalent (they are psmux extensions),
+    // so they keep the spatial neighbour search. (issue #400)
+    let n = rects.len();
+    let target = match dir {
+        FocusDir::Up   => Some(if ai == 0 { n - 1 } else { ai - 1 }),
+        FocusDir::Down => Some(if ai + 1 >= n { 0 } else { ai + 1 }),
+        _ => crate::input::find_best_pane_in_direction(&rects, ai, arect, dir, &pane_ids, &win.pane_mru)
+            .or_else(|| crate::input::find_wrap_target(&rects, ai, arect, dir, &pane_ids, &win.pane_mru)),
+    }.filter(|&ni| ni != ai); // single-pane window: nothing to swap with
+    let mut swapped = false;
     if let Some(ni) = target {
-        if let Some(new_pane_id) = pane_ids.get(ni) {
-            crate::tree::touch_mru(&mut win.pane_mru, *new_pane_id);
+        let active_path = rects[ai].0.clone();
+        let target_path = rects[ni].0.clone();
+        // Actually exchange the two panes in the layout tree (keeping the split
+        // sizes) instead of merely moving focus.  This is the real swap-pane
+        // behaviour expected from tmux.
+        if crate::tree::swap_nodes(&mut win.root, &active_path, &target_path) {
+            // Focus follows the pane that was just moved into the new slot.
+            win.active_path = target_path;
+            if let Some(focused_id) = crate::tree::get_active_pane_id(&win.root, &win.active_path) {
+                crate::tree::touch_mru(&mut win.pane_mru, focused_id);
+            }
+            swapped = true;
         }
-        win.active_path = rects[ni].0.clone();
+    }
+    // Resize the moved panes' PTYs to fit their new slots (tmux re-lays-out
+    // after a swap).  Without this the program keeps its old terminal size.
+    if swapped { crate::tree::resize_all_panes(app); }
+    swapped
+}
+
+/// Swap the active pane with the pane at an explicit tree `path`
+/// (used by `swap-pane -t <target>`).  Geometry is preserved; focus follows
+/// the moved pane to its new slot.
+pub fn swap_pane_with_path(app: &mut AppState, target_path: Vec<usize>) -> bool {
+    let swapped = {
+        let win = &mut app.windows[app.active_idx];
+        let active_path = win.active_path.clone();
+        if active_path == target_path { false }
+        else {
+            if crate::tree::swap_nodes(&mut win.root, &active_path, &target_path) {
+                win.active_path = target_path;
+                if let Some(focused_id) = crate::tree::get_active_pane_id(&win.root, &win.active_path) {
+                    crate::tree::touch_mru(&mut win.pane_mru, focused_id);
+                }
+                true
+            } else { false }
+        }
+    };
+    // Resize moved panes to fit their new slots (see swap_pane).
+    if swapped { crate::tree::resize_all_panes(app); }
+    swapped
+}
+
+/// Swap two explicit panes named by their tree paths (`swap-pane -s <src>
+/// -t <dst>`, issue #442).  Neither pane needs to be the active one.  Geometry
+/// is preserved (the layout nodes exchange slots).  Focus follows tmux
+/// `cmd-swap-pane.c`: without `-d` the `-t` (dst) pane becomes active — after
+/// the swap it occupies the src slot, so focus lands on `src_path`.  With `-d`
+/// the previously active pane keeps focus, following it to its new slot.
+pub fn swap_pane_between(app: &mut AppState, src_path: Vec<usize>, dst_path: Vec<usize>, detach: bool) -> bool {
+    let swapped = {
+        let win = &mut app.windows[app.active_idx];
+        if src_path == dst_path { false }
+        else {
+            // Remember the focused pane id so `-d` can keep focus on it even if
+            // it was one of the two panes being swapped.
+            let active_id = crate::tree::get_active_pane_id(&win.root, &win.active_path);
+            if crate::tree::swap_nodes(&mut win.root, &src_path, &dst_path) {
+                if detach {
+                    if let Some(aid) = active_id {
+                        if let Some(p) = crate::tree::find_path_by_id(&win.root, aid) {
+                            win.active_path = p;
+                        }
+                    }
+                } else {
+                    // tmux default: the -t pane becomes active; it now sits in
+                    // the src slot after the exchange.
+                    win.active_path = src_path.clone();
+                }
+                if let Some(fid) = crate::tree::get_active_pane_id(&win.root, &win.active_path) {
+                    crate::tree::touch_mru(&mut win.pane_mru, fid);
+                }
+                true
+            } else { false }
+        }
+    };
+    // Resize moved panes to fit their new slots (see swap_pane).
+    if swapped { crate::tree::resize_all_panes(app); }
+    swapped
+}
+
+/// Resolve a tmux-style position token (e.g. `{top-right}`) to the path of the
+/// pane occupying that corner/edge of the current window.  Layout-independent:
+/// always finds whatever pane currently sits there.
+pub fn pane_path_at_position(app: &AppState, token: &str) -> Option<Vec<usize>> {
+    if app.windows.is_empty() { return None; }
+    let area = app.last_window_area;
+    let win = &app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, area, &mut rects);
+    resolve_position_token(token, area, &rects)
+}
+
+/// Map a tmux-style position token to the path of the pane covering that
+/// corner/edge point.  Pure geometry, separated out so it can be unit-tested.
+pub fn resolve_position_token(token: &str, area: Rect, rects: &[(Vec<usize>, Rect)]) -> Option<Vec<usize>> {
+    if area.width == 0 || area.height == 0 { return None; }
+    let x0 = area.x;
+    let y0 = area.y;
+    let xmax = area.x + area.width - 1;
+    let ymax = area.y + area.height - 1;
+    let xmid = area.x + area.width / 2;
+    let ymid = area.y + area.height / 2;
+    let (px, py) = match token {
+        "{top-left}"     => (x0, y0),
+        "{top-right}"    => (xmax, y0),
+        "{bottom-left}"  => (x0, ymax),
+        "{bottom-right}" => (xmax, ymax),
+        "{top}"          => (xmid, y0),
+        "{bottom}"       => (xmid, ymax),
+        "{left}"         => (x0, ymid),
+        "{right}"        => (xmax, ymid),
+        _ => return None,
+    };
+    rects.iter()
+        .find(|(_, r)| px >= r.x && px < r.x + r.width && py >= r.y && py < r.y + r.height)
+        .map(|(p, _)| p.clone())
+}
+
+#[cfg(test)]
+mod position_token_tests {
+    use super::resolve_position_token;
+    use ratatui::layout::Rect;
+    fn layout() -> (Rect, Vec<(Vec<usize>, Rect)>) {
+        // ABTOP top-left, SMALL bottom-left, BIG right (mirrors the user's panel).
+        let area = Rect { x: 0, y: 0, width: 160, height: 40 };
+        let rects = vec![
+            (vec![0, 0], Rect { x: 0,  y: 0,  width: 79, height: 19 }),
+            (vec![0, 1], Rect { x: 0,  y: 20, width: 79, height: 20 }),
+            (vec![1],    Rect { x: 80, y: 0,  width: 80, height: 40 }),
+        ];
+        (area, rects)
+    }
+    #[test]
+    fn top_right_finds_big_pane() {
+        let (area, rects) = layout();
+        assert_eq!(resolve_position_token("{top-right}", area, &rects), Some(vec![1]));
+        assert_eq!(resolve_position_token("{bottom-right}", area, &rects), Some(vec![1]));
+        assert_eq!(resolve_position_token("{right}", area, &rects), Some(vec![1]));
+    }
+    #[test]
+    fn corners_left() {
+        let (area, rects) = layout();
+        assert_eq!(resolve_position_token("{top-left}", area, &rects), Some(vec![0, 0]));
+        assert_eq!(resolve_position_token("{bottom-left}", area, &rects), Some(vec![0, 1]));
+    }
+    #[test]
+    fn unknown_token_is_none() {
+        let (area, rects) = layout();
+        assert_eq!(resolve_position_token("{active}", area, &rects), None);
+    }
+}
+
+#[cfg(test)]
+mod swap_mru_tests {
+    use super::swap_pane_with_path;
+    use crate::proxy_pane::create_proxy_pane;
+    use crate::types::{AppState, LayoutKind, Node, Window};
+    use ratatui::layout::Rect;
+    use std::net::{TcpListener, TcpStream};
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let accept_thr = std::thread::spawn(move || listener.accept().expect("accept").0);
+        let client = TcpStream::connect(addr).expect("connect");
+        let server = accept_thr.join().expect("join accept thread");
+        (client, server)
+    }
+
+    fn proxy_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
+        let (reader, _peer1) = tcp_pair();
+        let (writer, _peer2) = tcp_pair();
+        create_proxy_pane(
+            reader,
+            writer,
+            "127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-session".to_string(),
+            id as u64,
+            None,
+            format!("pane-{}", id),
+            rows,
+            cols,
+            id,
+            None,
+        ).expect("create proxy pane")
+    }
+
+    fn make_window_with_two_panes(left_id: usize, right_id: usize) -> Window {
+        Window {
+            root: Node::Split {
+                kind: LayoutKind::Horizontal,
+                sizes: vec![1, 1],
+                children: vec![Node::Leaf(proxy_pane(left_id, 10, 5)), Node::Leaf(proxy_pane(right_id, 10, 5))],
+            },
+            active_path: vec![0],
+            name: "w0".to_string(),
+            id: 0,
+            activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+            last_output_time: std::time::Instant::now(),
+            last_seen_version: 0,
+            manual_rename: false,
+            layout_index: 0,
+            pane_mru: vec![right_id, left_id],
+            zoom_saved: None,
+            linked_from: None,
+            floating: Vec::new(),
+            floating_focus: None,
+        }
+    }
+
+    #[test]
+    fn swap_with_path_updates_mru_for_focused_pane_after_swap() {
+        let mut app = AppState::new("swap-mru".to_string());
+        app.last_window_area = Rect { x: 0, y: 0, width: 10, height: 10 };
+        app.windows.push(make_window_with_two_panes(11, 22));
+        app.active_idx = 0;
+
+        let swapped = swap_pane_with_path(&mut app, vec![1]);
+        assert!(swapped, "swap should succeed");
+        assert_eq!(app.windows[0].active_path, vec![1], "focus should follow moved active pane");
+        assert_eq!(app.windows[0].pane_mru.first().copied(), Some(11), "MRU should be the focused pane id after swap");
     }
 }
 
@@ -1210,13 +1588,17 @@ pub fn break_pane_to_window(app: &mut AppState) {
             pane_mru: initial_mru,
             zoom_saved: None,
             linked_from: None,
+            floating: Vec::new(),
+            floating_focus: None,
         });
         app.next_win_id += 1;
-        
+        app.on_window_appended();
+
         if src_empty {
             app.windows.remove(src_idx);
+            app.on_window_removed(src_idx);
         }
-        
+
         // Switch to the new window
         app.active_idx = app.windows.len() - 1;
     } else {
@@ -1227,7 +1609,7 @@ pub fn break_pane_to_window(app: &mut AppState) {
     }
 }
 
-pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool) -> io::Result<()> {
+pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool) -> io::Result<()> {
     // tmux semantics: without -k, respawn only works on dead panes.
     // With -k, kill the running process first and respawn.
     {
@@ -1249,6 +1631,20 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
         }
     }
 
+    // -E: respawn as an EMPTY pane (no command). Replace the pane in place with
+    // a childless empty pane, keeping its id/title/size, and return.
+    if empty {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+            let (r, c, id, title) = (pane.last_rows, pane.last_cols, pane.id, pane.title.clone());
+            if let Some(mut ep) = crate::popup::create_empty_pane(r.max(1), c.max(1), id) {
+                ep.title = title;
+                *pane = ep;
+            }
+        }
+        return Ok(());
+    }
+
     // Reuse provided PTY system or create one as fallback
     let owned_pty;
     let pty_system: &dyn portable_pty::PtySystem = if let Some(ps) = pty_system_ref {
@@ -1267,7 +1663,12 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     
     let size = PtySize { rows: pane.last_rows, cols: pane.last_cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
-    let mut shell_cmd = if !expanded_shell.is_empty() {
+    // Issue #399: honor an explicit `-- <command>` (e.g. Claude Code agent-teams
+    // respawning a pane with the teammate launch command). Without a command,
+    // fall back to the configured default shell (original behavior).
+    let mut shell_cmd = if command.is_some() {
+        crate::pane::build_command(command, app.env_shim, app.allow_predictions)
+    } else if !expanded_shell.is_empty() {
         build_default_shell(&expanded_shell, app.env_shim, app.allow_predictions)
     } else {
         detect_shell()
@@ -1298,9 +1699,11 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let bell_writer = bell_pending.clone();
     let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cpr_writer = cpr_pending.clone();
+    let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cq_writer = color_query_pending.clone();
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, true, output_ring.clone());
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
     pane.output_ring = output_ring;
 
     let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
@@ -1314,15 +1717,106 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
     pane.cpr_pending = cpr_pending;
+    pane.color_query_pending = color_query_pending;
     pane.child_pid = None;
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
     pane.dead = false;
-    
+    pane.spawned_at = Some(std::time::Instant::now());
+
+    Ok(())
+}
+
+/// Respawn a fresh default shell into a SPECIFIC pane (by window index + tree
+/// path) that crashed shortly after spawn. Mirrors `respawn_active_pane`'s spawn
+/// core but always uses the default shell and targets an arbitrary pane. Used by
+/// the opt-in `@heal-crashed-panes` self-heal for issue #450, where a pwsh whose
+/// PSReadLine is not the active reader FailFasts on its first ConPTY read right
+/// after a warm-pane transplant, leaving a broken/empty window.
+pub fn heal_respawn_pane(
+    app: &mut AppState,
+    pty_system_ref: &dyn portable_pty::PtySystem,
+    win_idx: usize,
+    path: &Vec<usize>,
+) -> io::Result<()> {
+    // Expand format vars (e.g. #{pane_current_path}) before the mutable borrow.
+    let expanded_shell = crate::format::expand_format(&app.default_shell, &app);
+
+    let Some(win) = app.windows.get_mut(win_idx) else { return Ok(()); };
+    let Some(pane) = active_pane_mut(&mut win.root, path) else { return Ok(()); };
+    let pane_id = pane.id;
+    let size = PtySize { rows: pane.last_rows.max(1), cols: pane.last_cols.max(1), pixel_width: 0, pixel_height: 0 };
+
+    let pair = pty_system_ref.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+    let mut shell_cmd = if !expanded_shell.is_empty() {
+        build_default_shell(&expanded_shell, app.env_shim, app.allow_predictions)
+    } else {
+        detect_shell()
+    };
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    drop(pair.slave);
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
+    let term_reader = term.clone();
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
+    let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bell_writer = bell_pending.clone();
+    let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cpr_writer = cpr_pending.clone();
+    let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cq_writer = color_query_pending.clone();
+    let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+
+    let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
+
+    // Re-acquire the pane and swap in the fresh shell.
+    let Some(win) = app.windows.get_mut(win_idx) else { return Ok(()); };
+    let Some(pane) = active_pane_mut(&mut win.root, path) else { return Ok(()); };
+    pane.master = pair.master;
+    pane.writer = pty_writer;
+    pane.child = child;
+    pane.term = term;
+    pane.data_version = data_version;
+    pane.cursor_shape = cursor_shape;
+    pane.bell_pending = bell_pending;
+    pane.cpr_pending = cpr_pending;
+    pane.color_query_pending = color_query_pending;
+    pane.output_ring = output_ring;
+    pane.child_pid = child_pid;
+    pane.vt_bridge_cache = None;
+    pane.vti_mode_cache = None;
+    pane.mouse_input_cache = None;
+    pane.dead = false;
+    pane.spawned_at = Some(std::time::Instant::now());
     Ok(())
 }
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue81_resize_direction.rs"]
 mod test_issue81_resize_direction;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue381_gitbash_fullscreen_falsepositive.rs"]
+mod test_issue381_gitbash_fullscreen_falsepositive;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue400_swap_pane_index_order.rs"]
+mod test_issue400_swap_pane_index_order;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue442_swap_pane_source.rs"]
+mod test_issue442_swap_pane_source;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_discussion349_podman_motion_leak.rs"]
+mod test_discussion349_podman_motion_leak;
