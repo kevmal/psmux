@@ -3958,15 +3958,39 @@ fn run_main() -> io::Result<()> {
 
     let mut stdout = crate::platform::create_writer();
     enable_virtual_terminal_processing();
+
+    // crossterm decides ANSI support ONCE per process and caches it:
+    //     enable_vt_processing().is_ok() || TERM != "dumb"
+    // On a cold ConPTY start the first half can fail transiently (stdout is
+    // not a usable console handle yet), and with TERM unset — the norm on
+    // Windows, and nothing in a launcher chain sets it — the whole client then
+    // renders without colour for the rest of the attach: pane contents AND our
+    // own status line. Setting TERM makes the detection deterministic instead
+    // of a race. `||` short-circuits, so this decides it however the race lands.
+    // Must happen BEFORE the first crossterm call, because the result is
+    // latched by a `Once`; enable_raw_mode() below is that first call.
+    // (mintty/Cygwin always sets TERM itself, but the pipe_vt path relied on
+    // this same fallback, so it keeps the behaviour it had.)
+    if env::var("TERM").is_err() {
+        env::set_var("TERM", "xterm-256color");
+    }
+
+    // crossterm 0.29 also honours NO_COLOR (no-color.org): with it set,
+    // Colored's Display impl serialises SetForegroundColor/SetBackgroundColor
+    // to NOTHING — and memoizes that once per process. A client that inherits
+    // NO_COLOR=1 (e.g. its tab/shell chain passed through a Claude Code
+    // session, which sets it on everything it spawns) then renders the whole
+    // attach grey even though the server, panes, and buffer are fully
+    // coloured. The no-color convention is for colour-PRODUCING apps; an
+    // attach client is a conduit relaying pane content that already went
+    // through the pane app's own NO_COLOR decision. Force colour on
+    // unconditionally.
+    crossterm::style::force_color_output(true);
+
     if pipe_vt {
         // A Cygwin pty is already raw from the native side (no console line
         // discipline in the path); enable_raw_mode would call SetConsoleMode
         // on the pipe handle and fail with ERROR_INVALID_FUNCTION.
-        // crossterm's ANSI detection needs TERM set to take the pure-ANSI
-        // path on Windows — mintty always sets it, but make sure.
-        if env::var("TERM").is_err() {
-            env::set_var("TERM", "xterm-256color");
-        }
         let _ = enable_raw_mode();
     } else {
         enable_raw_mode()?;
