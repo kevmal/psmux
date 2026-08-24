@@ -841,10 +841,24 @@ const ENV_SHIM_PS: &str = concat!(
     // above in set_tmux_env).  This wrapper auto-injects --teammate-mode when
     // PSMUX_CLAUDE_TEAMMATE_MODE is set (via `set -g claude-code-fix-tty on`).
     // Disable with: set -g claude-code-fix-tty off
+    //
+    // The wrapper resolves the real command at call time instead of
+    // hard-coding `claude.exe`.  The native installer puts claude.exe on
+    // PATH, but the npm install only exposes the claude.cmd / claude.ps1
+    // shims (its claude.exe lives under
+    // node_modules/@anthropic-ai/claude-code/bin, which is NOT on PATH),
+    // so a bare `& claude.exe` failed with "The term 'claude.exe' is not
+    // recognized" for every npm-installed user.  Try the exe first, then
+    // the npm shims, and fail with a clear message instead of a
+    // misleading lookup error.
     "if($env:PSMUX_CLAUDE_TEAMMATE_MODE){ ",
     "function Global:claude { ",
-    "if($args -contains '--teammate-mode'){ & claude.exe @args } ",
-    "else{ & claude.exe --teammate-mode $env:PSMUX_CLAUDE_TEAMMATE_MODE @args } } }",
+    "$c=$null; foreach($n in 'claude.exe','claude.cmd','claude.ps1'){ ",
+    "$c=Get-Command $n -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1; ",
+    "if($c){break} }; ",
+    "if(-not $c){ Write-Error 'psmux: claude not found on PATH (tried claude.exe, claude.cmd, claude.ps1)'; return }; ",
+    "if($args -contains '--teammate-mode'){ & $c @args } ",
+    "else{ & $c --teammate-mode $env:PSMUX_CLAUDE_TEAMMATE_MODE @args } } }",
 );
 
 /// PSReadLine prediction fix — disables predictions that crash with

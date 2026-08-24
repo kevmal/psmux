@@ -87,7 +87,7 @@ set -g claude-code-fix-tty off
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `claude-code-fix-tty` | `on` | Sets `PSMUX_CLAUDE_TEAMMATE_MODE=tmux` and defines a `claude` wrapper function that injects `--teammate-mode tmux` into every `claude` invocation |
+| `claude-code-fix-tty` | `on` | Sets `PSMUX_CLAUDE_TEAMMATE_MODE=tmux` and defines a `claude` wrapper function that injects `--teammate-mode tmux` into every `claude` invocation (resolves `claude.exe`, then `claude.cmd`, then `claude.ps1`) |
 
 The `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` env var is always set (not gated by any option) since it's required for the feature to work at all.
 
@@ -177,7 +177,7 @@ You can also verify the `claude` wrapper is active:
 Get-Command claude | Format-List
 ```
 
-If the wrapper is active, this shows a `Function` (not an `Application`). The wrapper auto-injects `--teammate-mode tmux` when calling `claude.exe`.
+If the wrapper is active, this shows a `Function` (not an `Application`). When called, the wrapper resolves the real command at call time — `claude.exe` (native install) first, then npm's `claude.cmd` / `claude.ps1` shims — and auto-injects `--teammate-mode tmux`.
 
 ## Troubleshooting
 
@@ -200,7 +200,7 @@ This is expected behavior. Opus prefers `isolation: "worktree"` over the teammat
 
 ### Claude command not found
 
-Make sure `claude.exe` is on your PATH. Install via:
+Make sure Claude Code is on your PATH — either the native `claude.exe` or the npm shims (`claude.cmd` / `claude.ps1` in `%APPDATA%\npm`; npm's own `claude.exe` sits under `node_modules` and is *not* on PATH, which is fine). The wrapper tries `claude.exe`, `claude.cmd`, `claude.ps1` in that order and prints `psmux: claude not found on PATH` if none resolve. Install via:
 ```powershell
 npm install -g @anthropic-ai/claude-code
 ```
