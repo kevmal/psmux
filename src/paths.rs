@@ -46,7 +46,9 @@ fn windows_profile_dir() -> Option<String> {
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
         fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
-        fn CloseHandle(h: *mut c_void) -> i32;
+        // isize handle to match every other CloseHandle declaration in the
+        // crate (clashing_extern_declarations); cast at the call site.
+        fn CloseHandle(h: isize) -> i32;
     }
     #[link(name = "userenv")]
     extern "system" {
@@ -61,7 +63,7 @@ fn windows_profile_dir() -> Option<String> {
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
         let ok = GetUserProfileDirectoryW(token, buf.as_mut_ptr(), &mut len);
-        CloseHandle(token);
+        CloseHandle(token as isize);
         if ok == 0 || len == 0 {
             return None;
         }
@@ -74,6 +76,14 @@ fn windows_profile_dir() -> Option<String> {
 /// call sites that early-exit when home is missing (`.ok()?` /
 /// `Err(_) => return …`). `None` when no home directory is available.
 pub fn psmux_dir_opt() -> Option<String> {
+    if let Some(raw) = std::env::var_os("PSMUX_DATA_DIR") {
+        let path = std::path::PathBuf::from(raw);
+        assert!(
+            path.is_absolute() && !path.as_os_str().is_empty(),
+            "PSMUX_DATA_DIR must be an absolute non-empty path"
+        );
+        return Some(path.to_string_lossy().trim_end_matches(['/', '\\']).to_string());
+    }
     let home = home_dir();
     if home.is_empty() {
         None
@@ -93,6 +103,38 @@ pub fn psmux_dir() -> String {
     psmux_dir_opt().unwrap_or_else(|| "\\.psmux".to_string())
 }
 
+/// The data root reduced to a comparison key: separators unified and case
+/// folded, because Windows treats `C:/Foo` and `c:\foo` as one directory and
+/// anything keyed on the root must treat them as one too.
+fn normalized_data_root() -> String {
+    psmux_dir().replace('/', "\\").to_lowercase()
+}
+
+/// Stable per-data-root tag for names that live in the machine-wide kernel
+/// object namespace (issue #599).
+///
+/// `PSMUX_DATA_DIR` namespaces the registry: every `.port`/`.key`/`.sid`/`.pid`
+/// file, and therefore every fact the single-server guard protects, lives under
+/// it. That guard's mutex, though, is a machine-wide name. Without the root in
+/// the key two independent registries collide on one session name and the
+/// second root's server is refused as a duplicate of a server it cannot even
+/// see -- including the fixed `__warm__` name, which only the first root then
+/// ever publishes. `-L` already reaches the key through `port_file_base()`;
+/// this makes psmux's other namespace mechanism agree.
+///
+/// Derived from the RESOLVED root rather than the raw variable, so pointing
+/// `PSMUX_DATA_DIR` at the default `~\.psmux` keys identically to leaving it
+/// unset.
+pub fn data_root_tag() -> String {
+    use std::hash::{Hash, Hasher};
+    // A fixed-seed hasher: the name must be identical across processes and
+    // runs, so `RandomState` is deliberately NOT used here (same reasoning as
+    // `namespace_instance_file`).
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    normalized_data_root().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Path to a fixed-name file directly under the data directory (e.g.
 /// `latency.log`, `last_session`, `next_session_id`, `crash.log`).
 pub fn psmux_dir_file(name: impl AsRef<str>) -> String {
@@ -102,6 +144,25 @@ pub fn psmux_dir_file(name: impl AsRef<str>) -> String {
 /// Path to a session's `.port` file (the TCP port its server listens on).
 pub fn port_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.port", psmux_dir(), session.as_ref())
+}
+
+/// Directory holding one ownership marker per server process this data dir
+/// started (issue #510).
+///
+/// The startup reaper enumerates candidate servers machine-wide, but its
+/// registry only describes one data dir. Without a per-process record of
+/// "this one is mine" it cannot tell an orphan of its own from another
+/// instance's healthy server, and killing on that ambiguity destroyed live
+/// sessions belonging to a different USERPROFILE/HOME. A server writes its
+/// marker into its OWN data dir, so ownership is self-declared and needs no
+/// inspection of other processes.
+pub fn server_marker_dir() -> String {
+    format!("{}\\servers", psmux_dir())
+}
+
+/// Path to one server process's ownership marker (see `server_marker_dir`).
+pub fn server_marker_file(pid: u32) -> String {
+    format!("{}\\{}", server_marker_dir(), pid)
 }
 
 /// Fallible variant of [`port_file`]: `None` when no data directory can be
@@ -131,12 +192,67 @@ pub fn spawnlock_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
 }
 
+/// Path to a session's `.act` file: the last-activity stamp (Unix epoch
+/// microseconds, ASCII) that bare CLI routing ranks candidates by.
+///
+/// This is psmux's registry-visible equivalent of tmux's in-memory
+/// `session.activity_time` (tmux `session.c`). tmux can consult it directly
+/// because the command runs inside the server; a psmux CLI process talks to one
+/// server per session, so the ranking input has to live in the shared registry
+/// where it can be read without connecting to anything (issue #603).
+pub fn activity_file(session: impl AsRef<str>) -> String {
+    format!("{}\\{}.act", psmux_dir(), session.as_ref())
+}
+
+/// Directory holding one namespace-identity file per `-L` namespace (issue #509).
+///
+/// A subdirectory rather than a `<ns>.instance` sibling: session files are named
+/// `<ns>__<session>.<ext>`, and the default namespace uses a bare `<session>`,
+/// so any flat naming risks colliding with a legitimately-named session.
+pub fn instance_dir_in(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("instances")
+}
+
+/// Path to a namespace's identity file. `ns` is the `-L` value, or `None` for
+/// the default namespace.
+///
+/// The file name is a readable prefix plus a hash of the *full* namespace name.
+/// `-L` values come from the user and may contain characters that are illegal in
+/// a filename (or that would collide once sanitised — `a/b` and `a_b` both
+/// become `a_b`), so the hash, not the prefix, is what guarantees isolation.
+pub fn namespace_instance_file(dir: &std::path::Path, ns: Option<&str>) -> std::path::PathBuf {
+    let name = match ns {
+        None => "default-0000000000000000".to_string(),
+        Some(n) => {
+            use std::hash::{Hash, Hasher};
+            // A fixed-seed hasher: the file name must be identical across
+            // processes and runs, so `RandomState` (used for the random session
+            // key) is deliberately NOT used here.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            n.hash(&mut h);
+            let digest = h.finish();
+            let prefix: String = n
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(32)
+                .collect();
+            format!("{}-{:016x}", prefix, digest)
+        }
+    };
+    instance_dir_in(dir).join(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // These tests READ the process-global env (USERPROFILE/HOME/
+    // PSMUX_DATA_DIR) that sibling modules mutate, so they must hold the
+    // same crate-wide lock the mutators serialize on or they observe a
+    // half-mutated environment in full parallel runs.
     #[test]
     fn psmux_dir_is_home_relative_dot_psmux() {
+        let _lock = crate::util::lock_test_env();
         // The test environment always has a home, so the data dir resolves to
         // {home}\.psmux and the two accessors agree.
         let dir = psmux_dir();
@@ -146,6 +262,7 @@ mod tests {
 
     #[test]
     fn per_session_helpers_append_name_and_suffix_to_data_dir() {
+        let _lock = crate::util::lock_test_env();
         let dir = psmux_dir();
         assert_eq!(port_file("foo"), format!("{}\\foo.port", dir));
         assert_eq!(key_file("foo"), format!("{}\\foo.key", dir));
@@ -156,6 +273,7 @@ mod tests {
 
     #[test]
     fn psmux_dir_file_appends_fixed_name() {
+        let _lock = crate::util::lock_test_env();
         assert_eq!(
             psmux_dir_file("latency.log"),
             format!("{}\\latency.log", psmux_dir())
@@ -166,3 +284,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue474_home_resolution.rs"]
 mod tests_issue474_home_resolution;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_data_dir_override.rs"]
+mod tests_data_dir_override;

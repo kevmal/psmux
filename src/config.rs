@@ -162,20 +162,34 @@ pub fn load_config(app: &mut AppState) {
     // If -f flag was used, load that specific config file instead of default search
     if let Ok(config_file) = env::var("PSMUX_CONFIG_FILE") {
         let expanded = if config_file.starts_with('~') {
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            config_file.replacen('~', &home, 1)
+            config_file.replacen('~', &crate::paths::home_dir(), 1)
         } else {
             config_file
         };
         set_current_config_file(&expanded);
-        if let Ok(content) = std::fs::read_to_string(&expanded) {
-            parse_config_content(app, &content);
+        match std::fs::read_to_string(&expanded) {
+            Ok(content) => parse_config_content(app, &content),
+            // An explicitly requested config file that cannot be read is a
+            // mistake worth surfacing — the user named this path on purpose.
+            Err(e) => {
+                // Route through warn_config for consistent formatting. It prefixes
+                // current_config_file (set to `expanded` above); no config line is
+                // in play at initial load, so the result is `<path>: cannot read: ...`.
+                warn_config(app, format!("cannot read: {}", e));
+            }
         }
         set_current_config_file("");
         return;
     }
 
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    // Use the canonical resolver rather than reading USERPROFILE/HOME directly.
+    // `paths::home_dir()` deliberately demotes HOME to a last resort (issue
+    // #474): under MSYS2/Git Bash, HOME is a POSIX path like /home/user, and
+    // joining it with the backslash-separated names below produced
+    // `/home/user\.config\psmux\psmux.conf`, which never matches anything — so
+    // psmux silently started with NO config at all while every other part of it
+    // used the real Windows profile directory.
+    let home = crate::paths::home_dir();
     let paths = vec![
         format!("{}\\.psmux.conf", home),
         format!("{}\\.psmuxrc", home),
@@ -756,47 +770,161 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
     }
 }
 
+/// Strip one layer of matching wrapping quotes, if the whole string carries
+/// them. This is the pre-#536 fallback and is kept for the shapes the
+/// quote-aware scan below deliberately does not claim.
+fn strip_wrapping_quotes(v: &str) -> &str {
+    let b = v.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
+}
+
+/// Split a config line into whitespace-separated tokens, treating a quoted run
+/// as a single token, and record the byte offset where each token starts.
+///
+/// The offsets are the point of this: they let the caller recover the value
+/// **verbatim** from the original line. `split_whitespace()` discards where the
+/// runs of whitespace were, which is what made a quoted gap unrecoverable
+/// (#536).
+fn tokens_with_offsets(line: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut start = 0usize;
+    let mut started = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut it = line.char_indices();
+    while let Some((idx, c)) = it.next() {
+        if !started && !c.is_whitespace() {
+            start = idx;
+            started = true;
+        }
+        match c {
+            // Keep the escape pair intact; the value scan resolves it later.
+            '\\' if in_double => {
+                cur.push(c);
+                if let Some((_, n)) = it.next() {
+                    cur.push(n);
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                cur.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                cur.push(c);
+            }
+            _ if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    out.push((start, std::mem::take(&mut cur)));
+                    started = false;
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if started {
+        out.push((start, cur));
+    }
+    out
+}
+
+/// Resolve a `set-option` value from the remainder of a config line.
+///
+/// A value wrapped in matching quotes that close at end of line is taken
+/// byte-exact, so `set -g @x "A     B"` keeps all five spaces and
+/// `"   leading"` keeps its indent. Inside double quotes `\"` and `\\` are
+/// unescaped, matching both tmux and the tokenizer the CLI path already uses.
+/// Anything else (a bare word, or a quote that does not close the line) falls
+/// back to the old behaviour: verbatim with trailing whitespace removed and one
+/// layer of wrapping quotes stripped.
+fn extract_option_value(rest: &str) -> String {
+    let rest = rest.trim_end();
+    let mut chars = rest.char_indices();
+    let quote = match chars.next() {
+        Some((_, c)) if c == '"' || c == '\'' => c,
+        Some(_) => return rest.to_string(),
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    while let Some((idx, c)) = chars.next() {
+        // Only double quotes process escapes, matching tmux and
+        // commands::parse_command_line.
+        if quote == '"' && c == '\\' {
+            if let Some((_, n)) = chars.clone().next() {
+                if n == '"' || n == '\\' {
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+            }
+            out.push(c);
+            continue;
+        }
+        if c == quote {
+            // Only a closing quote that ends the line delimits the whole
+            // value. Trailing content means this is some other shape (a
+            // chained command, two quoted words), so leave it to the fallback
+            // rather than silently claiming half of it.
+            if rest[idx + c.len_utf8()..].trim().is_empty() {
+                return out;
+            }
+            return strip_wrapping_quotes(rest).to_string();
+        }
+        out.push(c);
+    }
+    // Unterminated quote: behave as before.
+    strip_wrapping_quotes(rest).to_string()
+}
+
 fn parse_set_option(app: &mut AppState, line: &str) {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 { warn_config(app, "set-option requires an option name"); return; }
-    
+    let toks = tokens_with_offsets(line);
+    if toks.len() < 2 { warn_config(app, "set-option requires an option name"); return; }
+
     let mut i = 1;
     let mut is_global = false;
     let mut format_expand = false;  // -F: expand format strings in value
     let mut only_if_unset = false;  // -o: only set if not already set
     let mut append_mode = false;    // -a: append to current value
     let mut unset_mode = false;     // -u: unset (reset to default)
-    
-    while i < parts.len() {
-        let p = parts[i];
+
+    while i < toks.len() {
+        let p = toks[i].1.as_str();
         if p.starts_with('-') {
             if p.contains('g') { is_global = true; }
             if p.contains('F') { format_expand = true; }
             if p.contains('o') { only_if_unset = true; }
             if p.contains('a') { append_mode = true; }
-            if p.contains('u') { unset_mode = true; }
+            // -U is an unset alias of -u (tmux parity, #553); the contains
+            // check is case-sensitive so both must be tested.
+            if p.contains('u') || p.contains('U') { unset_mode = true; }
             // -q (quiet): no-op — we don't produce errors for unknown options
             // -w: window option — treat same as global for our single-server model
             i += 1;
-            if p.contains('t') && i < parts.len() { i += 1; }
+            if p.contains('t') && i < toks.len() { i += 1; }
         } else {
             break;
         }
     }
-    
-    if i >= parts.len() { warn_config(app, "set-option requires an option name"); return; }
 
-    // Extract key and value
-    let key = parts[i];
-    let raw_value = if i + 1 < parts.len() {
-        parts[i + 1..].join(" ")
-    } else {
-        String::new()
+    if i >= toks.len() { warn_config(app, "set-option requires an option name"); return; }
+
+    // Extract key, then take the value from the ORIGINAL line starting at the
+    // next token's offset, so quoted whitespace survives (#536).
+    let key = strip_wrapping_quotes(&toks[i].1).to_string();
+    let key = key.as_str();
+    let raw_value = match toks.get(i + 1) {
+        Some((off, _)) => extract_option_value(&line[*off..]),
+        None => String::new(),
     };
 
     // Handle -u (unset): reset option to empty
     if unset_mode {
-        parse_option_value(app, &format!("{} ", key), is_global);
+        parse_option_value(app, key, "", is_global);
         return;
     }
 
@@ -821,11 +949,11 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         if already_set { return; }
     }
 
-    // Expand format strings in the value if -F flag is set
+    // Expand format strings in the value if -F flag is set. No quote trimming
+    // here any more: extract_option_value already resolved the quoting, so a
+    // value whose content legitimately begins and ends with a quote keeps it.
     let value = if format_expand && !raw_value.is_empty() {
-        let stripped = raw_value.trim_matches('"').trim_matches('\'');
-        let expanded = crate::format::expand_format(stripped, app);
-        expanded
+        crate::format::expand_format(&raw_value, app)
     } else {
         raw_value
     };
@@ -833,36 +961,28 @@ fn parse_set_option(app: &mut AppState, line: &str) {
     // Handle -a (append to current value)
     let final_value = if append_mode {
         let current = crate::format::lookup_option_pub(key, app).unwrap_or_default();
-        format!("{}{}", current, value.trim_matches('"').trim_matches('\''))
+        format!("{}{}", current, value)
     } else {
         value
     };
 
-    let rest = format!("{} {}", key, final_value);
-    parse_option_value(app, &rest, is_global);
+    // Pass key and value separately. Rejoining them into one string could not
+    // represent a value with leading or trailing spaces, which the receiver
+    // then trimmed back off (#536).
+    parse_option_value(app, key, &final_value, is_global);
     // Track that this option was explicitly set (for -o only-if-unset checks)
     app.user_set_options.insert(key.to_string());
 }
 
-pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
-    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-    if parts.is_empty() { return; }
-    
-    let key = parts[0].trim();
-    let value = if parts.len() > 1 {
-        let v = parts[1].trim();
-        // Only strip quotes when the entire value is wrapped in matching
-        // quotes.  Preserves values like `"path with spaces" --login`.
-        if (v.starts_with('"') && v.ends_with('"'))
-            || (v.starts_with('\'') && v.ends_with('\''))
-        {
-            &v[1..v.len() - 1]
-        } else {
-            v
-        }
-    } else {
-        ""
-    };
+/// Apply one option, given its name and its **exact** value.
+///
+/// The value arrives verbatim: the caller has already resolved quoting, so a
+/// deliberate run of spaces, or leading/trailing whitespace inside a quoted
+/// config value, survives to here. This used to take a single `"key value"`
+/// string and re-split it, which could not represent those runs at all and
+/// trimmed the ends back off (#536).
+pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global: bool) {
+    let key = key.trim();
 
     // Validate the value against the option's declared type from the catalog
     // (issue #370 follow-up). Only options that exist in the catalog are
@@ -900,14 +1020,15 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
     match key {
         "status-left" => app.status_left = value.to_string(),
         "status-right" => app.status_right = value.to_string(),
-        "mouse" => app.mouse_enabled = matches!(value, "on" | "true" | "1"),
-        "scroll-enter-copy-mode" => app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1"),
-        "pwsh-mouse-selection" => app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1"),
-        "mouse-selection" => app.mouse_selection = matches!(value, "on" | "true" | "1"),
-        "paste-detection" => app.paste_detection = matches!(value, "on" | "true" | "1"),
-        "choose-tree-preview" => app.choose_tree_preview = matches!(value, "on" | "true" | "1"),
+        "mouse" => app.mouse_enabled = matches!(value, "on" | "true" | "1" | "yes"),
+        "scroll-enter-copy-mode" => app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"),
+        "pwsh-mouse-selection" => app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1" | "yes"),
+        "mouse-selection" => app.mouse_selection = matches!(value, "on" | "true" | "1" | "yes"),
+        "mouse-selection-force" => app.mouse_selection_force = matches!(value, "on" | "true" | "1" | "yes"),
+        "paste-detection" => app.paste_detection = matches!(value, "on" | "true" | "1" | "yes"),
+        "choose-tree-preview" => app.choose_tree_preview = matches!(value, "on" | "true" | "1" | "yes"),
         "bold-is-bright" => {
-            app.bold_is_bright = matches!(value, "on" | "true" | "1");
+            app.bold_is_bright = matches!(value, "on" | "true" | "1" | "yes");
             crate::platform::set_bold_is_bright(app.bold_is_bright);
         }
         "prefix" => {
@@ -928,6 +1049,22 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                 app.escape_time_ms = ms;
             }
         }
+        // Issue #606: repeat-time was documented, catalogued and honoured by
+        // the server's set-option, but this match had no arm for it, so a
+        // `.tmux.conf` line fell through to the catch-all below, was reported
+        // as "unknown option 'repeat-time'" and left `repeat_time_ms` at its
+        // 500 ms default. tmux (options-table.c) bounds it to
+        // 0..=REPEAT_TIME_MAX_MS milliseconds; 0 disables repeat entirely.
+        "repeat-time" => match value.parse::<i64>() {
+            Ok(ms) if (0..=crate::server::options::REPEAT_TIME_MAX_MS).contains(&ms) => {
+                app.repeat_time_ms = ms as u64;
+            }
+            Ok(ms) if ms < 0 => warn_config(app, format!("value is too small: {}", value)),
+            Ok(_) => warn_config(app, format!("value is too large: {}", value)),
+            // A non-numeric value already produced the catalog type warning
+            // above, so do not warn about it twice.
+            Err(_) => {}
+        },
         "prediction-dimming" | "dim-predictions" => {
             app.prediction_dimming = !matches!(value, "off" | "false" | "0");
         }
@@ -966,6 +1103,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "status-justify" => { app.status_justify = value.to_string(); }
         "base-index" => {
             if let Ok(idx) = value.parse::<usize>() {
+                app.rebase_window_indices(idx);
                 app.window_base_index = idx;
             }
         }
@@ -996,34 +1134,34 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             app.word_separators = value.to_string();
         }
         "renumber-windows" => {
-            app.renumber_windows = matches!(value, "on" | "true" | "1");
+            app.renumber_windows = matches!(value, "on" | "true" | "1" | "yes");
         }
         "mode-keys" => {
             app.mode_keys = value.to_string();
         }
         "focus-events" => {
-            app.focus_events = matches!(value, "on" | "true" | "1");
+            app.focus_events = matches!(value, "on" | "true" | "1" | "yes");
         }
         "monitor-activity" => {
-            app.monitor_activity = matches!(value, "on" | "true" | "1");
+            app.monitor_activity = matches!(value, "on" | "true" | "1" | "yes");
         }
         "visual-activity" => {
-            app.visual_activity = matches!(value, "on" | "true" | "1");
+            app.visual_activity = matches!(value, "on" | "true" | "1" | "yes");
         }
         "remain-on-exit" => {
-            app.remain_on_exit = matches!(value, "on" | "true" | "1");
+            app.remain_on_exit = matches!(value, "on" | "true" | "1" | "yes");
         }
         "destroy-unattached" => {
-            app.destroy_unattached = matches!(value, "on" | "true" | "1");
+            app.destroy_unattached = matches!(value, "on" | "true" | "1" | "yes");
         }
         "exit-empty" => {
-            app.exit_empty = matches!(value, "on" | "true" | "1");
+            app.exit_empty = matches!(value, "on" | "true" | "1" | "yes");
         }
         "aggressive-resize" => {
-            app.aggressive_resize = matches!(value, "on" | "true" | "1");
+            app.aggressive_resize = matches!(value, "on" | "true" | "1" | "yes");
         }
         "set-titles" => {
-            app.set_titles = matches!(value, "on" | "true" | "1");
+            app.set_titles = matches!(value, "on" | "true" | "1" | "yes");
         }
         "set-titles-string" => {
             app.set_titles_string = value.to_string();
@@ -1036,16 +1174,16 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
         "window-status-separator" => { app.window_status_separator = value.to_string(); }
         "automatic-rename" => {
-            app.automatic_rename = matches!(value, "on" | "true" | "1");
+            app.automatic_rename = matches!(value, "on" | "true" | "1" | "yes");
         }
         "synchronize-panes" => {
-            app.sync_input = matches!(value, "on" | "true" | "1");
+            app.sync_input = matches!(value, "on" | "true" | "1" | "yes");
         }
         "allow-rename" => {
-            app.allow_rename = matches!(value, "on" | "true" | "1");
+            app.allow_rename = matches!(value, "on" | "true" | "1" | "yes");
         }
         "allow-set-title" => {
-            app.allow_set_title = matches!(value, "on" | "true" | "1");
+            app.allow_set_title = matches!(value, "on" | "true" | "1" | "yes");
         }
         "terminal-overrides" => { /* tmux terminfo override — accepted for compatibility, no-op on Windows */ }
         "default-terminal" => {
@@ -1057,7 +1195,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             app.update_environment = value.split_whitespace().map(|s| s.to_string()).collect();
         }
         "bell-action" => { app.bell_action = value.to_string(); }
-        "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1"); }
+        "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1" | "yes"); }
         "activity-action" => {
             app.activity_action = value.to_string();
         }
@@ -1100,19 +1238,19 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "copy-command" => { app.copy_command = value.to_string(); }
         "set-clipboard" => { app.set_clipboard = value.to_string(); }
         "env-shim" => {
-            app.env_shim = matches!(value, "on" | "true" | "1");
+            app.env_shim = matches!(value, "on" | "true" | "1" | "yes");
         }
         "allow-predictions" => {
-            app.allow_predictions = matches!(value, "on" | "true" | "1");
+            app.allow_predictions = matches!(value, "on" | "true" | "1" | "yes");
         }
         "claude-code-fix-tty" => {
-            app.claude_code_fix_tty = matches!(value, "on" | "true" | "1");
+            app.claude_code_fix_tty = matches!(value, "on" | "true" | "1" | "yes");
         }
         "claude-code-force-interactive" => {
-            app.claude_code_force_interactive = matches!(value, "on" | "true" | "1");
+            app.claude_code_force_interactive = matches!(value, "on" | "true" | "1" | "yes");
         }
         "warm" => {
-            app.warm_enabled = matches!(value, "on" | "true" | "1");
+            app.warm_enabled = matches!(value, "on" | "true" | "1" | "yes");
             if !app.warm_enabled {
                 if let Some(mut wp) = app.warm_pane.take() {
                     wp.child.kill().ok();
@@ -1278,27 +1416,73 @@ pub fn shell_words(s: &str) -> Vec<String> {
 pub fn split_chained_commands_pub(command: &str) -> Vec<String> {
     split_chained_commands(command)
 }
+/// Split a command line into chained sub-commands.
+///
+/// A separator is a *whole top-level token* of exactly `;` or `\;`, matching
+/// tmux's `cmd_parse_from_arguments`, which only ends a command when an
+/// argument consists of (or ends with) an unescaped semicolon. Two properties
+/// matter here and both were broken before (#499):
+///
+///  1. **Quote awareness.** A `;` inside single or double quotes is data, not a
+///     separator. The one-shot CLI path flattens argv into a single line and
+///     wraps any argument containing whitespace in double quotes, so a user
+///     value like `"a ; b"` used to be split mid-value: the option was stored
+///     truncated to `a` and the remainder (`b"`) was dispatched as its own
+///     command. With a real command after the `;` that meant arbitrary command
+///     execution from inside a quoted *value* (`"x ; kill-server"` killed the
+///     server).
+///
+///  2. **Whitespace preservation.** Sub-commands are returned as slices of the
+///     original line rather than re-joined `split_whitespace()` tokens, so runs
+///     of spaces inside a quoted argument survive chaining (previously
+///     `set-option @a 1 \; set-option @b "x    y"` stored `x y`).
+///
+/// A semicolon that is only *part* of a token (`a;b`, `a; b`) is left alone,
+/// again matching tmux, which inspects the whole argument.
 fn split_chained_commands(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
     let mut commands: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    
-    for token in &tokens {
-        if *token == "\\;" || *token == ";" {
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                commands.push(trimmed);
-            }
-            current.clear();
-        } else {
-            if !current.is_empty() { current.push(' '); }
-            current.push_str(token);
+    let mut seg_start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+
+    fn push_seg(commands: &mut Vec<String>, seg: &[char]) {
+        let s: String = seg.iter().collect();
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            commands.push(trimmed.to_string());
         }
     }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        commands.push(trimmed);
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Separator check first: only a standalone top-level `;` / `\;` token.
+        if !in_single && !in_double && (c == ';' || (c == '\\' && chars.get(i + 1) == Some(&';'))) {
+            let sep_len = if c == ';' { 1 } else { 2 };
+            let starts_token = i == 0 || chars[i - 1].is_whitespace();
+            let ends_token = chars.get(i + sep_len).is_none_or(|n| n.is_whitespace());
+            if starts_token && ends_token {
+                push_seg(&mut commands, &chars[seg_start..i]);
+                i += sep_len;
+                seg_start = i;
+                continue;
+            }
+        }
+
+        match c {
+            // An escape pair is copied over verbatim; skipping the escaped
+            // character keeps `\"` from toggling the quote state.
+            '\\' if !in_single => { i += 2; continue; }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+        i += 1;
     }
+
+    push_seg(&mut commands, &chars[seg_start.min(chars.len())..]);
     commands
 }
 
@@ -1421,6 +1605,48 @@ pub fn ensure_prefix_self_binding(app: &mut AppState) {
     }
 }
 
+/// Fold the NUL key (ASCII 0x00) onto `C-Space`.
+///
+/// A terminal encodes Ctrl+Space as the NUL byte 0x00.  On Windows the console
+/// delivers that byte as a KEY_EVENT with `wVirtualKeyCode = VK_2` and
+/// `UnicodeChar = 0`, because NUL is classically typed as Ctrl+@ (Shift+2 on a
+/// US layout).  crossterm resolves that zero UnicodeChar back through the
+/// keyboard layout with an empty key state, so it surfaces as `Char('2')` with
+/// CONTROL.  Physical Ctrl+2, physical Ctrl+Shift+2, and a NUL byte written by
+/// a ConPTY-hosted terminal are byte-for-byte identical in that record, so they
+/// cannot be told apart, and in terminal terms they are all genuinely the same
+/// key: NUL.
+///
+/// tmux folds the same way in `tty-keys.c`:
+///
+/// ```text
+/// /* C-Space is special. */
+/// if ((key & KEYC_MASK_KEY) == C0_NUL)
+///         key = ' ' | KEYC_CTRL | (key & KEYC_META);
+/// ```
+///
+/// Without this fold `set -g prefix C-Space` is dead on Windows for any
+/// terminal whose only way to emit Ctrl+Space is to send a literal NUL, which
+/// is exactly Alacritty's documented `chars = <NUL escape>` workaround (issue
+/// #504).  The fold is applied symmetrically to incoming key events and to
+/// registered binding keys, so an existing `bind-key C-2` keeps firing.
+pub fn fold_nul_to_ctrl_space(key: (KeyCode, KeyModifiers)) -> (KeyCode, KeyModifiers) {
+    let is_nul = match key.0 {
+        // Windows console encoding of NUL (Ctrl+@ / Ctrl+Shift+2 / Ctrl+Space).
+        KeyCode::Char('2') => key.1.contains(KeyModifiers::CONTROL)
+            && !key.1.contains(KeyModifiers::ALT),
+        // A literal NUL that reached the key layer as a character.
+        KeyCode::Char('\0') => true,
+        _ => false,
+    };
+    if is_nul {
+        // SHIFT is noise here: Ctrl+Shift+2 and Ctrl+2 are the same NUL.
+        (KeyCode::Char(' '), key.1.difference(KeyModifiers::SHIFT) | KeyModifiers::CONTROL)
+    } else {
+        key
+    }
+}
+
 /// Normalize a key tuple for binding comparison.
 /// Strips SHIFT from Char events since the character itself encodes shift information.
 /// e.g., '|' already implies Shift was pressed, so (Char('|'), SHIFT) and (Char('|'), NONE) should match.
@@ -1430,7 +1656,11 @@ pub fn ensure_prefix_self_binding(app: &mut AppState) {
 /// (e.g. `[` `]` `{` `}` `@` `\` `|` `~` on German/Czech keyboards) arrive
 /// as Char('[') with CONTROL|ALT modifiers.  Stripping those fake modifiers
 /// lets the binding lookup match the registered `[` binding (issue #287).
+///
+/// NUL (`C-2` / `C-Space`) is folded first so that a binding registered as
+/// `C-2` and one registered as `C-Space` resolve to the same tuple (#504).
 pub fn normalize_key_for_binding(key: (KeyCode, KeyModifiers)) -> (KeyCode, KeyModifiers) {
+    let key = fold_nul_to_ctrl_space(key);
     match key.0 {
         KeyCode::Char(c) => {
             let mut mods = key.1.difference(KeyModifiers::SHIFT);
@@ -1648,8 +1878,31 @@ pub fn source_file(app: &mut AppState, path: &str) {
     let prev_file = current_config_file();
     set_current_config_file(&expanded_path);
 
-    if let Ok(content) = std::fs::read_to_string(&expanded_path) {
-        parse_config_content(app, &content);
+    match std::fs::read_to_string(&expanded_path) {
+        Ok(content) => parse_config_content(app, &content),
+        Err(e) => {
+            // A `source-file` naming a path that cannot be read used to be a
+            // silent no-op: no warning, no log line, nothing. Since the whole
+            // keybinding layer of a split config lives behind one such line, a
+            // typo or a moved repo produced a psmux with stock defaults and no
+            // indication why. Record it like any other config warning so it
+            // reaches ~/.psmux/config-warnings.log and the attach-time stderr
+            // summary.
+            //
+            // tmux parity note: tmux errors on a missing source-file too, but
+            // only when the path is not a glob. psmux has no glob support here,
+            // so every miss is a real miss.
+            //
+            // Route through warn_config for consistent formatting, but point it
+            // at the source-file directive itself — the parent file and line,
+            // where the user's fix belongs — not the child that couldn't be
+            // read. current_config_file was switched to the child above, and
+            // config_warn_line still holds the parent's line (source_file runs
+            // inside parse_config_content's per-line loop), so restore the parent
+            // file first; then name the missing child in the message.
+            set_current_config_file(&prev_file);
+            warn_config(app, format!("cannot source {}: {}", expanded_path, e));
+        }
     }
 
     set_current_config_file(&prev_file);
@@ -2152,3 +2405,23 @@ mod tests_issue425_bold_is_bright_option;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue459_hook_accumulation.rs"]
 mod tests_issue459_hook_accumulation;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue488_pageup_defaults.rs"]
+mod tests_issue488_pageup_defaults;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue499_quoted_semicolon.rs"]
+mod tests_issue499_quoted_semicolon;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue504_ctrl_space_nul.rs"]
+mod tests_issue504_ctrl_space_nul;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue536_config_quoted_whitespace.rs"]
+mod tests_issue536_config_quoted_whitespace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue606_repeat_time.rs"]
+mod tests_issue606_repeat_time;

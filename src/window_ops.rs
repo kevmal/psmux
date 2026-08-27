@@ -25,8 +25,7 @@ fn mouse_log(msg: &str) {
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     if n > 2000 { return; }
 
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-    let path = format!("{}/.psmux/mouse_debug.log", home);
+    let path = format!("{}/mouse_debug.log", crate::paths::psmux_dir());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
     }
@@ -113,155 +112,74 @@ fn is_vt_bridge(name: &str) -> bool {
     lower.contains("wsl") || lower.contains("ssh")
 }
 
-/// Permissive TUI detection for hover events — matches layout.rs heuristic.
+/// Wheel-forwarding gate: is the pane's child on the alternate screen?
 ///
-/// Returns true when the last row of the pane screen has non-blank content,
-/// which indicates a fullscreen app (status bar, menu bar, etc.).
-///
-/// This is deliberately less strict than `is_fullscreen_tui()`:
-///   - `is_fullscreen_tui()` also requires the cursor in the bottom 3 rows,
-///     which fails for apps like opencode whose cursor sits at a mid-screen
-///     text input.
-///   - For hover events, false positives are harmless — shells ignore bare
-///     motion (SGR button 35).  False negatives break TUI hover (opencode,
-///     etc.), so we use the permissive check.
-pub(crate) fn screen_has_tui_content(pane: &Pane) -> bool {
+/// The alternate screen is an authoritative wheel signal. The broader
+/// mouse-protocol signal needs ownership attribution because PSReadLine can
+/// enable it on behalf of the shell.
+pub(crate) fn pane_in_alt_screen(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
-        let screen = parser.screen();
-        if screen.alternate_screen() {
-            return true;
-        }
-        let last_row = pane.last_rows.saturating_sub(1);
-        for col in 0..pane.last_cols.min(80) {
-            if let Some(cell) = screen.cell(last_row, col) {
-                let t = cell.contents();
-                if !t.is_empty() && t != " " {
-                    return true;
-                }
-            }
-        }
+        return parser.screen().alternate_screen();
     }
     false
 }
 
-/// Check if the pane is likely running a fullscreen TUI app (htop, vim, etc.)
-/// by detecting alternate screen buffer usage.
+/// Attribute the pane's mouse protocol to whoever was foreground when it was
+/// enabled (#548 follow-up).  Called from the server data tick, so the
+/// process-table walk happens at ENABLEMENT time — sampling lazily at wheel
+/// time would misattribute PSReadLine's lingering spurious tracking to
+/// whatever app happens to be foreground when the user first scrolls.
 ///
-/// ConPTY never passes DECSET 1049h (alternate screen) to the output pipe,
-/// so `screen.alternate_screen()` is always false.  Use the same heuristic
-/// as layout.rs: if the last row of the screen has non-blank content, the
-/// pane is running a fullscreen app.
-pub(crate) fn is_fullscreen_tui(pane: &Pane) -> bool {
-    if let Ok(parser) = pane.term.lock() {
-        let screen = parser.screen();
-        // Fast check: if the parser reports alternate screen, trust it
-        if screen.alternate_screen() {
-            return true;
-        }
-
-        // Issue #381: a plain shell whose output has merely filled the screen
-        // is NOT a fullscreen TUI. Under git bash the fill heuristic below
-        // false-positives once enough output fills the bottom rows with the
-        // prompt at the cursor, so psmux forwarded mouse motion to the shell,
-        // which echoed it as raw SGR text ("15M65;61;..."). If the foreground
-        // process is a shell, skip the heuristic and report "not fullscreen".
-        //
-        // Gate on `== Some(true)`, NOT `.is_some()`: foreground_is_shell returns
-        // Some(false) for a genuine NON-shell fullscreen app (nvim, htop), and
-        // that case must still fall through to the heuristic that #285 relies on
-        // for mouse support on ConPTY builds that strip the mouse DECSETs. Using
-        // `.is_some()` here fires for Some(false) too and would suppress
-        // detection of real TUIs, regressing #285.
-        let foreground_is_shell = pane
+/// Rules:
+///   - protocol off               -> owner cleared
+///   - protocol newly on/changed  -> `app_owned = (foreground_is_shell ==
+///     Some(false))`.  A confirmed non-shell foreground at enablement means
+///     the app itself asked for the mouse (Copilot CLI, the #570 echo
+///     child); the shell (or an inconclusive probe) means PSReadLine-style
+///     spurious tracking and the wheel stays on copy-mode semantics.
+///   - protocol unchanged         -> owner kept (one walk per transition)
+pub(crate) fn update_mouse_proto_owner(pane: &mut Pane) {
+    let mode = match pane.term.lock() {
+        Ok(parser) => parser.screen().mouse_protocol_mode(),
+        Err(_) => return,
+    };
+    if mode == vt100::MouseProtocolMode::None {
+        pane.mouse_proto_owner = None;
+        return;
+    }
+    let changed = match pane.mouse_proto_owner {
+        Some((last, _)) => last != mode,
+        None => true,
+    };
+    if changed {
+        let app_owned = pane
             .child_pid
             .and_then(crate::platform::process_info::foreground_is_shell)
-            == Some(true);
-
-        if foreground_is_shell {
-            return false;
-        }
-
-        // Heuristic: check if many of the last rows are non-blank AND the
-        // cursor is near the bottom.  Fullscreen TUI apps fill the entire
-        // screen and keep the cursor near the bottom (status bars, menus).
-        // A shell after `dir` may have content on the last row, but the
-        // cursor sits at the current prompt line — not necessarily at the
-        // bottom — and the rows below the cursor are blank.
-        let rows = pane.last_rows;
-        if rows < 3 { return false; }
-        let (cursor_row, _) = screen.cursor_position();
-        let last_row = rows.saturating_sub(1);
-        // Cursor must be in the bottom 3 rows for a fullscreen TUI
-        if cursor_row < last_row.saturating_sub(2) {
-            return false;
-        }
-        // Check that at least 3 of the last 4 rows have non-blank content
-        let check_rows = 4u16.min(rows);
-        let mut filled = 0u16;
-        for r in (last_row + 1 - check_rows)..=last_row {
-            let mut has_content = false;
-            for col in 0..pane.last_cols.min(40) { // only check first 40 cols
-                if let Some(cell) = screen.cell(r, col) {
-                    let t = cell.contents();
-                    if !t.is_empty() && t != " " {
-                        has_content = true;
-                        break;
-                    }
-                }
-            }
-            if has_content { filled += 1; }
-        }
-        return filled >= 3;
+            == Some(false);
+        pane.mouse_proto_owner = Some((mode, app_owned));
     }
-    false
 }
 
-/// Check if the child process in this pane wants to receive mouse events.
-///
-/// Uses a three-tier detection strategy:
-///
-///   1. **mouse_protocol_mode** (DECSET 1000/1002/1003) — authoritative for
-///      VT bridge children (WSL, SSH) where escape sequences pass through.
-///   2. **alternate_screen** (DECSET 1049h) — works on Windows 11+ where
-///      ConPTY passes DECSET 1049h to the output stream.
-///   3. **is_fullscreen_tui heuristic** — fallback for older Windows 10
-///      builds where ConPTY strips both DECSET 1000 and DECSET 1049h.
-///      Detects fullscreen TUI apps (nvim, htop, vim) by checking that the
-///      last rows are filled and the cursor is near the bottom.
-///
-/// Without tier 3, native TUI apps on older Windows never receive mouse
-/// events because ConPTY makes both tier 1 and tier 2 return false.
-/// (fixes #285, regression from commit 719e604)
-pub(crate) fn pane_wants_mouse(pane: &Pane) -> bool {
-    if let Ok(parser) = pane.term.lock() {
-        let screen = parser.screen();
-        // Tier 1: did the child enable mouse protocol? (VT bridge children)
-        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
-            return true;
-        }
-        // Tier 2: alternate screen active (newer ConPTY passes DECSET 1049h)
-        if screen.alternate_screen() {
-            return true;
-        }
-    }
-    // Tier 3: heuristic for older ConPTY that strips DECSET 1049h —
-    // detect fullscreen TUI apps by screen content analysis.
-    is_fullscreen_tui(pane)
+/// The wheel-forwarding decision (#548 + #570): forward when the pane is on
+/// the alternate screen (nvim, htop, less — tmux `alternate_on`) OR when a
+/// mouse protocol is active AND was enabled by the application itself (tmux
+/// `mouse_any_flag`, minus PSReadLine's spurious enablement which
+/// `update_mouse_proto_owner` attributes to the shell).  Everything else
+/// gets copy-mode scrollback, exactly like tmux over a plain pane.
+pub(crate) fn pane_wheel_forward(pane: &Pane) -> bool {
+    pane_in_alt_screen(pane) || matches!(pane.mouse_proto_owner, Some((_, true)))
 }
 
-/// Stricter than `pane_wants_mouse`, used ONLY for the scroll-wheel decision.
+/// Gate for mouse click/button forwarding.
 ///
-/// The wheel must auto-enter copy mode for an ordinary shell pane (tmux parity,
-/// issue #360).  `pane_wants_mouse`'s tier-3 `is_fullscreen_tui` content
-/// heuristic returns true for a normal shell that has filled the screen with
-/// the prompt sitting at the bottom, which wrongly forwarded the wheel to the
-/// shell (it ignores SGR wheel) instead of entering copy mode.  For scroll we
-/// only forward when the child RELIABLY wants the mouse: it enabled a mouse
-/// protocol (e.g. nvim `set mouse=a`) or is on the alternate screen.  TUI apps
-/// that genuinely consume the wheel satisfy one of these even on older ConPTY
-/// (the mouse protocol DECSETs are not stripped); apps that satisfy neither do
-/// not interpret the wheel anyway, so copy-mode scrollback is the right thing.
-pub(crate) fn pane_wants_scroll_forward(pane: &Pane) -> bool {
+/// A click is forwarded when the pane's terminal state indicates mouse input:
+///   1. it enabled a mouse protocol (DECSET 1000/1002/1003 — VT apps like vim,
+///      and modern crossterm/ratatui apps, which emit DECSET 1000/1006 when
+///      they turn mouse capture on); or
+///   2. it is on the alternate screen (fullscreen apps on modern ConPTY).
+///
+/// This deliberately does not use screen-content or console-mode heuristics.
+pub(crate) fn pane_wants_click(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
         let screen = parser.screen();
         if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
@@ -274,23 +192,84 @@ pub(crate) fn pane_wants_scroll_forward(pane: &Pane) -> bool {
     false
 }
 
-/// Strict check for hover/motion events.  Returns true only when the child
-/// has EXPLICITLY enabled mouse motion tracking (DECSET 1002 ButtonMotion or
-/// DECSET 1003 AnyMotion).
+/// Strict check for BARE motion events: the pointer moved with no button held
+/// (SGR button 35).  Returns true only when the child asked for any-event
+/// tracking, DECSET 1003.
 ///
-/// Unlike `pane_wants_mouse()`, this does NOT use alt-screen or fullscreen
-/// heuristics.  Sending unsolicited SGR motion sequences to apps that haven't
+/// This does not use alt-screen or screen-content heuristics. Sending
+/// unsolicited SGR motion sequences to apps that haven't
 /// enabled mouse tracking (e.g. nvim without `set mouse=a`, or any TUI app
 /// that only uses alt-screen for rendering) corrupts their input and makes
 /// them appear hung.  (fixes #296)
-pub(crate) fn pane_wants_hover(pane: &Pane) -> bool {
+///
+/// DECSET 1002 is NOT enough (#604).  1002 is button-event tracking: report
+/// motion only WHILE A BUTTON IS HELD.  Only 1003 asks for motion with no
+/// button.  tmux draws the line in exactly the same place: a bare motion
+/// report reaches a pane only under `MODE_MOUSE_ALL` (input-keys.c:737):
+///
+///     if (MOUSE_DRAG(m->sgr_b) &&
+///         MOUSE_RELEASE(m->sgr_b) &&
+///         (~s->mode & MODE_MOUSE_ALL))
+///             return (0);
+///
+/// (SGR button 35 is the motion bit 32 plus the "no button" low bits 3, so it
+/// is both MOUSE_DRAG and MOUSE_RELEASE.)  tmux does not even ask the OUTER
+/// terminal for bare motion unless a pane wants 1003 (tty.c:897):
+///
+///     if (mode & MODE_MOUSE_ALL)
+///             tty_puts(tty, "\033[?1000h\033[?1002h\033[?1003h");
+///     else if (mode & MODE_MOUSE_BUTTON)
+///             tty_puts(tty, "\033[?1000h\033[?1002h");
+///
+/// psmux accepted 1002 here, so merely moving the pointer over a pane running
+/// `nvim -u NONE` (mouse=nvi, which enables 1002+1006 and never 1003) sprayed
+/// an `ESC[<35;col;rowM` report at nvim for every pointer sample (#604).
+pub(crate) fn pane_wants_bare_motion(pane: &Pane) -> bool {
     if let Ok(parser) = pane.term.lock() {
-        let screen = parser.screen();
-        matches!(screen.mouse_protocol_mode(),
-            vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion)
+        mode_reports_bare_motion(parser.screen().mouse_protocol_mode())
     } else {
         false
     }
+}
+
+/// The mouse-mode half of `pane_wants_bare_motion`, split out so the tmux rule
+/// itself can be asserted without building a live pane (#604).
+pub(crate) fn mode_reports_bare_motion(mode: vt100::MouseProtocolMode) -> bool {
+    mode == vt100::MouseProtocolMode::AnyMotion
+}
+
+/// Is this client mouse event a bare pointer move that nothing will act on?
+///
+/// The client sends `pane-mouse <id> 35 <col> <row> M` for every pointer
+/// sample that lands inside a pane.  When the pane never asked for any-event
+/// tracking the event forwards nothing, focuses nothing and selects nothing,
+/// so the server state is byte for byte what it already was.  Pushing a frame
+/// for it repaints the whole client screen at pointer-motion rate, which is
+/// the flicker in #604: measured on this tree, sweeping the pointer 60 times
+/// across a pane produced 60 full state frames and a redraw storm, against 0
+/// while idle.
+///
+/// Copy mode is deliberately excluded: there a motion event does move the
+/// selection cursor, so it is not inert.
+pub fn pane_mouse_is_inert_motion(app: &AppState, pane_id: usize, button: u8) -> bool {
+    if button != 35 {
+        return false;
+    }
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+        return false;
+    }
+    let Some(win) = app.windows.get(app.active_idx) else { return true };
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    for (path, _) in &rects {
+        if crate::tree::get_active_pane_id(&win.root, path) == Some(pane_id) {
+            return match active_pane(&win.root, path) {
+                Some(p) => !pane_wants_bare_motion(p),
+                None => true,
+            };
+        }
+    }
+    true
 }
 
 /// Detect whether a pane has a VT bridge descendant (wsl.exe, ssh.exe, etc.)
@@ -339,6 +318,76 @@ fn detect_mouse_input(pane: &mut Pane) -> bool {
     };
     pane.mouse_input_cache = Some((std::time::Instant::now(), result));
     result
+}
+
+/// Ensure the child's console has ENABLE_VIRTUAL_TERMINAL_INPUT set before
+/// writing an SGR mouse sequence to its PTY input pipe.
+///
+/// Root cause of #277/#245: conhost silently drops VT bytes written to the
+/// ConPTY master (`write_mouse_to_pty`) instead of delivering them to the
+/// child as literal characters when the child's console has VTI off — which
+/// is the default for a freshly spawned shell or TUI app that hasn't called
+/// `SetConsoleMode` yet.  Without this, every wheel event forwarded to an
+/// alt-screen/mouse-tracking app (nvim, vim, opencode, custom SGR readers)
+/// vanishes before it reaches the child at all.
+///
+/// Cached for 2 seconds per pane (same TTL as the other mouse-inject
+/// detectors) to avoid the AttachConsole/CreateFileW/SetConsoleMode dance on
+/// every wheel tick once VTI is confirmed on.
+fn ensure_vti(pane: &mut Pane) {
+    if let Some((ts, cached)) = pane.vti_mode_cache {
+        if cached || ts.elapsed().as_secs() < 2 {
+            return;
+        }
+    }
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    if let Some(pid) = pane.child_pid {
+        let enabled = mouse_inject::query_vti_enabled(pid).unwrap_or(false)
+            || mouse_inject::ensure_vti_enabled(pid);
+        pane.vti_mode_cache = Some((std::time::Instant::now(), enabled));
+    }
+}
+
+/// Classify the pane's foreground process for the scroll-wheel
+/// alternate-scroll decision (issue #277): is it a confirmed non-shell
+/// program, and if so what is it called?
+///
+/// Returns `(non_shell_fg, foreground_exe_name)`.  `non_shell_fg` is only
+/// true on a *confirmed* `Some(false)` from
+/// `platform::process_info::foreground_is_shell` — never on `None` (probe
+/// failure) or `Some(true)` (confirmed shell) — the same tri-state gating
+/// #381/#285 established for Ctrl+C routing, so a normal shell prompt keeps
+/// entering copy mode on wheel-up (#360) and a probe hiccup never changes
+/// behavior. `foreground_exe_name` lets the caller special-case legacy
+/// DOS-heritage pagers (`more.com`) that don't consume arrow keys.
+///
+/// Cached for 2 seconds per pane (same TTL/rationale as `detect_vt_bridge` /
+/// `detect_mouse_input` / `ensure_vti` above) since this walks the full
+/// system process snapshot twice (`foreground_is_shell` +
+/// `get_foreground_process_name`) — too expensive to redo on every wheel
+/// tick during a fast scroll flick.
+fn scroll_foreground_classify(pane: &mut Pane) -> (bool, Option<String>) {
+    if let Some((ts, non_shell, ref name)) = pane.scroll_fg_cache {
+        if ts.elapsed().as_secs() < 2 {
+            return (non_shell, name.clone());
+        }
+    }
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    let (non_shell, name) = match pane.child_pid {
+        Some(pid) => {
+            let non_shell = crate::platform::process_info::foreground_is_shell(pid)
+                .map_or(false, |is_shell| !is_shell);
+            let name = crate::platform::process_info::get_foreground_process_name(pid);
+            (non_shell, name)
+        }
+        None => (false, None),
+    };
+    pane.scroll_fg_cache = Some((std::time::Instant::now(), non_shell, name.clone()));
+    (non_shell, name)
 }
 
 /// Helper: inject SGR mouse via WriteConsoleInputW KEY_EVENT records.
@@ -429,15 +478,20 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // remote shell prints raw escape sequences at the prompt.
         // This is the root cause of issue #77 (mouse events leak as raw
         // text into SSH panes).
-        let wants = pane.term.lock().ok()
-            .map_or(false, |t| t.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None);
+        let mode = pane.term.lock().ok()
+            .map_or(vt100::MouseProtocolMode::None, |t| t.screen().mouse_protocol_mode());
+        let wants = mode != vt100::MouseProtocolMode::None;
         if !wants {
-            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true -> SUPPRESSED (remote has no mouse tracking)",
-                col, row, vt_button, press, win_name));
+            // The mode is part of the message on purpose: #604 was a case where
+            // the remote app HAD enabled 1002 and psmux itself knocked the mode
+            // back to None, which is indistinguishable from "never asked"
+            // unless the log says which one it saw.
+            mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true mode={:?} -> SUPPRESSED (remote has no mouse tracking)",
+                col, row, vt_button, press, win_name, mode));
             return;
         }
-        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true -> WriteConsoleInputW KEY_EVENT injection",
-            col, row, vt_button, press, win_name));
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} vt_bridge=true mode={:?} -> WriteConsoleInputW KEY_EVENT injection",
+            col, row, vt_button, press, win_name, mode));
         inject_sgr_mouse(pane, col, row, vt_button, press);
     } else {
         // Native ConPTY child — write SGR mouse to PTY pipe.
@@ -446,6 +500,73 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // and passes VT through for nvim/vim.
         mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} -> PTY pipe SGR mouse (Windows Terminal method)",
             col, row, vt_button, press, win_name));
+        // tmux parity for the wheel (#598): a mouse REPORT is only ever
+        // written to a pane whose application actually enabled a mouse
+        // protocol.  tmux enforces that in input_key_mouse (input-keys.c):
+        //
+        //     if (m->ignore || (s->mode & ALL_MOUSE_MODES) == 0)
+        //             return;
+        //
+        // The `alternate_on` term in tmux's default WheelUpPane binding
+        // (key-bindings.c: `if -F '#{||:#{alternate_on},#{pane_in_mode},
+        // #{mouse_any_flag}}' { send -M } { copy-mode -e }`) only decides
+        // "do not fall through to copy-mode".  On the alternate screen with
+        // no mouse mode, `send -M` writes nothing at all.
+        //
+        // psmux forwarded on the alternate screen ALONE, so a full-screen app
+        // that never asked for the mouse had raw `ESC[<64;col;rowM` typed into
+        // it and read the report as keystrokes: htop opened its "Search: "
+        // prompt and filled it with the digits and separators of the report,
+        // and codex lost its transcript (#598).
+        //
+        // Both delivery channels have to obey the gate.  The PTY pipe is the
+        // obvious one, but the Win32 MOUSE_EVENT record injected below is not
+        // self gating as it looks: WriteConsoleInputW puts the record straight
+        // into the input buffer, and a child reading with
+        // ENABLE_VIRTUAL_TERMINAL_INPUT gets conhost's VT translation of that
+        // record, which is the same `ESC[<64;col;rowM`.  Measured on this
+        // tree: suppressing only the pipe write still leaked the report.
+        // Clicks and drags keep their existing `pane_wants_click` gate; only
+        // the wheel path is in scope here.
+        //
+        // "Did the application ask for the mouse" has two authoritative
+        // answers on Windows, and the raw `mouse_protocol_mode()` is NOT one
+        // of them: a freshly spawned console already has ENABLE_MOUSE_INPUT
+        // in its inherited input mode, so conhost emits `ESC[?1003;1006h`
+        // upstream before any application has run, and PSReadLine re-enables
+        // tracking on its own (#360/#548).  Measured on this tree: a pane
+        // whose child had explicitly CLEARED ENABLE_MOUSE_INPUT still showed
+        // `?1003;1006h` in the raw pane stream.  The two signals that do mean
+        // the application asked:
+        //
+        //   1. `mouse_proto_owner` — a DECSET transition that
+        //      `update_mouse_proto_owner` attributed to a confirmed non-shell
+        //      foreground.  This is the accurate signal for VT panes whose
+        //      DECSET actually survives (bridges, passthrough).
+        //   2. ENABLE_MOUSE_INPUT on the child console RIGHT NOW.  Console
+        //      input mode lives on the shared input buffer, so this reports
+        //      whatever the current foreground app last asked for, which is
+        //      exactly how a real Windows TUI (crossterm, ratatui, libuv)
+        //      registers.
+        //
+        // The console query costs an AttachConsole dance (2 second cache), so
+        // it is only run for the wheel, and only after the cheap
+        // `mouse_proto_owner` check has already failed.  Clicks, drags and
+        // motion never reach it.
+        if _event_flags & mouse_inject::MOUSE_WHEELED != 0
+            && !matches!(pane.mouse_proto_owner, Some((_, true)))
+            && !detect_mouse_input(pane)
+        {
+            mouse_log("  -> wheel report SUPPRESSED on both channels: pane app enabled no \
+                       mouse protocol (tmux input_key_mouse parity, #598)");
+            return;
+        }
+
+        // #277/#245: conhost silently drops the SGR bytes below unless the
+        // child's console already has ENABLE_VIRTUAL_TERMINAL_INPUT set —
+        // ensure it first so the sequence actually reaches VT-reading apps
+        // (nvim, vim, opencode) instead of vanishing before the child sees it.
+        ensure_vti(pane);
         write_mouse_to_pty(pane, col, row, vt_button, press);
 
         // For wheel events, also inject a Win32 MOUSE_EVENT record.
@@ -535,28 +656,6 @@ pub fn toggle_zoom(app: &mut AppState) {
     resize_all_panes(app);
 }
 
-/// Compute tab positions on the server side to match the client's status bar layout.
-/// The client renders: "[session_name] idx: window_name idx: window_name ..."
-/// NOTE: No longer called — tab clicks are now handled client-side with exact
-/// rendered positions.  Kept for reference / potential embedded-mode use.
-#[allow(dead_code)]
-pub fn update_tab_positions(app: &mut AppState) {
-    let mut tab_pos: Vec<(usize, u16, u16)> = Vec::new();
-    let mut cursor_x: u16 = 0;
-    // Session label: "[session_name] "
-    let session_label_len = app.session_name.len() as u16 + 3; // '[' + name + ']' + ' '
-    cursor_x += session_label_len;
-    // Window tabs: "idx: window_name " for each window
-    for (i, w) in app.windows.iter().enumerate() {
-        let display_idx = app.win_display_index(i);
-        let label = format!("{}: {} ", display_idx, w.name);
-        let start_x = cursor_x;
-        cursor_x += label.len() as u16;
-        tab_pos.push((i, start_x, cursor_x));
-    }
-    app.tab_positions = tab_pos;
-}
-
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
     // Status bar tab clicks are handled client-side via select-window.
@@ -643,7 +742,7 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
             let (col, row) = pane_inner_cell_0based(area, x, y);
             let win_name = win.name.clone();
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                if pane_wants_mouse(active) {
+                if pane_wants_click(active) {
                     inject_mouse_combined(active, col, row, 0, true,
                         mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0, &win_name);
                 }
@@ -697,9 +796,16 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
     if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-        if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
-            win.active_path = path.clone();
-            let (row, col) = copy_cell_for_area(*area, x, y);
+        // Prefer the pane under the pointer; fall back to the active
+        // (copy-mode) pane so a drag that leaves every pane rect still
+        // extends the selection and can auto-scroll at the edges.
+        let target = rects.iter()
+            .find(|(_, area)| area.contains(ratatui::layout::Position { x, y }))
+            .or_else(|| rects.iter().find(|(p, _)| *p == win.active_path))
+            .map(|(p, a)| (p.clone(), *a));
+        if let Some((path, area)) = target {
+            win.active_path = path;
+            let (row, col) = copy_cell_for_area(area, x, y);
             if app.copy_anchor.is_none() {
                 // Only start selection when mouse moves to a different cell
                 // than the click position. Prevents micro-drag jitter (#199).
@@ -711,6 +817,15 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((row, col));
+            // tmux parity (#62): dragging on/past the pane's first or last
+            // row scrolls the view so the selection continues into scrollback.
+            if y <= area.y {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_up(app, 1);
+            } else if y + 1 >= area.y + area.height {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_down(app, 1);
+            }
         }
         return;
     }
@@ -723,7 +838,7 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
             let (col, row) = pane_inner_cell_0based(area, x, y);
             let win_name = win.name.clone();
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                if pane_wants_mouse(active) {
+                if pane_wants_click(active) {
                     inject_mouse_combined(active, col, row, 32, true,
                         mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, mouse_inject::MOUSE_MOVED, &win_name);
                 }
@@ -762,13 +877,22 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
                 return;
             }
         }
-        // Auto-yank if real selection exists (anchor != pos), else clear stale anchor
+        // Auto-yank if a real selection exists, else clear the stale anchor.
+        // Compare CONTENT positions (screen row minus the scroll offset it
+        // was recorded at, as yank_selection does), not screen cells: edge
+        // auto-scroll can park the release on the anchor's screen cell
+        // while the selection spans many scrolled lines.
         if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-            if a != p {
+            let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
+            let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+            if (a_abs, a.1) != (p_abs, p.1) {
                 let _ = yank_selection(app);
-            } else {
-                app.copy_anchor = None;
             }
+            // tmux parity (#62): ending a drag cancels copy mode and
+            // returns to the live view (copy-pipe-and-cancel) even when
+            // the selection came up empty, matching the pane-mouse
+            // release path.
+            exit_copy_mode(app);
         }
         return;
     }
@@ -786,7 +910,7 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
         let (col, row) = pane_inner_cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            if pane_wants_mouse(active) {
+            if pane_wants_click(active) {
                 inject_mouse_combined(active, col, row, 0, false,
                     0, 0, &win_name);
             }
@@ -804,7 +928,7 @@ pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press
         let (col, row) = pane_inner_cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            if pane_wants_mouse(active) {
+            if pane_wants_click(active) {
                 let sgr_btn = match button {
                     1 => 1u8, // middle
                     2 => 2u8, // right
@@ -828,24 +952,26 @@ pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press
 
 /// Forward bare mouse motion (hover) to the child PTY.
 ///
-/// Only forwarded when the child has EXPLICITLY enabled mouse motion
-/// tracking (`pane_wants_hover`, DECSET 1002/1003).  Do NOT use the
-/// permissive pane_wants_mouse() heuristic here: its is_fullscreen_tui
-/// tier false-positives on a filled screen with a NON-shell foreground
+/// Only forwarded when the child has EXPLICITLY enabled any-event motion
+/// tracking (`pane_wants_bare_motion`, DECSET 1003). Screen-content heuristics
+/// false-positive on a filled screen with a NON-shell foreground
 /// (podman/docker interactive containers, discussion #349), spraying raw
 /// SGR motion bytes (35;x;yM...) into the container tty as visible garbage.
-/// This matches the local input path, which was fixed the same way in #296.
-///
 /// SGR button 35 = bare motion with no button held (WT parity).
 /// Windows Terminal encodes hover as WM_MOUSEMOVE -> button 3 + 0x20 = 35.
 ///
 /// Same-coordinate events are suppressed (Windows Terminal parity: the
 /// terminal only sends motion when coordinates actually change).
-pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
+///
+/// Returns true when a report was actually written into a pane.  The caller
+/// uses that to decide whether the move is worth a redraw: a bare pointer
+/// move that reaches no pane changes nothing on screen, and repainting for it
+/// is what made the cursor flicker while the mouse was merely moving (#604).
+pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) -> bool {
     let (x, y) = map_client_coords(app, x, y);
     // WT parity: suppress same-coordinate duplicates
     if app.last_hover_pos == Some((x, y)) {
-        return;
+        return false;
     }
     app.last_hover_pos = Some((x, y));
 
@@ -862,12 +988,14 @@ pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
         let (col, row) = pane_inner_cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-            if pane_wants_hover(active) {
+            if pane_wants_bare_motion(active) {
                 inject_mouse_combined(active, col, row, 35, true,
                     0, mouse_inject::MOUSE_MOVED, &win_name);
+                return true;
             }
         }
     }
+    false
 }
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
@@ -918,15 +1046,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
     // Determine target pane, switch focus, and check if child is a TUI app
     // that should receive scroll events.
     //
-    // Detection strategy (same as pane_wants_mouse, fixes #285):
-    //   1. alternate_screen() — authoritative on newer Windows 11+ ConPTY
-    //   2. is_fullscreen_tui() heuristic — fallback for older Windows 10
-    //      builds where ConPTY strips DECSET 1049h.
-    //
-    // Note: is_fullscreen_tui() may false-positive after `ls`/`dir` fills
-    // the screen (preventing scroll-to-copy-mode briefly), but this is far
-    // less harmful than completely breaking scroll in TUI apps like Neovim
-    // on older Windows.
+    // Wheel gate: alternate_screen ONLY (see pane_in_alt_screen).
     let (child_in_alt_screen, target_area_opt, sgr_btn, button_state) = {
         let win = &mut app.windows[app.active_idx];
         let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
@@ -948,7 +1068,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         }
 
         let alt = active_pane(&win.root, &win.active_path)
-            .map_or(false, |p| pane_wants_mouse(p));
+            .map_or(false, |p| pane_wheel_forward(p));
         let sgr_btn: u8 = if up { 64 } else { 65 };
         let wheel_delta: i16 = if up { 120 } else { -120 };
         let bs = ((wheel_delta as i32) << 16) as u32;
@@ -1016,17 +1136,34 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
 
     // Handle copy mode: position cursor with pane-relative coordinates
     if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-        let r = row.max(0) as u16;
-        let c = col.max(0) as u16;
+        // Visible pane extent, for clamping and edge detection.  The client
+        // sends drag/release coordinates unclamped, so an out-of-range row
+        // is the signal that the pointer crossed a pane edge.
+        let (rows_v, cols_v) = {
+            let w = &app.windows[app.active_idx];
+            active_pane(&w.root, &w.active_path)
+                .map(|p| (p.last_rows, p.last_cols))
+                .unwrap_or((0, 0))
+        };
+        let max_r = (rows_v.saturating_sub(1)) as i16;
+        let max_c = (cols_v.saturating_sub(1)) as i16;
+        let r = row.clamp(0, max_r.max(0)) as u16;
+        let c = col.clamp(0, max_c.max(0)) as u16;
         if button == 0 && press {
             // Left press: position cursor, clear selection
             app.copy_anchor = None;
             app.copy_pos = Some((r, c));
             app.copy_mouse_down_cell = Some((r, c));
         } else if button == 32 {
-            // Left drag: extend selection, but ignore same-cell micro-jitter (#199)
+            // Left drag: extend selection, but ignore same-cell micro-jitter
+            // (#199) — only while the RAW coordinates are still inside the
+            // pane.  A drag past an edge clamps onto the click cell too
+            // (press on the first row, drag straight up), but the pointer
+            // leaving the pane is a real drag that must start the selection
+            // and auto-scroll below, never jitter.
+            let raw_in_range = row >= 0 && row <= max_r && col >= 0 && col <= max_c;
             if app.copy_anchor.is_none() {
-                if app.copy_pos == Some((r, c)) {
+                if raw_in_range && app.copy_pos == Some((r, c)) {
                     return; // same cell as click, ignore jitter
                 }
                 app.copy_anchor = Some(app.copy_pos.unwrap_or((r, c)));
@@ -1034,6 +1171,23 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((r, c));
+            // tmux parity (#62): dragging on/past the pane's first or last
+            // row scrolls the view so the selection keeps growing into
+            // scrollback; speed rises with distance past the edge.  The
+            // client re-sends the last drag every 50ms while the pointer
+            // dwells there, which is what makes the scroll continuous.
+            // Once the view scrolls this is definitely a drag, so drop the
+            // pending click cell: the release-side #199 guard compares
+            // screen cells, which scrolling invalidates — a release on the
+            // same screen cell would otherwise be mistaken for a click and
+            // discard the selection.
+            if row <= 0 {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_up(app, 1 + ((-row) as usize / 2).min(4));
+            } else if row >= max_r {
+                app.copy_mouse_down_cell = None;
+                scroll_copy_down(app, 1 + ((row - max_r) as usize / 2).min(4));
+            }
         } else if button == 0 && !press {
             // Left release: finalize position
             app.copy_pos = Some((r, c));
@@ -1047,9 +1201,25 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                     return;
                 }
             }
-            // Auto-yank if real selection exists (anchor != pos)
+            // Auto-yank if a real selection exists.  Compare CONTENT
+            // positions (screen row minus the scroll offset it was recorded
+            // at, as yank_selection does), not screen cells: edge
+            // auto-scroll can park the release on the anchor's screen cell
+            // while the selection spans many scrolled lines.
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-                if a != p { let _ = yank_selection(app); }
+                let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
+                let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+                if (a_abs, a.1) != (p_abs, p.1) {
+                    let _ = yank_selection(app);
+                }
+                // tmux parity (#62): ending a drag cancels copy mode and
+                // returns to the live view (copy-pipe-and-cancel), even
+                // when the selection came up empty — e.g. a drag past the
+                // top of a pane with no scrollback, where the edge scroll
+                // was a no-op and the pointer clamped back onto the
+                // anchor.  An anchor here always means a real drag: plain
+                // clicks were snapped back by the guards above.
+                exit_copy_mode(app);
             }
         }
         return;
@@ -1058,17 +1228,19 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
     // Forward mouse event to PTY if pane wants it.
     //
     // Bare motion (SGR button 35, no button held) requires the child to have
-    // EXPLICITLY enabled motion tracking (pane_wants_hover, DECSET 1002/1003).
-    // The permissive pane_wants_mouse() heuristic false-positives on a filled
-    // screen with a non-shell foreground (podman/docker interactive containers,
-    // discussion #349), which sprayed "35;x;yM" as visible garbage into the
-    // container tty on every mouse move.  Clicks/drags/wheel keep the
-    // permissive gate so TUI mouse support on ConPTY builds that strip the
-    // DECSETs keeps working (#285).
+    // EXPLICITLY enabled any-event tracking (pane_wants_bare_motion, DECSET
+    // 1003, because 1002 only asks for motion while a button is held, #604).
+    // Clicks/drags (buttons 0/1/2/32) use pane_wants_click, which avoids
+    // screen-content heuristics that false-positive on a
+    // filled screen with a non-shell foreground (podman/docker interactive
+    // containers, discussion #349), which forwarded left/right clicks as
+    // "0;x;yM0;x;ym" garbage into the container tty (comment 17754744). Real
+    // mouse support (VT DECSET apps, alt-screen apps, and native crossterm
+    // apps via ENABLE_MOUSE_INPUT — the #285 case) is preserved.
     let win = &mut app.windows[app.active_idx];
     let win_name = win.name.clone();
     if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
-        let wants = if button == 35 { pane_wants_hover(pane) } else { pane_wants_mouse(pane) };
+        let wants = if button == 35 { pane_wants_bare_motion(pane) } else { pane_wants_click(pane) };
         if wants {
             let button_state = match (button, press) {
                 (0, true) => mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
@@ -1082,8 +1254,88 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
     }
 }
 
+/// Hand a normal-mode client-side drag selection off to copy mode.
+///
+/// The client sends this when a drag at the shell prompt reaches the pane's
+/// top edge — or, when the view is direct-scrolled (scroll-enter-copy-mode
+/// off, #193), its bottom edge: the visible screen has run out, so the
+/// selection must continue into scrollback (tmux parity — a prompt drag is
+/// a copy-mode selection).  `anchor` is the cell where the drag started and
+/// `cur` the current pointer cell, both pane-relative 0-based; out-of-range
+/// values are clamped.  From here on the client keeps sending regular
+/// `pane-mouse 32` drags, which auto-scroll at the edges (see
+/// handle_pane_mouse).
+pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anchor_row: i16,
+                       col: i16, row: i16, rect_sel: bool) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. } | Mode::PopupMode { .. }) {
+        return;
+    }
+
+    // Find and focus the pane the drag started in.
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    let mut found_path: Option<Vec<usize>> = None;
+    for (path, _area) in &rects {
+        if let Some(pid) = crate::tree::get_active_pane_id(&win.root, path) {
+            if pid == pane_id {
+                found_path = Some(path.clone());
+                break;
+            }
+        }
+    }
+    let Some(path) = found_path else { return; };
+    if win.active_path != path {
+        win.active_path = path.clone();
+        if let Some(pid) = crate::tree::get_active_pane_id(&win.root, &path) {
+            crate::tree::touch_mru(&mut win.pane_mru, pid);
+        }
+    }
+    let (rows_v, cols_v) = active_pane(&win.root, &path)
+        .map(|p| (p.last_rows, p.last_cols))
+        .unwrap_or((0, 0));
+    if rows_v == 0 || cols_v == 0 { return; }
+
+    // enter_copy_mode keeps a direct-scrolled view (scroll-enter-copy-mode
+    // off, #193): the drag was made over the content currently on screen,
+    // and copy_scroll_offset starts at the parser's live scrollback, so the
+    // anchor below lands at the offset the user was looking at.
+    enter_copy_mode(app);
+    let max_r = (rows_v - 1) as i16;
+    let max_c = (cols_v - 1) as i16;
+    app.copy_anchor = Some((anchor_row.clamp(0, max_r) as u16, anchor_col.clamp(0, max_c) as u16));
+    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+    app.copy_selection_mode = if rect_sel {
+        crate::types::SelectionMode::Rect
+    } else {
+        crate::types::SelectionMode::Char
+    };
+    app.copy_pos = Some((row.clamp(0, max_r) as u16, col.clamp(0, max_c) as u16));
+    // A drag is in progress, not a click: the release must yank, never
+    // snap back through the #199 click guard.
+    app.copy_mouse_down_cell = None;
+    // The handoff fires with the pointer at/past an edge — start scrolling
+    // immediately so the selection keeps growing (the bottom edge only
+    // moves when the view was scrolled back; at offset 0 it is a no-op).
+    if row <= 0 {
+        scroll_copy_up(app, 1 + ((-row) as usize / 2).min(4));
+    } else if row >= max_r {
+        scroll_copy_down(app, 1 + ((row - max_r) as usize / 2).min(4));
+    }
+}
+
 /// Handle a semantic scroll event targeted at a specific pane.
-pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
+///
+/// `at` is the pointer's pane-relative 0-based (col, row).  It is `None` only
+/// when the request came from a client too old to send it, in which case the
+/// pane centre is used as before.
+pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Option<(i16, i16)>) {
+    // Server request dispatch already applies this gate. Keep it here too so
+    // alternate/direct callers cannot scroll or enter copy mode with mouse off.
+    if !app.mouse_enabled {
+        return;
+    }
+
     // Ignore scroll in popup mode (#110)
     if matches!(app.mode, Mode::PopupMode { .. }) { return; }
 
@@ -1113,13 +1365,12 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         }
     }
 
-    // Use the stricter scroll-forward check (mouse protocol or alternate
-    // screen only).  The permissive pane_wants_mouse() heuristic misclassifies
-    // a normal shell that has filled the screen (prompt at the bottom) as a TUI
-    // app, so the wheel was forwarded to the shell instead of entering copy
-    // mode (#360).
+    // Wheel gate: alternate_screen ONLY — the known-good pre-3.3.5 semantics.
+    // Gating on mouse_protocol_mode (what #360's check kept) routed the wheel
+    // into pi's focused input box via PSReadLine's spurious mouse tracking;
+    // see pane_in_alt_screen for the full rationale.
     let alt = active_pane(&win.root, &win.active_path)
-        .map_or(false, |p| pane_wants_scroll_forward(p));
+        .map_or(false, |p| pane_wheel_forward(p));
 
     if alt {
         // Forward scroll to TUI app
@@ -1128,21 +1379,87 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         let sgr_btn: u8 = if up { 64 } else { 65 };
         let wheel_delta: i16 = if up { 120 } else { -120 };
         let button_state = ((wheel_delta as i32) << 16) as u32;
-        // Use center of pane for coordinates — some TUI frameworks
-        // (Bubble Tea) may ignore events at position (0,0) if it's
-        // outside the scrollable viewport.
+        // Report the wheel at the pointer's real position so the app can scroll
+        // the window actually under the cursor (#570).  A TUI with its own split
+        // layout (a file tree beside an editor, an embedded terminal) routes the
+        // wheel by column/row, so reporting a fixed point made every notch scroll
+        // whichever of its windows happened to cover that point.
+        //
+        // Only when the client did not send a position (older build) fall back to
+        // the pane centre: some TUI frameworks (Bubble Tea) ignore events at (0,0)
+        // when that is outside their scrollable viewport.
         let pane_area = rects.iter()
             .find(|(p, _)| *p == win.active_path)
             .map(|(_, a)| *a);
-        let (col, row) = pane_area.map_or((5, 5), |a| {
-            ((a.width / 2) as i16, (a.height / 2) as i16)
+        let (col, row) = at.unwrap_or_else(|| {
+            pane_area.map_or((5, 5), |a| ((a.width / 2) as i16, (a.height / 2) as i16))
         });
         if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
             inject_mouse_combined(pane, col, row, sgr_btn, true,
                 button_state, mouse_inject::MOUSE_WHEELED, &win_name);
         }
+        return;
+    }
+
+    // Not mouse-aware and not on psmux's tracked alternate screen.  tmux
+    // parity: a main-screen program without mouse tracking gets copy-mode
+    // scrollback.  Alternate-scroll (DECSET 1007, wheel → arrow keys) only
+    // ever applies to ALTERNATE-screen panes in tmux/xterm; the forward
+    // branch above already covers those via wheel injection.
+    //
+    // Do NOT blanket-translate the wheel into arrow keys for every non-shell
+    // foreground.  Interactive inline TUIs (pi, Claude Code, …) run on the
+    // main screen without mouse tracking, and their focused input box reads
+    // Up/Down as prompt-history navigation: the general alternate-scroll
+    // branch this replaced sent 3×arrows per wheel notch, so the wheel over
+    // pi cycled prompt history instead of scrolling the transcript
+    // (regression 3.3.4→3.3.5+).
+    //
+    // The one legacy pager that genuinely needs help stays as an exact
+    // allowlist. `more.com` is a DOS-heritage getch()-style reader that
+    // parses no ANSI escape sequences at all, so arrow keys are a silent
+    // no-op for it — proven by direct keystroke testing (Enter advances one
+    // line, Space one page, arrows do nothing). It's also forward-only by
+    // design (MS docs: no backward paging), so only wheel-down gets the
+    // Enter-advance treatment; wheel-up falls through to copy-mode entry,
+    // which already works because psmux's own scrollback buffer captured
+    // everything `more` printed regardless of what `more` can rewind to.
+    //
+    // `non_shell_fg` is gated on a *confirmed* `Some(false)` from the
+    // process-identity check in platform::process_info::foreground_is_shell
+    // (the same tri-state helper Ctrl+C routing uses for issue #381/#285) —
+    // never on `None` (probe failure) or `Some(true)` (confirmed shell).
+    // This deliberately avoids content-based fullscreen heuristics, which
+    // misclassify a normal shell whose
+    // screen happens to be full (prompt at the bottom) as a TUI app, which
+    // is exactly the false positive #360 fixed for copy-mode entry. Process
+    // identity has no such ambiguity — a real shell binary is never
+    // misreported as "not a shell". The legacy-pager exe-name check is
+    // similarly precise (an exact allowlist, not a guess), so Enter is only
+    // ever forwarded to the one program confirmed to want it — never to an
+    // arbitrary non-shell foreground, where an unsolicited Enter could
+    // submit a REPL/confirmation prompt the user didn't intend to trigger.
+    let (non_shell_fg, fg_name) = active_pane_mut(&mut win.root, &win.active_path)
+        .map_or((false, None), scroll_foreground_classify);
+    // `get_foreground_process_name` returns the exe stem without extension
+    // (e.g. "more" for more.com/more.exe), matching how `is_shell_exe`'s own
+    // allowlist ("pwsh", "cmd", ...) is written — verified directly via
+    // PSMUX_MOUSE_DEBUG against a live `more.com` child (fg_name=Some("more")).
+    let is_legacy_pager = non_shell_fg && fg_name.as_deref()
+        .map_or(false, |n| n.eq_ignore_ascii_case("more"));
+
+    if is_legacy_pager && !up {
+        // `more.com`: Enter is its "advance one line" key.
+        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+            for _ in 0..3 {
+                crate::input::write_key_seq(pane, b"\r");
+            }
+            let _ = pane.writer.flush();
+        }
     } else if up && app.scroll_enter_copy_mode {
-        // Shell prompt — enter copy mode and scroll
+        // Everything else (shell prompt, inline TUI like pi, `more.com`
+        // wheel-up, or a probe failure) — enter copy mode and scroll
+        // psmux's own buffer, exactly like tmux.
         enter_copy_mode(app);
         scroll_copy_up(app, 3);
     } else if !app.scroll_enter_copy_mode {
@@ -1366,10 +1683,10 @@ mod position_token_tests {
 }
 
 #[cfg(test)]
-mod swap_mru_tests {
+mod window_ops_tests {
     use super::swap_pane_with_path;
     use crate::proxy_pane::create_proxy_pane;
-    use crate::types::{AppState, LayoutKind, Node, Window};
+    use crate::types::{AppState, LayoutKind, Mode, Node, Window};
     use ratatui::layout::Rect;
     use std::net::{TcpListener, TcpStream};
 
@@ -1411,6 +1728,8 @@ mod swap_mru_tests {
             active_path: vec![0],
             name: "w0".to_string(),
             id: 0,
+            area: Rect::new(0, 0, 10, 5),
+            window_size: None,
             activity_flag: false,
             bell_flag: false,
             silence_flag: false,
@@ -1426,6 +1745,48 @@ mod swap_mru_tests {
         }
     }
 
+    fn make_scrollback_app(mouse_enabled: bool) -> AppState {
+        let pane = proxy_pane(41, 8, 40);
+        let history = (0..80)
+            .map(|line| format!("history-{line}\r\n"))
+            .collect::<String>();
+        pane.term
+            .lock()
+            .expect("term lock")
+            .process(history.as_bytes());
+
+        let mut app = AppState::new("mouse-scrollback".to_string());
+        app.mouse_enabled = mouse_enabled;
+        app.scroll_enter_copy_mode = true;
+        app.last_window_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        app.windows.push(Window {
+            root: Node::Leaf(pane),
+            active_path: vec![],
+            name: "w0".to_string(),
+            id: 0,
+            area: app.client_area,
+            window_size: None,
+            activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+            last_output_time: std::time::Instant::now(),
+            last_seen_version: 0,
+            manual_rename: false,
+            layout_index: 0,
+            pane_mru: vec![41],
+            zoom_saved: None,
+            linked_from: None,
+            floating: Vec::new(),
+            floating_focus: None,
+        });
+        app
+    }
+
     #[test]
     fn swap_with_path_updates_mru_for_focused_pane_after_swap() {
         let mut app = AppState::new("swap-mru".to_string());
@@ -1437,6 +1798,268 @@ mod swap_mru_tests {
         assert!(swapped, "swap should succeed");
         assert_eq!(app.windows[0].active_path, vec![1], "focus should follow moved active pane");
         assert_eq!(app.windows[0].pane_mru.first().copied(), Some(11), "MRU should be the focused pane id after swap");
+    }
+
+    #[test]
+    fn wheel_up_enters_copy_mode_and_repeated_wheel_scrolls_further() {
+        let mut app = make_scrollback_app(true);
+
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let first_offset = app.copy_scroll_offset;
+        assert!(
+            first_offset > 0,
+            "first wheel report must move into history"
+        );
+
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(
+            app.copy_scroll_offset > first_offset,
+            "repeated wheel reports must continue scrolling"
+        );
+    }
+
+    #[test]
+    fn mouse_off_ignores_wheel_without_entering_copy_mode() {
+        let mut app = make_scrollback_app(false);
+
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough));
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_at_top_edge_scrolls_into_history() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Press at row 2, then drag to the pane's top row: the view scrolls.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        assert_eq!(app.copy_anchor, Some((2, 5)));
+        assert_eq!(app.copy_pos, Some((0, 5)));
+        let after_edge = app.copy_scroll_offset;
+        assert!(after_edge > base, "drag on the top row must scroll up");
+
+        // Re-sending the same drag (the client's 50ms dwell repeat) keeps scrolling.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        assert!(app.copy_scroll_offset > after_edge, "dwell repeat must keep scrolling");
+
+        // Distance past the edge scrolls faster than the top row itself.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -8, true);
+        assert!(app.copy_scroll_offset >= o + 5, "far past the edge must scroll faster");
+        assert_eq!(app.copy_pos, Some((0, 5)), "cursor clamps to the top row");
+    }
+
+    #[test]
+    fn copy_drag_at_bottom_edge_scrolls_back_down() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+        assert!(base >= 6, "two wheel reports must scroll six lines");
+
+        // Press at row 3, drag to the last visible row (7 of 8): scrolls down.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 3, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert!(app.copy_scroll_offset < base, "drag on the last row must scroll down");
+
+        // Past the bottom edge: cursor clamps, scroll continues faster.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 12, true);
+        assert!(app.copy_scroll_offset < o);
+        assert_eq!(app.copy_pos, Some((7, 5)), "cursor clamps to the last row");
+    }
+
+    #[test]
+    fn copy_drag_straight_up_from_top_row_scrolls() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Press ON the top row, then drag straight up out of the pane with
+        // no horizontal movement: the clamped position lands back on the
+        // click cell, but crossing the edge is a real drag, not #199
+        // jitter — the selection must start and the view must scroll.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 0, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -1, true);
+        assert_eq!(app.copy_anchor, Some((0, 5)), "edge drag must start the selection");
+        assert!(app.copy_scroll_offset > base, "edge drag must scroll despite the same clamped cell");
+
+        // Dwell repeats at the same raw position keep scrolling.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 5, -1, true);
+        assert!(app.copy_scroll_offset > o, "dwell repeat must keep scrolling");
+    }
+
+    #[test]
+    fn copy_drag_straight_down_from_bottom_row_scrolls() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+        assert!(base >= 6, "two wheel reports must scroll six lines");
+
+        // Press ON the last visible row (7 of 8), drag straight down past
+        // the pane: same clamped cell, but the view must scroll back down.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 8, true);
+        assert_eq!(app.copy_anchor, Some((7, 5)), "edge drag must start the selection");
+        assert!(app.copy_scroll_offset < base, "edge drag must scroll back down");
+    }
+
+    #[test]
+    fn empty_edge_drag_release_exits_copy_mode() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // A drag journey that ends exactly where it started: up to the top
+        // edge (scrolls one line), down to the bottom edge (scrolls back),
+        // release on the anchor's content position.  Nothing is selected,
+        // but the drag still ends — tmux's copy-pipe-and-cancel cancels
+        // copy mode either way, it never leaves the user stranded there.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, base, "the two edge scrolls must cancel out");
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
+        assert!(app.paste_buffers.is_empty(), "an empty selection must not yank");
+        assert!(matches!(app.mode, Mode::Passthrough), "an empty drag must still exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn legacy_mouse_release_after_edge_scroll_yanks_and_exits() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None); // wheel into copy mode
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let base = app.copy_scroll_offset;
+
+        // Legacy screen-coordinate protocol (mouse-down/drag/up x y):
+        // press at row 2, drag onto the top row — the view edge-scrolls.
+        super::remote_mouse_down(&mut app, 5, 2);
+        super::remote_mouse_drag(&mut app, 5, 0);
+        assert!(app.copy_scroll_offset > base, "drag on the top row must scroll up");
+
+        // Release on the SAME screen cell as the press: the scroll made
+        // this a real multi-line selection, so it must yank (content
+        // positions), not be discarded by a screen-cell anchor == pos
+        // comparison.
+        super::remote_mouse_up(&mut app, 5, 2);
+        assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
+        assert!(app.paste_buffers[0].contains('\n'), "yank must span the scrolled lines");
+        // A mouse yank cancels copy mode and returns to live view (#62),
+        // same as the pane-mouse release path.
+        assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn enter_copy_mode_preserves_direct_scrolled_view() {
+        let mut app = make_scrollback_app(true);
+        // scroll-enter-copy-mode off (#193): the wheel scrolls the pane's
+        // parser directly, without entering copy mode.
+        app.scroll_enter_copy_mode = false;
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough), "direct scroll must not enter copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+
+        // Keyboard entry (prefix-[) over the scrolled view: copy mode must
+        // anchor its offset at the view on screen, not reset to 0 while
+        // the parser stays scrolled.
+        crate::copy_mode::enter_copy_mode(&mut app);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        assert_eq!(app.copy_scroll_offset, 6, "copy mode must keep the direct-scrolled view");
+    }
+
+    #[test]
+    fn copy_drag_release_after_edge_scroll_yanks_and_exits() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true); // scrolls the view
+        // Release on the SAME screen cell as the press: scrolling made this
+        // a real multi-line drag, so it must yank rather than be snapped
+        // back to a click — both the #199 click guard and the anchor/pos
+        // comparison work on screen cells, which the scroll invalidated.
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
+        assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
+        // Char-mode selection from (row 2, col 5)@offset 3 to (row 0, col 5)
+        // @offset 4 spans the two scrollback lines history-71/history-72,
+        // sliced at col 5 on both ends.
+        assert_eq!(app.paste_buffers[0], "ry-71\nhistor", "yank must span the scrolled lines");
+        // A mouse yank cancels copy mode and returns to live view (#62).
+        assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_begin_from_direct_scroll_preserves_offset_and_scrolls_down() {
+        let mut app = make_scrollback_app(true);
+        // scroll-enter-copy-mode off (#193): the wheel scrolls the pane's
+        // parser directly, without entering copy mode.
+        app.scroll_enter_copy_mode = false;
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough), "direct scroll must not enter copy mode");
+        assert_eq!(app.copy_scroll_offset, 0);
+
+        // A drag selection over the scrolled view reached the bottom row
+        // (7 of 8): the client hands off with the bottom-edge position.
+        super::copy_drag_begin(&mut app, 41, 5, 3, 5, 7, false);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        // The direct-scrolled view (offset 6) is preserved and anchors the
+        // selection; the bottom edge starts scrolling toward the live view.
+        assert_eq!(app.copy_anchor, Some((3, 5)));
+        assert_eq!(app.copy_anchor_scroll_offset, 6, "anchor must keep the direct-scroll offset");
+        assert_eq!(app.copy_scroll_offset, 5, "bottom-edge handoff must scroll down one line");
+
+        // Dwell drags on the bottom row keep scrolling toward the live view.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, 4);
+
+        // At the live bottom the scroll clamps instead of wrapping.
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
+        assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn copy_drag_begin_hands_prompt_drag_off_to_copy_mode() {
+        let mut app = make_scrollback_app(true);
+        assert!(matches!(app.mode, Mode::Passthrough));
+
+        // A prompt drag that started at (col 10, row 5) crossed the top
+        // edge (row -1): the client hands the selection off to copy mode.
+        super::copy_drag_begin(&mut app, 41, 10, 5, 10, -1, false);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        assert_eq!(app.copy_anchor, Some((5, 10)));
+        assert_eq!(app.copy_pos, Some((0, 10)), "current cell clamps to the top row");
+        assert!(app.copy_scroll_offset > 0, "handoff at the top edge starts scrolling");
+
+        // Follow-up dwell drags keep scrolling.
+        let o = app.copy_scroll_offset;
+        super::handle_pane_mouse(&mut app, 41, 32, 10, -1, true);
+        assert!(app.copy_scroll_offset > o);
+
+        // A second handoff while already in copy mode is ignored.
+        let anchor = app.copy_anchor;
+        super::copy_drag_begin(&mut app, 41, 0, 0, 0, 0, false);
+        assert_eq!(app.copy_anchor, anchor);
     }
 }
 
@@ -1578,6 +2201,8 @@ pub fn break_pane_to_window(app: &mut AppState) {
             active_path: vec![],
             name: win_name,
             id: app.next_win_id,
+            area: app.client_area,
+            window_size: None,
             activity_flag: false,
             bell_flag: false,
             silence_flag: false,
@@ -1674,6 +2299,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
         detect_shell()
     };
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    crate::pane::set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
     if let Some(dir) = workdir {
         let home = std::env::var("USERPROFILE")
@@ -1703,10 +2329,11 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let cq_writer = color_query_pending.clone();
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id, child_pid);
     pane.output_ring = output_ring;
 
-    let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let mut pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
 
     pane.master = pair.master;
@@ -1718,10 +2345,14 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.bell_pending = bell_pending;
     pane.cpr_pending = cpr_pending;
     pane.color_query_pending = color_query_pending;
-    pane.child_pid = None;
+    // Every other spawn site stores the fresh child pid; leaving this None
+    // blanked #{pane_pid} and sent #{pane_current_command} to its
+    // foreground-window fallback for the rest of the pane's life.
+    pane.child_pid = child_pid;
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
+    pane.scroll_fg_cache = None;
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
 
@@ -1755,6 +2386,7 @@ pub fn heal_respawn_pane(
         detect_shell()
     };
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    crate::pane::set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     drop(pair.slave);
@@ -1774,9 +2406,9 @@ pub fn heal_respawn_pane(
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id, child_pid);
 
-    let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let mut pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
 
     // Re-acquire the pane and swap in the fresh shell.
@@ -1796,6 +2428,7 @@ pub fn heal_respawn_pane(
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
+    pane.scroll_fg_cache = None;
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
     Ok(())
@@ -1804,10 +2437,6 @@ pub fn heal_respawn_pane(
 #[cfg(test)]
 #[path = "../tests-rs/test_issue81_resize_direction.rs"]
 mod test_issue81_resize_direction;
-
-#[cfg(test)]
-#[path = "../tests-rs/test_issue381_gitbash_fullscreen_falsepositive.rs"]
-mod test_issue381_gitbash_fullscreen_falsepositive;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue400_swap_pane_index_order.rs"]
@@ -1820,3 +2449,7 @@ mod test_issue442_swap_pane_source;
 #[cfg(test)]
 #[path = "../tests-rs/test_discussion349_podman_motion_leak.rs"]
 mod test_discussion349_podman_motion_leak;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue604_wsl_nvim_mouse.rs"]
+mod test_issue604_wsl_nvim_mouse;

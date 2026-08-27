@@ -1,6 +1,6 @@
 [package]
 name = "psmux"
-version = "3.3.6"
+version = "3.3.8"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
@@ -66,13 +66,21 @@ path = "tests-rs/test_issue299_pwsh_snippet_integration.rs"
 name = "test_pr469_osc_command_safety"
 path = "tests-rs/test_pr469_osc_command_safety.rs"
 
+[[test]]
+name = "test_issue494_copymode_freeze"
+path = "tests-rs/test_issue494_copymode_freeze.rs"
+
+[dev-dependencies]
+parking_lot = "0.12.5"
+
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_DataExchange",
+    "Win32_Storage_FileSystem",
 ] }
 
 [[bin]]
@@ -88,19 +96,19 @@ name = "tmux"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.30"
-crossterm = "0.29"
-portable-pty = { version = "0.9.5", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
-which = "8"
-chrono = "0.4"
-vt100 = { version = "0.16.8", path = "crates/vt100-psmux", package = "vt100-psmux" }
-unicode-width = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-regex = "1"
-glob = "0.3"
-anyhow = "1"
-base64 = "0.22"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+portable-pty = { version = "0.9.7", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
+which = "8.0.5"
+chrono = "0.4.45"
+vt100 = { version = "0.16.11", path = "crates/vt100-psmux", package = "vt100-psmux" }
+unicode-width = "0.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+regex = "1.13.1"
+glob = "0.3.4"
+anyhow = "1.0.104"
+base64 = "0.23.1"
 
 [profile.release]
 opt-level = 3

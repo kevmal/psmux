@@ -132,7 +132,7 @@ impl MasterPty for ConPtyMasterPty {
 
     fn get_size(&self) -> Result<PtySize, Error> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.size.clone())
+        Ok(inner.size)
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
@@ -148,6 +148,10 @@ impl MasterPty for ConPtyMasterPty {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("writer already taken"))?,
         ))
+    }
+
+    fn conpty_passthrough_mode(&self) -> Option<bool> {
+        Some(self.inner.lock().unwrap().con.used_passthrough)
     }
 }
 
@@ -204,4 +208,39 @@ impl SlavePty for ConPtySlavePty {
 fn is_invalid_parameter(e: &anyhow::Error) -> bool {
     let msg = format!("{}", e);
     msg.contains("os error 87")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    const CHILD_ENV: &str = "PORTABLE_PTY_CONPTY_PASSTHROUGH_TEST_CHILD";
+
+    #[test]
+    fn reports_when_passthrough_is_disabled_by_environment() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let pair = ConPtySystem::default().openpty(PtySize::default()).unwrap();
+
+            assert_eq!(pair.master.conpty_passthrough_mode(), Some(false));
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "win::conpty::tests::reports_when_passthrough_is_disabled_by_environment",
+            ])
+            .env("PSMUX_NO_PASSTHROUGH", "1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

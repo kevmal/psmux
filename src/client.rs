@@ -187,6 +187,66 @@ pub(crate) fn build_osc8_overlay(runs: &[HyperlinkRun]) -> String {
     out
 }
 
+/// Content area of a pane after reserving the `pane-border-status` label row.
+/// Must match `render_layout_json`'s `inner`; the caret and every screen→cell
+/// mouse mapping route through this so they stay aligned with the content (#288).
+pub(crate) fn pane_content_inner(area: Rect, border_status: &str, border_format: &str) -> Rect {
+    let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
+    if !has_border_label {
+        return area;
+    }
+    if border_status == "top" {
+        Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+    } else {
+        // "bottom": content keeps its top origin, only the last row is reserved.
+        Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+    }
+}
+
+/// Screen rect of the centred display-popup overlay.
+///
+/// The draw pass and the post-draw cursor write both need this rect and must
+/// agree on it to the cell, or the cursor lands off the popup it belongs to
+/// (#507), so both call this instead of recomputing the geometry.
+pub(crate) fn popup_overlay_rect(content_chunk: Rect, want_w: u16, want_h: u16) -> Rect {
+    let w = want_w.min(content_chunk.width.saturating_sub(2));
+    let h = want_h.min(content_chunk.height.saturating_sub(2));
+    Rect {
+        x: content_chunk.x + (content_chunk.width.saturating_sub(w)) / 2,
+        y: content_chunk.y + (content_chunk.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Screen position of a PTY popup's cursor, given the popup-inner cursor cell
+/// reported by the server.
+///
+/// Returns `None` when the cell is not currently on screen (scrolled away, or
+/// outside a popup too small to have an interior), in which case the caller
+/// leaves the cursor hidden rather than parking it somewhere arbitrary.
+pub(crate) fn popup_cursor_screen_pos(
+    content_chunk: Rect,
+    want_w: u16,
+    want_h: u16,
+    scroll: u16,
+    cursor: (u16, u16),
+) -> Option<(u16, u16)> {
+    let (cc, cr) = cursor;
+    let popup_area = popup_overlay_rect(content_chunk, want_w, want_h);
+    let inner_w = popup_area.width.saturating_sub(2);
+    let inner_h = popup_area.height.saturating_sub(2);
+    if inner_w == 0 || inner_h == 0 {
+        return None;
+    }
+    // Same scroll offset the popup paragraph is drawn with.
+    let row = cr.checked_sub(scroll)?;
+    if row >= inner_h || cc >= inner_w {
+        return None;
+    }
+    Some((popup_area.x + 1 + cc, popup_area.y + 1 + row))
+}
+
 fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
     match node {
         LayoutJson::Leaf { rows_v2, .. } => {
@@ -357,6 +417,8 @@ fn extract_selection_text(
     end: (u16, u16),
     block: bool,
     pane_clip: Option<Rect>,
+    border_status: &str,
+    border_format: &str,
 ) -> String {
     let (r0, c0, r1, c1) = normalize_selection(start, end, block);
 
@@ -382,7 +444,7 @@ fn extract_selection_text(
         for col in col_start..=col_end {
             let mut ch = ' ';
             for leaf in &leaves {
-                let inner = &leaf.inner;
+                let inner = pane_content_inner(leaf.inner, border_status, border_format);
                 if col >= inner.x
                     && col < inner.x + inner.width
                     && row >= inner.y
@@ -418,6 +480,51 @@ fn active_pane_in_alt_screen(layout: &LayoutJson) -> bool {
     }
 }
 
+/// Check if the pane with `pane_id` has explicitly enabled a mouse protocol
+/// (DECSET 1000/1002/1003 — the server ships this per leaf as `wants_mouse`).
+/// Used on left-down to decide whether psmux may start its client-side drag
+/// selection: an app that asked for mouse tracking (gaviero, opencode, nvim
+/// with `set mouse=a`, …) implements its own selection and must receive the
+/// drags, not have psmux swallow them and paint an overlay on top.  This is
+/// the per-pane automatic version of the global `mouse-selection off` escape
+/// hatch (issue #245).  Alt-screen alone does NOT qualify, so alt-screen
+/// apps without mouse support (`less`, …) keep psmux selection.
+fn pane_wants_mouse_json(layout: &LayoutJson, pane_id: usize) -> bool {
+    match layout {
+        LayoutJson::Leaf { id, wants_mouse, .. } => *id == pane_id && *wants_mouse,
+        LayoutJson::Split { children, .. } => {
+            children.iter().any(|c| pane_wants_mouse_json(c, pane_id))
+        }
+    }
+}
+
+/// Is this batched client command nothing but a bare pointer move?
+///
+/// The client emits `pane-mouse <id> 35 <col> <row> M` when the pointer moves
+/// inside a pane and `mouse-move <col> <row>` when it moves anywhere else.
+/// SGR button 35 is the motion bit (32) plus the "no button held" low bits (3),
+/// so it is the one mouse verb that carries no user intent: it must not be
+/// mistaken for a keystroke and drive the typing fast-poll and an immediate
+/// state round trip (#604).
+pub(crate) fn is_bare_motion_cmd(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.starts_with("mouse-move ") {
+        return true;
+    }
+    let Some(rest) = cmd.strip_prefix("pane-mouse ") else { return false };
+    let mut fields = rest.split_whitespace();
+    let _pane_id = fields.next();
+    fields.next() == Some("35")
+}
+
+fn client_selection_owns_drag(
+    mouse_selection: bool,
+    mouse_selection_force: bool,
+    pane_handles_mouse: bool,
+) -> bool {
+    mouse_selection && (mouse_selection_force || !pane_handles_mouse)
+}
+
 /// Check if the active pane is in server-side copy mode.
 /// When true, the client should NOT start its own text selection —
 /// the server handles cursor positioning and selection in copy mode.
@@ -425,6 +532,20 @@ fn active_pane_in_copy_mode(layout: &LayoutJson) -> bool {
     match layout {
         LayoutJson::Leaf { active, copy_mode, .. } => *active && *copy_mode,
         LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_copy_mode(c)),
+    }
+}
+
+/// Collect each leaf's live scrollback offset (`view_offset`) by pane id.
+/// Nonzero outside copy mode means the pane is direct-scrolled
+/// (scroll-enter-copy-mode off, #193) — i.e. there is content below the view.
+fn collect_view_offsets(layout: &LayoutJson, out: &mut Vec<(usize, usize)>) {
+    match layout {
+        LayoutJson::Leaf { id, view_offset, .. } => out.push((*id, *view_offset)),
+        LayoutJson::Split { children, .. } => {
+            for c in children {
+                collect_view_offsets(c, out);
+            }
+        }
     }
 }
 
@@ -445,19 +566,23 @@ fn word_bounds_at(
     pane_rect: Rect,
     col: u16,
     row: u16,
+    border_status: &str,
+    border_format: &str,
 ) -> Option<(u16, u16)> {
     let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
     let mut leaves: Vec<PaneLeaf> = Vec::new();
     collect_leaves(layout, content_area, &mut leaves);
 
+    // `pane_rect` is the outer rect; match on it, then map into the content inner.
     let leaf = leaves.iter().find(|l| l.inner == pane_rect)?;
+    let content = pane_content_inner(leaf.inner, border_status, border_format);
 
-    let local_row = row.checked_sub(leaf.inner.y)? as usize;
+    let local_row = row.checked_sub(content.y)? as usize;
     if local_row >= leaf.rows_v2.len() { return None; }
-    let width = leaf.inner.width as usize;
+    let width = content.width as usize;
     let chars = row_chars(&leaf.rows_v2[local_row].runs, width);
 
-    let local_col = col.checked_sub(leaf.inner.x)? as usize;
+    let local_col = col.checked_sub(content.x)? as usize;
     if local_col >= width { return None; }
     if !is_word_char(chars[local_col]) { return None; }
 
@@ -470,7 +595,7 @@ fn word_bounds_at(
         right += 1;
     }
 
-    Some((leaf.inner.x + left as u16, leaf.inner.x + right as u16))
+    Some((content.x + left as u16, content.x + right as u16))
 }
 
 /// Check if screen coordinates (x, y) fall on a separator line in the layout.
@@ -807,7 +932,13 @@ pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: 
                 if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
                 if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
                 if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                if run.flags & 8  != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                if run.flags & 8  != 0 {
+                    style = crate::rendering::with_underline(
+                        style,
+                        if run.ul == 0 { 1 } else { run.ul },
+                        run.ulc.as_deref().map(map_color),
+                    );
+                }
                 if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
                 if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                 if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
@@ -880,11 +1011,13 @@ pub fn render_layout_json(
             cursor_row,
             cursor_col,
             alternate_screen,
+            wants_mouse: _,
             hide_cursor: _,
             cursor_shape: _,
             active,
             copy_mode,
             scroll_offset,
+            view_offset: _,
             sel_start_row,
             sel_start_col,
             sel_end_row,
@@ -896,18 +1029,9 @@ pub fn render_layout_json(
             rows_v2,
             title,
         } => {
-            // When pane-border-status is enabled, reserve 1 row for the
-            // border label so it doesn't overlap pane content (#288).
+            // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
-            let inner = if has_border_label {
-                if border_status == "top" {
-                    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
-                } else {
-                    Rect::new(area.x, area.y, area.width, area.height - 1)
-                }
-            } else {
-                area
-            };
+            let inner = pane_content_inner(area, border_status, border_format);
             let mut lines: Vec<Line> = Vec::new();
             let use_full_cells = *copy_mode && *active && !content.is_empty();
             // If the source pane is larger than the preview area, reflow
@@ -1023,7 +1147,13 @@ pub fn render_layout_json(
                         if run.flags & 1 != 0 { style = style.add_modifier(Modifier::DIM); }
                         if run.flags & 2 != 0 { style = style.add_modifier(Modifier::BOLD); }
                         if run.flags & 4 != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                        if run.flags & 8 != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                        if run.flags & 8 != 0 {
+                            style = crate::rendering::with_underline(
+                                style,
+                                if run.ul == 0 { 1 } else { run.ul },
+                                run.ulc.as_deref().map(map_color),
+                            );
+                        }
                         if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                         if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
                         let text: &str = if run.flags & 64 != 0 {
@@ -1286,13 +1416,35 @@ struct ClientDragState {
 /// thread, and return a (writer, frame_rx) pair ready for the event loop.
 /// Sets a 5-second write timeout so blocked writes never freeze the client.
 fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
+    establish_connection_with_timeout(addr, key, RECONNECT_CONNECT_TIMEOUT)
+}
+
+/// Connect budget for a RE-connect: generous, because the server is known to
+/// have existed a moment ago and may simply be busy.
+const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Connect budget for the FIRST attach. A live server on loopback completes the
+/// handshake in about a millisecond (the kernel accepts into the listen backlog
+/// before the app ever calls accept), so a short budget cannot starve a healthy
+/// server. It does cap how long a DEAD port can stall the attach: Windows drops
+/// the SYN for an unbound loopback port and retransmits, so a refusal can take
+/// upwards of two seconds to surface (issue #605). Waiting that out only to
+/// print an OS error wastes the user's time; the liveness verdict is the same
+/// either way.
+const ATTACH_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
+
+fn establish_connection_with_timeout(
+    addr: &str,
+    key: &str,
+    connect_timeout: Duration,
+) -> io::Result<Connection> {
     // Bounded connect: a wedged/backlogged server otherwise makes `attach` hang
     // until the ~21s Windows SYN-retransmit and surface as `os error 10060`.
-    // A 2s timeout turns that into a fast, clear failure the caller can report
-    // (and lets try_reconnect back off promptly instead of stalling).
+    // A bounded timeout turns that into a fast, clear failure the caller can
+    // report (and lets try_reconnect back off promptly instead of stalling).
     let sockaddr: std::net::SocketAddr = addr.parse()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("bad server address: {addr}")))?;
-    let stream = std::net::TcpStream::connect_timeout(&sockaddr, Duration::from_secs(2))?;
+    let stream = std::net::TcpStream::connect_timeout(&sockaddr, connect_timeout)?;
     stream.set_nodelay(true)?;
     let mut writer = stream.try_clone()?;
     writer.set_nodelay(true)?;
@@ -1306,13 +1458,34 @@ fn establish_connection(addr: &str, key: &str) -> io::Result<Connection> {
     let _ = writer.write_all(format!("AUTH {}\n", key).as_bytes());
     let _ = writer.flush();
     let mut auth_line = String::new();
-    reader.read_line(&mut auth_line)?;
+    let read_res = reader.read_line(&mut auth_line);
+    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        eprintln!(
+            "[auth-debug pid={}] establish_connection addr={} key={} read_res={:?} got_line={:?}",
+            std::process::id(), addr, key, read_res.as_ref().map(|n| *n), auth_line
+        );
+    }
+    read_res?;
     if !auth_line.trim().starts_with("OK") {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed"));
     }
 
     let _ = writer.write_all(b"PERSISTENT\n");
     let _ = writer.write_all(b"client-attach\n");
+    // Report the session this client came FROM, so the server can answer
+    // `switch-client -l` from this client's own history rather than from a
+    // machine-wide file (issue #566). This MUST follow client-attach: that is
+    // what registers the client, and a value arriving before registration has
+    // no entry to be recorded on and is silently dropped. Sent only when there
+    // is something to say, so a first attach is byte-identical to before.
+    if let Ok(prev) = std::env::var("PSMUX_CLIENT_LAST_SESSION") {
+        if !prev.trim().is_empty() {
+            let _ = writer.write_all(
+                format!("client-last-session {}\n",
+                    crate::util::quote_arg_if_needed(prev.trim())).as_bytes(),
+            );
+        }
+    }
     // Issue #473: report the host terminal's colors (queried once at client
     // startup) so the server can answer pane color queries (OSC 4/10/11,
     // CSI ?996n) with the real palette instead of the Campbell fallback.
@@ -1370,20 +1543,90 @@ fn try_reconnect(addr: &str, key: &str) -> Option<Connection> {
     None
 }
 
+/// tmux's wording for an attach that cannot reach its session, verbatim:
+/// `can't find session: NAME`, which `main` prints as `psmux: <msg>` and exits
+/// 1. `-L` namespaces are stored on disk as `<ns>__<session>`; the attach gate
+/// publishes the user-facing spelling in `PSMUX_SESSION_DISPLAY_NAME` so this
+/// message shows the name that was typed rather than the internal one.
+pub(crate) fn no_such_session(name: &str) -> io::Error {
+    let shown = std::env::var("PSMUX_SESSION_DISPLAY_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.to_string());
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("can't find session: {}", shown),
+    )
+}
+
 pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let path = crate::paths::port_file(&name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
+        .ok_or_else(|| no_such_session(&name))?;
     let addr = format!("127.0.0.1:{}", port);
-    let session_key = read_session_key(&name).unwrap_or_default();
+    // The .port file can be visible a beat before the .key has readable
+    // content (servers before the issue #496 fix wrote .port first, and a
+    // just-claimed warm server rewrites its files). Never AUTH with an empty
+    // key — that is guaranteed to fail — poll briefly for the credential.
+    let mut session_key = read_session_key(&name).unwrap_or_default();
+    if session_key.is_empty() {
+        for _ in 0..400 {
+            std::thread::sleep(Duration::from_millis(5));
+            session_key = read_session_key(&name).unwrap_or_default();
+            if !session_key.is_empty() { break; }
+        }
+    }
+    let session_key = session_key;
+    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        eprintln!(
+            "[auth-debug pid={}] run_remote name={} port={} key={}",
+            std::process::id(), name, port, session_key
+        );
+    }
     let last_path = crate::paths::psmux_dir_file("last_session");
     if !crate::session::is_warm_session(&name) {
         let _ = std::fs::write(&last_path, &name);
     }
+    // Attaching is activity: tmux restamps the session in server-client.c when a
+    // client takes it (`server_client_set_session` -> `session_update_activity`).
+    // Bare CLI routing ranks by this stamp, so it has to be written here rather
+    // than left to the `last_session` file, which only ever names ONE session
+    // machine-wide and so cannot express "B is newer than A" (issue #603).
+    crate::session::touch_session_activity(&name);
+    // The name this client keeps restamping while the user types. `None` for a
+    // warm (standby) session, which is internal and never a routing candidate.
+    let activity_name: Option<String> =
+        if crate::session::is_warm_session(&name) { None } else { Some(name.clone()) };
 
     // ── Open persistent TCP connection ───────────────────────────────────
-    let (mut writer, mut frame_rx) = establish_connection(&addr, &session_key)?;
+    // A failure here is NOT something to report in the operating system's own
+    // words. The registry named a server; if it cannot be reached the session
+    // is gone, and tmux says so in one line. Letting the raw io::Error escape
+    // printed `psmux: No connection could be made because the target machine
+    // actively refused it. (os error 10061)` (issue #605), which names neither
+    // psmux's own concept (a session) nor anything the user can act on.
+    let (mut writer, mut frame_rx) =
+        match establish_connection_with_timeout(&addr, &session_key, ATTACH_CONNECT_TIMEOUT) {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Nothing answered on the registered port. Reap the entry so
+                // the next `ls`/`attach` is clean, but only once the pid anchor
+                // agrees the process is gone: a live server that was merely too
+                // slow must keep its registration (it rewrites these files on
+                // its own 5s tick anyway).
+                if crate::session::registry_pid_anchor_alive(&name) != Some(true) {
+                    crate::session::remove_session_registry(&name);
+                }
+                if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!(
+                        "[auth-debug pid={}] attach connect to {} failed: {} (kind {:?})",
+                        std::process::id(), addr, e, e.kind()
+                    );
+                }
+                return Err(no_such_session(&name));
+            }
+        };
     // Pending background reconnect: Some(rx) while a reconnect thread is running.
     // Kept as None in normal operation. When the channel yields Some(result),
     // the result replaces writer/frame_rx; if it yields None all attempts failed.
@@ -1442,6 +1685,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Digits typed while the picker is open accumulate here and are consumed
     // when the user presses Enter — "12" + Enter jumps to the 12th session.
     let mut session_num_buffer = String::new();
+    let mut session_filter_active = false;
+    let mut session_filter = String::new();
     // Digit-jump buffer for the customize-mode picker. Customize lives on
     // the server, so Enter computes a navigate delta and dispatches
     // `customize-navigate <delta>` instead of mutating local state directly.
@@ -1534,7 +1779,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut paste_stage2_last_len: usize = 0;
     // Suppression window: after right-click copy, discard text key events
     // for a short period to prevent VS Code ConPTY duplicate injection.
-    #[cfg(windows)]
+    // Declared on every platform because the right-click handler assigns it
+    // unconditionally; only the Windows code paths ever read it.
+    #[allow(unused_variables)]
     let mut paste_suppress_until: Option<Instant> = None;
 
     // Track whether a modified Enter Press was already handled this keypress
@@ -1565,9 +1812,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut srv_popup_lines: Vec<String> = Vec::new();
     #[allow(unused_assignments)]
     let mut srv_popup_rows: Vec<crate::layout::RowRunsJson> = Vec::new();
+    #[allow(unused_assignments)]
     let mut srv_floats: Vec<FloatJson> = Vec::new();
     #[allow(unused_assignments)]
     let mut srv_popup_has_pty = false;
+    #[allow(unused_assignments)]
+    let mut srv_popup_cursor: Option<(u16, u16)> = None; // popup-inner (col, row)
     let mut srv_popup_scroll: u16 = 0;
     #[allow(unused_assignments)]
     let mut srv_confirm_active = false;
@@ -1756,6 +2006,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// in-pane apps (opencode, etc.) can do their own mouse selection.
         #[serde(default = "default_mouse_selection")]
         mouse_selection: bool,
+        /// mouse-selection-force option. When true, client-side drag
+        /// selection overrides an application's mouse tracking.
+        #[serde(default)]
+        mouse_selection_force: bool,
         /// paste-detection option (mirror of server-side AppState field)
         #[serde(default = "default_paste_detection")]
         paste_detection: bool,
@@ -1843,6 +2097,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         popup_rows: Vec<crate::layout::RowRunsJson>,
         #[serde(default)]
         popup_has_pty: bool,
+        /// Cursor of the process running inside a PTY popup, relative to the
+        /// popup's inner (inside-the-border) area.
+        #[serde(default)]
+        popup_cursor_row: Option<u16>,
+        #[serde(default)]
+        popup_cursor_col: Option<u16>,
+        #[serde(default)]
+        popup_hide_cursor: bool,
         /// Floating panes (tmux new-pane) overlaid on the active window.
         #[serde(default)]
         floats: Vec<FloatJson>,
@@ -1909,7 +2171,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
     let mut rsel_end: Option<(u16, u16)> = None;
     let mut rsel_pane_rect: Option<Rect> = None;    // clip bounds of the originating pane
+    let mut rsel_pane_id: Option<usize> = None;     // pane the selection started in
     let mut rsel_dragged = false;
+    // Server-side copy-mode drag tracking.  The pane the drag started in is
+    // remembered so drag/release events keep reaching the server after the
+    // pointer leaves the pane rect (out-of-range rows drive edge
+    // auto-scroll), and a 50ms repeat re-sends the last drag while the
+    // pointer dwells at/past the pane's first or last row so the view keeps
+    // scrolling without mouse movement (tmux drag-scroll parity).
+    let mut copy_drag_pane: Option<(usize, Rect)> = None; // (pane_id, rect at drag start)
+    let mut copy_drag_last: Option<(i16, i16)> = None;    // last pane-relative (col, row) sent
+    let mut copy_drag_repeat_at: Option<Instant> = None;  // next repeat due (armed only at an edge)
+    const COPY_DRAG_REPEAT: Duration = Duration::from_millis(50);
+    // A click withheld from a mouse-aware pane while psmux determines whether
+    // the gesture is a click or a selection drag: (pane_id, col, row).
+    let mut deferred_left_click: Option<(usize, i16, i16)> = None;
     // Multi-click tracking for word/line selection.
     let mut last_click: Option<(Instant, (u16, u16))> = None;
     let mut click_count: u32 = 0;
@@ -1918,17 +2194,29 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut rsel_block: bool = false;
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
-    // Client-side tab position tracking for accurate mouse click detection.
-    // The server's update_tab_positions() uses a different algorithm than what
-    // the client actually renders, so we track positions at render time.
-    let mut client_tab_positions: Vec<(usize, u16, u16)> = Vec::new(); // (window_display_idx, x_start, x_end)
-    let mut client_status_row: u16 = u16::MAX; // row where status bar tabs are rendered
+    // Track rendered tab positions for accurate mouse click detection.
+    // (row, window_display_idx, x_start, x_end) — one entry per clickable tab
+    // span, on WHICHEVER status row it renders (#593: multi-row bars carry
+    // clickable ranges on every line, matching tmux status_get_range).
+    let mut client_tab_positions: Vec<(u16, usize, u16, u16)> = Vec::new();
+    let mut client_status_row: u16 = u16::MAX; // first status bar row
+    let mut client_status_rows: u16 = 0; // status bar height in rows (0 = hidden)
+    // Display indices of windows that actually exist, so a click on a
+    // #[range=window|N] naming a nonexistent window is ignored like tmux
+    // (server-client.c returns KEYC_UNKNOWN when winlink_find_by_index fails).
+    let mut client_window_indices: Vec<usize> = Vec::new();
     let mut client_pane_rects: Vec<(usize, Rect)> = Vec::new();
+    // Per-pane live scrollback offset from the last dump (see view_offset).
+    let mut client_pane_view_offsets: Vec<(usize, usize)> = Vec::new();
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
     let mut client_content_area: Rect = Rect::default();
+    // Border status/format from the last draw, for cursor/mouse inner-rect calc.
+    let mut client_border_status: String = "off".to_string();
+    let mut client_border_format: String = String::new();
     let mut client_copy_mode: bool = false;
     let mut client_pwsh_selection: bool = false;
     let mut client_mouse_selection: bool = true;
+    let mut client_mouse_selection_force: bool = false;
     let mut client_zoomed: bool = false;
     let mut client_drag: Option<ClientDragState> = None;
     // Border hover highlight: (position, kind, area) of the border under the cursor.
@@ -1943,12 +2231,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Issue #269: last OSC 9;4 (host terminal progress) value emitted.
     // Same debounce pattern as host_title.
     let mut last_emitted_host_progress: Option<String> = None;
-    // VT input mode: periodically re-send mouse-enable escape sequences.
-    // Covers SSH sessions and JetBrains JediTerm (which sends VT mouse
-    // sequences through ConPTY instead of native MOUSE_EVENT records).
+    // VT input mode (SSH / JediTerm / WezTerm): used to pick the Win32
+    // caret path below.  The periodic mouse-enable refresh keyed off
+    // last_mouse_enable runs in EVERY input mode via send_mouse_keepalive —
+    // Windows Terminal drops even a local client's mouse registration.
     let is_ssh_mode = crate::ssh_input::needs_vt_input();
     let mut last_mouse_enable = Instant::now();
-    // Cygwin pty (issue #474): cadence for the XTWINOPS size poll.
+    // Raw VT pipe: cadence for the XTWINOPS size poll.
     let mut last_pipe_size_query = Instant::now();
     // ── Cursor blink stabilisation ──────────────────────────────────
     // Cache the last-sent DECSCUSR code so we only write it when it
@@ -2257,6 +2546,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         }
                     }
                 }
+                // Real input from a real client is what tmux counts as session
+                // activity (server-client.c `server_client_handle_key` restamps
+                // `activity_time` before dispatching, and mouse arrives on the
+                // same path as a key). Resize is deliberately excluded: it is
+                // the terminal talking, not the user. Bare CLI commands rank
+                // sessions by this stamp, so typing in the session you are
+                // sitting in is what makes it win (issue #603).
+                if let Some(ref sess) = activity_name {
+                    if matches!(_cur_evt, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+                        crate::session::touch_session_activity_throttled(sess);
+                    }
+                }
                 match _cur_evt {
                     // ── Windows Ctrl+V paste interception ────────────────
                     // ── Suppress phantom modified-Enter Release (Windows Terminal) ──
@@ -2316,6 +2617,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         }
                     }
                     Event::Key(mut key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // Fold NUL onto C-Space before anything looks at the key.
+                        // The console reports Ctrl+Space, Ctrl+2, Ctrl+Shift+2 and a
+                        // NUL byte sent by a ConPTY-hosted terminal identically, and
+                        // all of them ARE NUL.  Folding here (not just in the binding
+                        // lookup) is what lets the raw `is_prefix` comparison below
+                        // match a `C-Space` prefix, and makes the byte forwarded to
+                        // the pane 0x00 instead of 0x12 (issue #504).
+                        {
+                            let folded = crate::config::fold_nul_to_ctrl_space((key.code, key.modifiers));
+                            key.code = folded.0;
+                            key.modifiers = folded.1;
+                        }
                         // On Windows, VS Code's xterm.js sends ESC+CR for
                         // Shift+Enter.  ConPTY interprets the ESC as Alt, so
                         // crossterm reports Alt+Enter.  Poll the physical
@@ -2607,24 +2920,39 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             }
                         }
                         else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
-                            command_input = false;
-                            command_cursor = 0;
-                            renaming = false;
-                            pane_renaming = false;
-                            tree_chooser = false;
-                            buffer_chooser = false;
-                            session_chooser = false;
-                            keys_viewer = false;
-                            confirm_cmd = None;
-                            // Drop any pending digit-jump buffers when the
-                            // pickers are dismissed via Esc.
-                            tree_num_buffer.clear();
-                            buffer_num_buffer.clear();
-                            session_num_buffer.clear();
-                            // Also clear any lingering selection
-                            rsel_start = None;
-                            rsel_end = None;
-                            selection_changed = true;
+                            if session_chooser && !session_filter.is_empty() {
+                                let selected_entry = session_filter_escape_selection(
+                                    &session_entries,
+                                    &session_filter,
+                                    session_selected,
+                                );
+                                session_filter.clear();
+                                session_filter_active = false;
+                                session_selected = selected_entry.unwrap_or(0);
+                                session_scroll = 0;
+                                session_num_buffer.clear();
+                            } else {
+                                command_input = false;
+                                command_cursor = 0;
+                                renaming = false;
+                                pane_renaming = false;
+                                tree_chooser = false;
+                                buffer_chooser = false;
+                                session_chooser = false;
+                                session_filter_active = false;
+                                session_filter.clear();
+                                keys_viewer = false;
+                                confirm_cmd = None;
+                                // Drop any pending digit-jump buffers when the
+                                // pickers are dismissed via Esc.
+                                tree_num_buffer.clear();
+                                buffer_num_buffer.clear();
+                                session_num_buffer.clear();
+                                // Also clear any lingering selection
+                                rsel_start = None;
+                                rsel_end = None;
+                                selection_changed = true;
+                            }
                         }
                         else if rsel_start.is_some() && matches!(key.code, KeyCode::Esc) {
                             // Escape clears any active text selection
@@ -2976,6 +3304,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 session_selected = 0;
                                 session_scroll = 0;
                                 session_num_buffer.clear();
+                                session_filter_active = false;
+                                session_filter.clear();
                                 popup_offset = (0, 0);
                                 popup_dragging = false;
                                 popup_rect_last = None;
@@ -3005,6 +3335,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         }
                                     }
                                 }
+                                // Issue #259 (batch D): sort by label so the picker's order is
+                                // deterministic, matching the tree_chooser's established
+                                // convention (session.rs::list_all_sessions_tree sorts by name)
+                                // and the g/G Home/End contract. Without this, order followed
+                                // raw directory-enumeration order, which the Win32 API
+                                // explicitly does not guarantee to be stable or alphabetical.
+                                targets.sort_by(|a, b| a.0.cmp(&b.0));
                                 let verdicts = crate::session::classify_sessions_parallel(
                                     targets,
                                     Duration::from_millis(50),
@@ -3162,20 +3499,51 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             let paste_burst_active = false;
                             match key.code {
                                 KeyCode::Up if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Down if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Down if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
+                                KeyCode::Backspace if session_chooser && session_filter_active => {
+                                    session_filter.pop();
+                                    session_selected = 0;
+                                    session_scroll = 0;
+                                    session_num_buffer.clear();
+                                }
+                                KeyCode::Char(c) if session_chooser && session_filter_active => {
+                                    if session_filter.len() < 256 {
+                                        session_filter.push(c);
+                                        session_selected = 0;
+                                        session_scroll = 0;
+                                        session_num_buffer.clear();
+                                    }
+                                }
                                 // hjkl parity with tmux mode-tree (issue #259): for flat lists
                                 // tmux treats h/k as up and j/l as down. g/G map to Home/End.
                                 KeyCode::Char('k') if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Char('j') if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Char('j') if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
                                 KeyCode::Char('h') if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
-                                KeyCode::Char('l') if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
+                                KeyCode::Char('l') if session_chooser => {
+                                    let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                    if session_selected + 1 < visible_len { session_selected += 1; }
+                                }
                                 KeyCode::Char('g') if session_chooser => { session_selected = 0; }
-                                KeyCode::Char('G') if session_chooser => { session_selected = session_entries.len().saturating_sub(1); }
+                                KeyCode::Char('G') if session_chooser => {
+                                    session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
+                                }
                                 KeyCode::PageUp if session_chooser => { session_selected = session_selected.saturating_sub(10); }
-                                KeyCode::PageDown if session_chooser => { session_selected = (session_selected + 10).min(session_entries.len().saturating_sub(1)); }
+                                KeyCode::PageDown if session_chooser => {
+                                    let last = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
+                                    session_selected = (session_selected + 10).min(last);
+                                }
                                 KeyCode::Home if session_chooser => { session_selected = 0; }
-                                KeyCode::End if session_chooser => { session_selected = session_entries.len().saturating_sub(1); }
+                                KeyCode::End if session_chooser => {
+                                    session_selected = session_filtered_indices(&session_entries, &session_filter).len().saturating_sub(1);
+                                }
                                 KeyCode::Enter if session_chooser => {
+                                    let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
                                     // If the user has typed a number, that wins over the arrow cursor.
                                     // Buffer is 1-based: "1" → first entry, "12" → twelfth. Out-of-range
                                     // or unparseable → do nothing (keep buffer so user can Backspace).
@@ -3183,11 +3551,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         Some(session_selected)
                                     } else {
                                         match session_num_buffer.parse::<usize>() {
-                                            Ok(n) if n >= 1 && n <= session_entries.len() => Some(n - 1),
+                                            Ok(n) if n >= 1 && n <= filtered_indices.len() => Some(n - 1),
                                             _ => None,
                                         }
                                     };
-                                    if let Some(idx) = target_idx {
+                                    if let Some(idx) = target_idx.and_then(|i| filtered_indices.get(i).copied()) {
                                         if let Some((sname, _)) = session_entries.get(idx) {
                                             if sname != &current_session {
                                                 cmd_batch.push("client-detach\n".into());
@@ -3196,19 +3564,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             }
                                             session_chooser = false;
                                             session_num_buffer.clear();
+                                            session_filter_active = false;
+                                            session_filter.clear();
                                         }
                                     }
-                                }
-                                KeyCode::Esc if session_chooser => {
-                                    session_chooser = false;
-                                    session_num_buffer.clear();
                                 }
                                 KeyCode::Backspace if session_chooser => {
                                     session_num_buffer.pop();
                                 }
                                 KeyCode::Char('x') if session_chooser => {
                                     // Kill the selected session (like tmux session chooser)
-                                    if let Some((sname, _)) = session_entries.get(session_selected) {
+                                    let selected_entry = session_filtered_indices(&session_entries, &session_filter)
+                                        .get(session_selected)
+                                        .copied();
+                                    if let Some((sname, _)) = selected_entry.and_then(|i| session_entries.get(i)) {
                                         let sname = sname.clone();
                                         if sname == current_session {
                                             // Killing current session — exit after kill
@@ -3232,8 +3601,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 }
                                             }
                                             // Remove the killed session from the list
-                                            session_entries.remove(session_selected);
-                                            if session_selected >= session_entries.len() && session_selected > 0 {
+                                            if let Some(idx) = selected_entry {
+                                                session_entries.remove(idx);
+                                            }
+                                            let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                            if session_selected >= visible_len && session_selected > 0 {
                                                 session_selected -= 1;
                                             }
                                             if session_entries.is_empty() {
@@ -3243,6 +3615,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             session_num_buffer.clear();
                                         }
                                     }
+                                }
+                                KeyCode::Char('f') if session_chooser => {
+                                    session_filter_active = true;
+                                    session_filter.clear();
+                                    session_selected = 0;
+                                    session_scroll = 0;
+                                    session_num_buffer.clear();
                                 }
                                 KeyCode::Char(c) if session_chooser && c.is_ascii_digit() => {
                                     // Accumulate into the jump buffer — Enter consumes it.
@@ -3694,7 +4073,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -3706,6 +4085,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3740,7 +4120,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
-                                                rsel_pane_rect,
+                                                rsel_pane_rect, &client_border_status, &client_border_format,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3751,6 +4131,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -3943,7 +4324,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                                 MouseEventKind::ScrollDown => {
                                     if tree_chooser && tree_selected + 1 < tree_entries.len() { tree_selected += 1; }
-                                    if session_chooser && session_selected + 1 < session_entries.len() { session_selected += 1; }
+                                    if session_chooser {
+                                        let visible_len = session_filtered_indices(&session_entries, &session_filter).len();
+                                        if session_selected + 1 < visible_len { session_selected += 1; }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -3954,19 +4338,30 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         }
                         match me.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                // Status bar tab click
-                                if me.row == client_status_row {
+                                // Status bar tab click. Every status row is
+                                // hit-tested (#593) — tmux server-client.c
+                                // accepts y anywhere in [statusat,
+                                // statusat+statuslines) and resolves the
+                                // clicked row's own ranges. A click on status
+                                // rows never falls through to pane handling.
+                                if client_status_rows > 0
+                                    && me.row >= client_status_row
+                                    && me.row < client_status_row.saturating_add(client_status_rows) {
                                     let mut clicked_tab: Option<usize> = None;
-                                    for &(win_idx, x_start, x_end) in &client_tab_positions {
-                                        if me.column >= x_start && me.column < x_end {
+                                    for &(row, win_idx, x_start, x_end) in &client_tab_positions {
+                                        if me.row == row && me.column >= x_start && me.column < x_end {
                                             clicked_tab = Some(win_idx);
                                             break;
                                         }
                                     }
                                     if let Some(idx) = clicked_tab {
-                                        // client_tab_positions now stores the true display
+                                        // client_tab_positions stores the true display
                                         // index (honors gaps from renumber-windows off).
-                                        cmd_batch.push(format!("select-window -t :{}\n", idx));
+                                        // A range naming a window that does not exist
+                                        // is ignored, matching tmux.
+                                        if client_window_indices.contains(&idx) {
+                                            cmd_batch.push(format!("select-window -t :{}\n", idx));
+                                        }
                                     }
                                 } else {
                                     // Border detection
@@ -4008,29 +4403,62 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         if let Some(&(pane_id, pane_rect)) = clicked_pane {
                                             cmd_batch.push(format!("select-pane -t %{}\n", pane_id));
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
+                                            let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
 
                                             if client_copy_mode {
+                                                deferred_left_click = None;
                                                 cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
                                                     pane_id, rel_col, rel_row));
+                                                // Remember the pane so a drag that leaves its
+                                                // rect still reaches the server (edge auto-scroll).
+                                                copy_drag_pane = Some((pane_id, pane_rect));
+                                                copy_drag_last = None;
+                                                copy_drag_repeat_at = None;
                                                 rsel_start = None;
                                                 rsel_end = None;
                                                 rsel_pane_rect = None;
+                                                rsel_pane_id = None;
                                                 rsel_block = false;
                                                 selection_changed = true;
                                             } else {
-                                                cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
-                                                    pane_id, rel_col, rel_row));
                                                 border_drag = false;
 
                                                 // mouse-selection off: do not start any client-side
                                                 // drag selection.  In-pane apps (opencode, nvim, etc.)
                                                 // can implement their own mouse selection without
                                                 // psmux drawing on top.  (issue #245)
-                                                if !client_mouse_selection {
+                                                //
+                                                // Per-pane: even with mouse-selection on, normally
+                                                // yield to an app that enabled a mouse protocol. The
+                                                // force option instead withholds the press until
+                                                // release, so clicks can be replayed while drags stay
+                                                // available for psmux selection.
+                                                let pane_handles_mouse =
+                                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                                        .map(|s| pane_wants_mouse_json(&s.layout, pane_id))
+                                                        .unwrap_or(false);
+                                                let force_client_selection =
+                                                    client_selection_owns_drag(
+                                                        client_mouse_selection,
+                                                        client_mouse_selection_force,
+                                                        pane_handles_mouse,
+                                                    ) && pane_handles_mouse;
+                                                if force_client_selection {
+                                                    deferred_left_click = Some((pane_id, rel_col, rel_row));
+                                                } else {
+                                                    deferred_left_click = None;
+                                                    cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
+                                                        pane_id, rel_col, rel_row));
+                                                }
+                                                if !client_selection_owns_drag(
+                                                    client_mouse_selection,
+                                                    client_mouse_selection_force,
+                                                    pane_handles_mouse,
+                                                ) {
                                                     rsel_start = None;
                                                     rsel_end = None;
                                                     rsel_pane_rect = None;
+                                                    rsel_pane_id = None;
                                                     rsel_block = false;
                                                     rsel_dragged = false;
                                                     selection_changed = true;
@@ -4056,6 +4484,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 } else if client_pwsh_selection {
                                                     rsel_block = me.modifiers.contains(KeyModifiers::ALT);
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
 
@@ -4075,6 +4504,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                                 last_sent_size.1,
                                                                 pane_rect,
                                                                 me.column, me.row,
+                                                                &client_border_status, &client_border_format,
                                                             ))
                                                     } else {
                                                         None
@@ -4099,12 +4529,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     rsel_start = Some((me.column, me.row));
                                                     rsel_end = Some((me.column, me.row));
                                                     rsel_pane_rect = Some(pane_rect);
+                                                    rsel_pane_id = Some(pane_id);
                                                     rsel_dragged = false;
                                                     selection_changed = true;
                                                 }
-                                                } // end if client_mouse_selection
+                                                } // end client-side selection gate (mouse-selection + per-pane wants_mouse)
                                             }
                                         } else {
+                                            deferred_left_click = None;
                                             cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
                                         }
                                     }
@@ -4126,7 +4558,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                     }) {
                                         let rel_col = me.column as i16 - pane_rect.x as i16;
-                                        let rel_row = me.row as i16 - pane_rect.y as i16;
+                                        let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                         cmd_batch.push(format!("pane-mouse {} 2 {} {} M\n",
                                             pane_id, rel_col, rel_row));
                                     }
@@ -4143,7 +4575,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
-                                                rsel_pane_rect,
+                                                rsel_pane_rect, &client_border_status, &client_border_format,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -4154,6 +4586,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     rsel_dragged = false;
                                     selection_changed = true;
@@ -4178,7 +4611,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
                                     let rel_col = me.column as i16 - pane_rect.x as i16;
-                                    let rel_row = me.row as i16 - pane_rect.y as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                     cmd_batch.push(format!("pane-mouse {} 1 {} {} M\n",
                                         pane_id, rel_col, rel_row));
                                 } else {
@@ -4208,39 +4641,113 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     }
                                 } else if rsel_start.is_none() || !client_mouse_selection {
                                     if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                        // Route the drag to the pane it started in (falling
+                                        // back to the pane under the pointer) and send the
+                                        // row UNCLAMPED: an out-of-range row tells the server
+                                        // the pointer crossed a pane edge, which auto-scrolls
+                                        // the copy-mode view (tmux drag-scroll parity).
+                                        if copy_drag_pane.is_none() {
+                                            copy_drag_pane = client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r));
+                                        }
+                                        if let Some((pane_id, pane_rect)) = copy_drag_pane {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
+                                            let rel_row = me.row as i16 - inner.y as i16;
                                             cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n",
                                                 pane_id, rel_col, rel_row));
+                                            copy_drag_last = Some((rel_col, rel_row));
+                                            // Arm the repeat while the pointer dwells on/past
+                                            // the pane's first or last row: the pre-flush tick
+                                            // re-sends this drag every 50ms so the view keeps
+                                            // scrolling without further mouse movement.
+                                            let at_edge = rel_row <= 0
+                                                || rel_row >= inner.height.saturating_sub(1) as i16;
+                                            copy_drag_repeat_at = if at_edge {
+                                                Some(Instant::now() + COPY_DRAG_REPEAT)
+                                            } else {
+                                                None
+                                            };
                                         }
                                     } else {
                                         cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
                                     }
                                 } else {
                                     if let Some(start) = rsel_start {
-                                        let (col, row) = if client_pwsh_selection {
-                                            if let Some(r) = rsel_pane_rect {
-                                                (
-                                                    me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
-                                                    me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
-                                                )
+                                        // tmux parity: a real drag reaching the pane's top
+                                        // row has run out of visible screen — hand the
+                                        // selection off to server-side copy mode so it
+                                        // continues into scrollback (with edge auto-scroll
+                                        // from here on).  The bottom row does the same, but
+                                        // only when the view is scrolled back (direct
+                                        // scrollback with scroll-enter-copy-mode off, #193)
+                                        // — at the live bottom there is nothing below to
+                                        // select.  Same-cell micro-jitter is excluded so a
+                                        // sloppy click on an edge row stays a click (#199
+                                        // parity).
+                                        let handoff = rsel_pane_rect.zip(rsel_pane_id)
+                                            .and_then(|(pane_rect, pane_id)| {
+                                                let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                                let moved = rsel_dragged || (me.column, me.row) != start;
+                                                let at_top = me.row <= inner.y;
+                                                let scrolled_back = client_pane_view_offsets.iter()
+                                                    .find(|(id, _)| *id == pane_id)
+                                                    .map_or(false, |(_, off)| *off > 0);
+                                                let at_bottom = scrolled_back
+                                                    && me.row >= inner.y + inner.height.saturating_sub(1);
+                                                ((at_top || at_bottom) && moved)
+                                                    .then_some((pane_rect, pane_id, inner))
+                                            });
+                                        if let Some((pane_rect, pane_id, inner)) = handoff {
+                                            let a_col = start.0 as i16 - pane_rect.x as i16;
+                                            let a_row = start.1 as i16 - inner.y as i16;
+                                            let cur_col = me.column as i16 - pane_rect.x as i16;
+                                            let cur_row = me.row as i16 - inner.y as i16;
+                                            cmd_batch.push(format!("copy-drag-begin {} {} {} {} {}{}\n",
+                                                pane_id, a_col, a_row, cur_col, cur_row,
+                                                if rsel_block { " b" } else { "" }));
+                                            // The gesture is definitively a selection drag,
+                                            // not a click — never replay a withheld press
+                                            // (mouse-selection-force) on release.
+                                            deferred_left_click = None;
+                                            // The server is in copy mode from here on; keep
+                                            // the local flag in sync until the next dump
+                                            // confirms it so follow-up drags take the
+                                            // copy-mode path above.
+                                            client_copy_mode = true;
+                                            copy_drag_pane = Some((pane_id, pane_rect));
+                                            copy_drag_last = Some((cur_col, cur_row));
+                                            copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                                            rsel_start = None;
+                                            rsel_end = None;
+                                            rsel_pane_rect = None;
+                                            rsel_pane_id = None;
+                                            rsel_block = false;
+                                            rsel_dragged = false;
+                                            selection_changed = true;
+                                        } else {
+                                            let (col, row) = if client_pwsh_selection {
+                                                if let Some(r) = rsel_pane_rect {
+                                                    (
+                                                        me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
+                                                        me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
+                                                    )
+                                                } else {
+                                                    (me.column, me.row)
+                                                }
                                             } else {
                                                 (me.column, me.row)
+                                            };
+                                            // Ignore micro-drags that stay on the
+                                            // initial click cell (#199 parity).
+                                            if (col, row) == start && !rsel_dragged {
+                                                // no-op
+                                            } else {
+                                                rsel_end = Some((col, row));
+                                                rsel_dragged = true;
+                                                selection_changed = true;
                                             }
-                                        } else {
-                                            (me.column, me.row)
-                                        };
-                                        // Ignore micro-drags that stay on the
-                                        // initial click cell (#199 parity).
-                                        if (col, row) == start && !rsel_dragged {
-                                            // no-op
-                                        } else {
-                                            rsel_end = Some((col, row));
-                                            rsel_dragged = true;
-                                            selection_changed = true;
                                         }
                                     }
                                 }
@@ -4248,6 +4755,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             MouseEventKind::Drag(MouseButton::Right) => {}
                             MouseEventKind::Up(MouseButton::Left) => {
                                 if border_drag {
+                                    deferred_left_click = None;
                                     cmd_batch.push(format!("split-resize-done\n"));
                                     border_drag = false;
                                     client_drag = None;
@@ -4266,7 +4774,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -4277,6 +4785,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
@@ -4291,7 +4800,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                     last_sent_size.1,
                                                     s, e,
                                                     false,
-                                                    rsel_pane_rect,
+                                                    rsel_pane_rect, &client_border_status, &client_border_format,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -4302,22 +4811,54 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         rsel_start = None;
                                         rsel_end = None;
                                         rsel_pane_rect = None;
+                                        rsel_pane_id = None;
                                         rsel_block = false;
                                         rsel_dragged = false;
                                         selection_changed = true;
                                     }
+                                    deferred_left_click = None;
                                 } else {
                                     rsel_start = None;
                                     rsel_end = None;
                                     rsel_pane_rect = None;
+                                    rsel_pane_id = None;
                                     rsel_block = false;
                                     selection_changed = true;
-                                    if client_copy_mode {
-                                        if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
-                                            r.contains(ratatui::layout::Position { x: me.column, y: me.row })
-                                        }) {
+                                    if let Some((pane_id, down_col, down_row)) = deferred_left_click.take() {
+                                        let (up_col, up_row) = client_pane_rects.iter()
+                                            .find(|(id, _)| *id == pane_id)
+                                            .map(|(_, pane_rect)| {
+                                                let inner = pane_content_inner(
+                                                    *pane_rect,
+                                                    &client_border_status,
+                                                    &client_border_format,
+                                                );
+                                                (
+                                                    (me.column as i16 - pane_rect.x as i16)
+                                                        .max(0)
+                                                        .min(pane_rect.width.saturating_sub(1) as i16),
+                                                    (me.row as i16 - inner.y as i16)
+                                                        .max(0)
+                                                        .min(inner.height.saturating_sub(1) as i16),
+                                                )
+                                            })
+                                            .unwrap_or((down_col, down_row));
+                                        cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
+                                            pane_id, down_col, down_row));
+                                        cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
+                                            pane_id, up_col, up_row));
+                                    } else if client_copy_mode {
+                                        // Send the release to the pane the drag started in,
+                                        // even when the pointer ends outside its rect — the
+                                        // server clamps and finalizes the yank.
+                                        let target = copy_drag_pane.or_else(|| {
+                                            client_pane_rects.iter().find(|(_, r)| {
+                                                r.contains(ratatui::layout::Position { x: me.column, y: me.row })
+                                            }).map(|&(id, r)| (id, r))
+                                        });
+                                        if let Some((pane_id, pane_rect)) = target {
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_rect.y as i16;
+                                            let rel_row = me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16;
                                             cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
                                                 pane_id, rel_col, rel_row));
                                         }
@@ -4325,10 +4866,30 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         cmd_batch.push(format!("mouse-up {} {}\n", me.column, me.row));
                                     }
                                 }
+                                // The drag gesture is over in every branch above.
+                                copy_drag_pane = None;
+                                copy_drag_last = None;
+                                copy_drag_repeat_at = None;
                             }
                             MouseEventKind::Up(MouseButton::Right) => {}
                             MouseEventKind::Up(MouseButton::Middle) => {}
                             MouseEventKind::Moved => {
+                                // A bare motion event means the left button is no longer
+                                // held.  If a copy-mode drag was being tracked, its release
+                                // was swallowed (e.g. it happened outside the terminal
+                                // window): finalize the gesture with a synthetic release so
+                                // the selection yanks, and stop the auto-scroll repeat.
+                                if copy_drag_pane.is_some() {
+                                    if client_copy_mode {
+                                        if let (Some((pane_id, _)), Some((rc, rr))) = (copy_drag_pane, copy_drag_last) {
+                                            cmd_batch.push(format!("pane-mouse {} 0 {} {} m\n",
+                                                pane_id, rc, rr));
+                                        }
+                                    }
+                                    copy_drag_pane = None;
+                                    copy_drag_last = None;
+                                    copy_drag_repeat_at = None;
+                                }
                                 // Detect border hover for visual preview
                                 let mut new_hover: Option<(u16, String, Rect)> = None;
                                 if !client_zoomed {
@@ -4356,7 +4917,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
                                     let rel_col = me.column as i16 - pane_rect.x as i16;
-                                    let rel_row = me.row as i16 - pane_rect.y as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
                                     cmd_batch.push(format!("pane-mouse {} 35 {} {} M\n",
                                         pane_id, rel_col, rel_row));
                                 } else {
@@ -4368,10 +4929,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 rsel_end = None;
                                 rsel_dragged = false;
                                 selection_changed = true;
-                                if let Some(&(pane_id, _)) = client_pane_rects.iter().find(|(_, r)| {
+                                if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
-                                    cmd_batch.push(format!("pane-scroll {} up\n", pane_id));
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                    cmd_batch.push(format!("pane-scroll {} up {} {}\n", pane_id, rel_col, rel_row));
                                 } else {
                                     cmd_batch.push(format!("scroll-up {} {}\n", me.column, me.row));
                                 }
@@ -4381,10 +4944,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 rsel_end = None;
                                 rsel_dragged = false;
                                 selection_changed = true;
-                                if let Some(&(pane_id, _)) = client_pane_rects.iter().find(|(_, r)| {
+                                if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
                                     r.contains(ratatui::layout::Position { x: me.column, y: me.row })
                                 }) {
-                                    cmd_batch.push(format!("pane-scroll {} down\n", pane_id));
+                                    let rel_col = me.column as i16 - pane_rect.x as i16;
+                                    let rel_row = (me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16).max(0);
+                                    cmd_batch.push(format!("pane-scroll {} down {} {}\n", pane_id, rel_col, rel_row));
                                 } else {
                                     cmd_batch.push(format!("scroll-down {} {}\n", me.column, me.row));
                                 }
@@ -4397,6 +4962,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                     Event::FocusLost => {
                         cmd_batch.push("focus-out\n".into());
+                        // No more mouse events will arrive; don't keep
+                        // auto-scrolling a copy-mode drag on the timer alone.
+                        copy_drag_repeat_at = None;
                     }
                     _ => {}
                 }
@@ -4511,12 +5079,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 if writer.write_all(format!("client-size {} {}\n", new_size.0, new_size.1).as_bytes()).is_err() {
                     break; // Connection lost
                 }
-                // SSH: re-send mouse-enable on resize — terminal may reset
-                // mouse reporting mode after a window size change.
-                if is_ssh_mode {
-                    crate::ssh_input::send_mouse_enable();
-                    last_mouse_enable = Instant::now();
-                }
+                // Re-send mouse-enable on resize — the terminal may reset
+                // mouse reporting after a window size change.  A resize is
+                // the known trigger for Windows Terminal dropping a local
+                // client's mouse registration, so this runs in every input
+                // mode (the keepalive routes per mode), not just SSH.
+                crate::ssh_input::send_mouse_keepalive();
+                last_mouse_enable = Instant::now();
             }
         }
 
@@ -4538,6 +5107,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             cmd_batch.push("prefix-end\n".into());
         }
 
+        // ── Copy-mode drag auto-scroll repeat ──────────────────────────
+        // While the left button is held with the pointer dwelling at/past
+        // the top or bottom row of the copy-mode pane, re-send the last drag
+        // position every 50ms so the server keeps scrolling the view (tmux
+        // repeats its drag timer at the same cadence).  The state clears on
+        // mouse-up / bare motion / focus loss; gating on client_copy_mode
+        // also pauses the repeat harmlessly if a stale dump briefly flips
+        // the flag right after a normal-mode handoff.
+        if client_copy_mode {
+            if let (Some((pane_id, _)), Some((rc, rr)), Some(due)) =
+                (copy_drag_pane, copy_drag_last, copy_drag_repeat_at)
+            {
+                if Instant::now() >= due {
+                    cmd_batch.push(format!("pane-mouse {} 32 {} {} M\n", pane_id, rc, rr));
+                    copy_drag_repeat_at = Some(Instant::now() + COPY_DRAG_REPEAT);
+                }
+            }
+        }
+
         // Send all batched commands immediately — keys reach the server
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
@@ -4553,11 +5141,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
             }
             let _ = writer.flush(); // push keys to server NOW
-            last_key_send_time = Some(Instant::now());
-            key_send_instant = Some(Instant::now());
-            // Force immediate dump-state so we start the echo-detection
-            // polling chain right away (eliminates 0-10ms initial wait).
-            force_dump = true;
+            // #604: a batch that is nothing but bare pointer motion is not a
+            // keystroke.  It produces no echo to chase, and when no pane is
+            // tracking motion it changes no server state at all, so neither the
+            // typing fast-poll nor an immediate dump-state is warranted.
+            // Treating every pointer sample as a keystroke pulled a full state
+            // frame (~12 KB) and repainted the whole screen at pointer-motion
+            // rate, which is what the reporter saw as the cursor flickering
+            // while the mouse merely moved.  If the motion DOES reach an app,
+            // the server pushes the resulting output frame on its own (see the
+            // "Server auto-pushes frames when state changes" note below).
+            let only_bare_motion = cmd_batch.iter().all(|c| is_bare_motion_cmd(c));
+            if !only_bare_motion {
+                last_key_send_time = Some(Instant::now());
+                key_send_instant = Some(Instant::now());
+                // Force immediate dump-state so we start the echo-detection
+                // polling chain right away (eliminates 0-10ms initial wait).
+                force_dump = true;
+            }
         }
 
         // ── STEP 2b: Request screen update (non-blocking) ────────────────
@@ -4625,6 +5226,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         client_copy_mode = active_pane_in_copy_mode(&root);
         client_pwsh_selection = state.pwsh_mouse_selection;
         client_mouse_selection = state.mouse_selection;
+        client_mouse_selection_force = state.mouse_selection_force;
         #[cfg(windows)]
         { paste_detection_enabled = state.paste_detection; }
         choose_tree_preview_default = state.choose_tree_preview;
@@ -4647,6 +5249,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             srv_popup_scroll = 0;
         }
         srv_popup_has_pty = new_popup_has_pty;
+        // A PTY popup owns the cursor while it is up; a static popup has no
+        // editable cursor and must not steal it from the pane underneath.
+        srv_popup_cursor = match (srv_popup_active && new_popup_has_pty && !state.popup_hide_cursor,
+                                  state.popup_cursor_col, state.popup_cursor_row) {
+            (true, Some(cc), Some(cr)) => Some((cc, cr)),
+            _ => None,
+        };
         srv_confirm_active = state.confirm_active;
         srv_confirm_prompt = state.confirm_prompt.unwrap_or_default();
         srv_menu_active = state.menu_active;
@@ -4883,6 +5492,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             client_content_area = content_chunk;
             client_pane_rects.clear();
             collect_pane_rects(&root, content_chunk, &mut client_pane_rects);
+            client_pane_view_offsets.clear();
+            collect_view_offsets(&root, &mut client_pane_view_offsets);
             client_borders.clear();
             let mut border_path = Vec::new();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
@@ -4897,6 +5508,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 Some(s) if !s.is_empty() => s,
                 _ => "#{pane_index} \"#{pane_title}\"",
             };
+            // Publish for the post-draw cursor and next frame's mouse handlers.
+            client_border_status = border_status.to_string();
+            client_border_format = border_format.to_string();
             // O(N) per frame but pane counts are small in practice (typically < 20).
             let total_panes = if state.zoomed { 1 } else { root.count_leaves() };
             let bchars = crate::border_lines::border_chars(
@@ -5022,10 +5636,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
 
             if session_chooser {
                 let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
+                let filtered_indices = session_filtered_indices(&session_entries, &session_filter);
                 // Popup size: when preview is OFF use the original
                 // pre-#257 dynamic sizing (compact, list-only). When preview
                 // is ON expand to 85x75% so the right-side preview has room.
-                let buffer_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
+                let jump_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
+                let filter_rows: u16 = if session_filter_active { 2 } else { 0 };
+                let buffer_rows = jump_rows.saturating_add(filter_rows);
                 let avail_w = content_chunk.width;
                 let avail_h = content_chunk.height;
                 let (popup_w, popup_h) = if preview_enabled {
@@ -5033,7 +5650,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     let want_h = ((avail_h as u32 * 75) / 100) as u16;
                     (want_w.max(40).min(avail_w), want_h.max(10).min(avail_h))
                 } else {
-                    let sess_h = (session_entries.len() as u16)
+                    let sess_h = (filtered_indices.len() as u16)
                         .saturating_add(2)
                         .saturating_add(buffer_rows)
                         .max(5)
@@ -5055,9 +5672,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 popup_rect_last = Some(oa);
                 let title = if preview_enabled {
-                    " choose-session (digits+enter=jump, enter=switch, x=kill, p=preview, esc=close, drag border to move) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close, drag border to move) "
                 } else {
-                    " choose-session (digits+enter=jump, enter=switch, x=kill, p=preview, esc=close) "
+                    " choose-session (f=filter, digits+enter=jump, enter=switch, x=kill, p=preview, esc=clear/close) "
                 };
                 let overlay = Block::default().borders(Borders::ALL).title(title).border_style(sel_style);
                 f.render_widget(Clear, oa);
@@ -5084,7 +5701,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     })
                 } else { None };
 
-                // Reserve the last two inner rows for the jump-buffer indicator
+                // Reserve rows for the active jump and filter indicators.
                 let reserved = buffer_rows as usize;
                 let visible_h = (list_area.height as usize).saturating_sub(reserved);
                 if visible_h > 0 && session_selected >= session_scroll + visible_h {
@@ -5093,22 +5710,33 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 if session_selected < session_scroll {
                     session_scroll = session_selected;
                 }
-                let num_width = session_entries.len().to_string().len();
+                let num_width = filtered_indices.len().max(1).to_string().len();
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (sname, info)) in session_entries.iter().enumerate().skip(session_scroll).take(visible_h) {
+                for (visible_idx, entry_idx) in filtered_indices.iter().copied().enumerate().skip(session_scroll).take(visible_h) {
+                    let (sname, info) = &session_entries[entry_idx];
                     let marker = if sname == &current_session { "*" } else { " " };
-                    let row = format!("{:>w$}. {} {}", i + 1, marker, info, w = num_width);
-                    let line = if i == session_selected {
+                    let row = format!("{:>w$}. {} {}", visible_idx + 1, marker, info, w = num_width);
+                    let line = if visible_idx == session_selected {
                         Line::from(Span::styled(row, sel_style))
                     } else {
                         Line::from(row)
                     };
                     lines.push(line);
                 }
+                if filtered_indices.is_empty() && visible_h > 0 {
+                    lines.push(Line::from("(no matching sessions)"));
+                }
                 if !session_num_buffer.is_empty() {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         format!("go to {}", session_num_buffer),
+                        sel_style,
+                    )));
+                }
+                if session_filter_active {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("Filter: {}", session_filter),
                         sel_style,
                     )));
                 }
@@ -5124,7 +5752,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     // Issue #257 follow-up: render the first window of the
                     // highlighted session with its full split layout.
                     let mut rendered = false;
-                    if let Some((sname, _info)) = session_entries.get(session_selected) {
+                    if let Some((sname, _info)) = filtered_indices
+                        .get(session_selected)
+                        .and_then(|idx| session_entries.get(*idx))
+                    {
                         // Resolve first window id via cached list-tree fetch.
                         let lt_key = format!("__lt__\t{}", sname);
                         let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
@@ -5169,7 +5800,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     if !rendered {
                         // Fallback to single-pane preview if the layout
                         // endpoint is unavailable.
-                        let preview_text: Option<String> = session_entries.get(session_selected)
+                        let preview_text: Option<String> = filtered_indices
+                            .get(session_selected)
+                            .and_then(|idx| session_entries.get(*idx))
                             .and_then(|(sname, _info)| {
                                 let lt_key = format!("__lt__\t{}", sname);
                                 let win_id = if let Some((cached, ts)) = preview_cache.get(&lt_key) {
@@ -5189,8 +5822,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                 }
                 // Scroll position indicator (when content overflows)
-                if session_entries.len() > visible_h {
-                    let max_scroll = session_entries.len().saturating_sub(visible_h);
+                if filtered_indices.len() > visible_h {
+                    let max_scroll = filtered_indices.len().saturating_sub(visible_h);
                     let pct = if max_scroll > 0 { session_scroll * 100 / max_scroll } else { 0 };
                     let indicator = if session_scroll == 0 {
                         "Top".to_string()
@@ -5699,8 +6332,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
                 _ => left_w as u16, // "left" default
             };
-            client_tab_positions = tab_rel_positions.iter().map(|&(idx, s, e)| (idx, s + tabs_x_offset, e + tabs_x_offset)).collect();
+            client_tab_positions = tab_rel_positions.iter()
+                .map(|&(idx, s, e)| (status_chunk.y, idx, s + tabs_x_offset, e + tabs_x_offset))
+                .collect();
             client_status_row = status_chunk.y;
+            client_status_rows = status_chunk.height;
+            client_window_indices = windows.iter().map(|w| w.idx).collect();
             // Truncate overall status line to fit the available width
             crate::style::truncate_spans_to_width(&mut status_spans, total_width);
             // If a display-message is active, show it on the status bar
@@ -5735,11 +6372,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     &status_format[0], total_width, sb_base,
                 );
                 // Update tab positions from range info so mouse clicks work
-                // with custom status-format layouts.
+                // with custom status-format layouts. tmux parity (#593): the
+                // range argument IS the window index — tmux passes it raw to
+                // winlink_find_by_index (style.c strtonum, server-client.c
+                // STYLE_RANGE_WINDOW) with no base-index arithmetic, so
+                // `#[range=window|#{window_index}]` works at any base-index.
                 client_tab_positions = layout.ranges.iter().filter_map(|(rt, s, e)| {
                     match rt {
                         crate::style::StatusRangeType::Window(idx) => {
-                            Some((*idx + base_index, *s + status_chunk.x, *e + status_chunk.x))
+                            Some((status_chunk.y, *idx, *s + status_chunk.x, *e + status_chunk.x))
                         }
                     }
                 }).collect();
@@ -5760,6 +6401,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 // Use the layout engine for #[align], #[fill], #[list], #[range] support
                 let layout = crate::style::layout_format_line(&text, line_area.width as usize, sb_base);
+                // Harvest this line's clickable ranges too (#593): tmux keeps
+                // one style_range list per status line (status.c status_redraw
+                // fills sle->ranges for every i in 0..lines) so a window list
+                // on status-format[1] is just as clickable as on line 0.
+                for (rt, s, e) in &layout.ranges {
+                    match rt {
+                        crate::style::StatusRangeType::Window(idx) => {
+                            client_tab_positions.push((line_y, *idx, *s + line_area.x, *e + line_area.x));
+                        }
+                    }
+                }
                 let line_widget = Paragraph::new(Line::from(layout.spans)).style(sb_base);
                 f.render_widget(line_widget, line_area);
             }
@@ -5820,14 +6472,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 render_float_overlays(f, content_chunk, &srv_floats);
             }
             if srv_popup_active {
-                let w = srv_popup_width.min(content_chunk.width.saturating_sub(2));
-                let h = srv_popup_height.min(content_chunk.height.saturating_sub(2));
-                let popup_area = Rect {
-                    x: content_chunk.x + (content_chunk.width.saturating_sub(w)) / 2,
-                    y: content_chunk.y + (content_chunk.height.saturating_sub(h)) / 2,
-                    width: w,
-                    height: h,
-                };
+                let popup_area = popup_overlay_rect(content_chunk, srv_popup_width, srv_popup_height);
+                let w = popup_area.width;
                 let title = if srv_popup_command.is_empty() { "Popup".to_string() } else { let max_title = (w as usize).saturating_sub(4); if srv_popup_command.len() > max_title { format!("{}...", &srv_popup_command[..max_title.saturating_sub(3)]) } else { srv_popup_command.clone() } };
                 let block = Block::default()
                     .borders(Borders::ALL)
@@ -5848,7 +6494,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
                             if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
                             if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                            if run.flags & 8  != 0 { style = style.add_modifier(Modifier::UNDERLINED); }
+                            if run.flags & 8  != 0 {
+                    style = crate::rendering::with_underline(
+                        style,
+                        if run.ul == 0 { 1 } else { run.ul },
+                        run.ulc.as_deref().map(map_color),
+                    );
+                }
                             if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
                             if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                             if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
@@ -6152,15 +6804,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             last_emitted_host_progress = host_progress_this_frame;
         }
 
-        // ── SSH: periodic mouse-enable refresh ───────────────────────
-        // ConPTY or terminal resize can silently disable mouse reporting.
-        // Re-send every 30 seconds to keep mouse working reliably.
-        if is_ssh_mode && last_mouse_enable.elapsed().as_secs() >= 30 {
-            crate::ssh_input::send_mouse_enable();
+        // ── Periodic mouse-enable refresh (ALL input modes) ──────────
+        // ConPTY or terminal resize can silently disable mouse reporting,
+        // and Windows Terminal additionally drops a LOCAL client's mouse
+        // registration outright (mouse dead, keys fine) until the DECSET
+        // bytes are re-sent.  This used to run only in SSH mode, leaving
+        // local sessions mouse-dead until detach/reattach; the keepalive
+        // routes per input mode so it is safe everywhere.
+        if last_mouse_enable.elapsed().as_secs() >= 30 {
+            crate::ssh_input::send_mouse_keepalive();
             last_mouse_enable = Instant::now();
         }
 
-        // ── Cygwin pty: periodic terminal-size poll (issue #474) ─────
+        // ── Raw VT pipe: periodic terminal-size poll ───────────────
         // A pipe carries no resize notifications, so ask the terminal for
         // its text-area size (XTWINOPS). The reply flows through the VT
         // reader, which updates the backend size override; an unchanged
@@ -6192,7 +6848,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             }
             let effective = find_active_cursor_shape(&root)
                 .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
-            let active_pane_area: Option<Rect> = {
+            let content_chunk = {
                 let sz = terminal.size().unwrap_or_default();
                 let constraints = if status_at_top {
                     vec![Constraint::Length(status_lines as u16), Constraint::Min(1)]
@@ -6201,11 +6857,25 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 };
                 let chunks = Layout::default().direction(Direction::Vertical)
                     .constraints(constraints).split(sz.into());
-                let content_chunk = if status_at_top { chunks[1] } else { chunks[0] };
-                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed)
+                if status_at_top { chunks[1] } else { chunks[0] }
             };
+            let active_pane_area: Option<Rect> =
+                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed);
             // Compute screen-global cursor position from pane-local coords.
-            let cursor_visible = if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
+            //
+            // A PTY popup is modal and takes the keystrokes, so while it is up
+            // the cursor belongs to the process inside it, not to the pane
+            // underneath (tmux does the same in server_client_reset_state by
+            // taking both the cursor and the cursor mode from the overlay).
+            // Leaving it on the pane underneath is what made the popup look
+            // like it had no cursor at all (#507).
+            let cursor_visible = if srv_popup_active && srv_popup_has_pty {
+                srv_popup_cursor.and_then(|c| {
+                    popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
+                })
+            } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
+                // Content lives inside the border-label reservation; use the render's inner rect.
+                let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
                 let cy = inner.y + cr.min(inner.height.saturating_sub(1));
                 let cx = inner.x + cc.min(inner.width.saturating_sub(1));
                 Some((cx, cy))
@@ -6289,6 +6959,36 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         }
     }
     Ok(())
+}
+
+fn session_filtered_indices(entries: &[(String, String)], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..entries.len()).collect();
+    }
+
+    let filter = filter.to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (name, _))| name.to_lowercase().contains(&filter).then_some(idx))
+        .collect()
+}
+
+fn session_filter_escape_selection(
+    entries: &[(String, String)],
+    filter: &str,
+    selected: usize,
+) -> Option<usize> {
+    if filter.is_empty() {
+        return None;
+    }
+
+    Some(
+        session_filtered_indices(entries, filter)
+            .get(selected)
+            .copied()
+            .unwrap_or(0),
+    )
 }
 
 /// Flush the paste-pending buffer as individual send-text / send-key commands.
@@ -6430,9 +7130,25 @@ mod test_zoom_bleed;
 mod test_zoom_cursor_rect;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_pane_border_status_cursor.rs"]
+mod test_pane_border_status_cursor;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue345_command_prompt_utf8.rs"]
 mod test_issue345_command_prompt_utf8;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_osc8_overlay.rs"]
 mod test_issue361_osc8_overlay;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_wants_mouse_selection.rs"]
+mod test_pane_wants_mouse_selection;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue507_popup_cursor.rs"]
+mod test_issue507_popup_cursor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue605_stale_port_attach.rs"]
+mod test_issue605_stale_port_attach;

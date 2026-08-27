@@ -105,7 +105,17 @@ pub struct Screen {
     alternate_grid: crate::grid::Grid,
 
     attrs: crate::attrs::Attrs,
+    /// DECSC slot for the MAIN screen. Also the slot DECSET 1049 saves into on
+    /// the way into the alternate screen, and restores from on the way out.
     saved_attrs: crate::attrs::Attrs,
+    /// DECSC slot for the ALTERNATE screen (issue #502). Each screen owns its
+    /// own saved cell, matching tmux (DECSC/DECRC use `ictx->old_cell` in
+    /// input.c, entirely separate from the alternate screen's
+    /// `s->saved_cell`). Sharing one slot let a full screen app that saved the
+    /// cursor while its colorscheme was active poison the main screen: on exit
+    /// DECSET 1049 restored the app's colors instead of the shell's, and every
+    /// line printed afterwards inherited them.
+    alternate_saved_attrs: crate::attrs::Attrs,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -197,6 +207,7 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            alternate_saved_attrs: crate::attrs::Attrs::default(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -261,6 +272,21 @@ impl Screen {
     /// vim use the alternate screen and do not retain history).
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.grid_mut().set_scrollback_len(new_len);
+    }
+
+    /// Copy-mode freeze (psmux issue #494): while set, the main grid's
+    /// visible region stays anchored to its current content — new rows
+    /// entering scrollback bump the scrollback offset instead of shifting
+    /// the view, matching tmux's frozen copy-mode screen.  Always targets
+    /// the main grid (the alternate grid has no scrollback to anchor to).
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.grid.set_frozen(frozen);
+    }
+
+    /// Whether the copy-mode freeze anchor is currently set on the main grid.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.grid.frozen()
     }
 
     /// Returns the configured maximum size of the scrollback buffer.
@@ -719,9 +745,21 @@ impl Screen {
     }
 
     /// Returns whether the alternate screen is currently in use.
+    ///
+    /// Gated on `allow_alternate_screen` (#88): when the option is off,
+    /// `enter_alternate_grid`/`exit_alternate_grid` still use the alt grid
+    /// internally as scratch space so `exit_alternate_grid` can flush its
+    /// visible rows into the main grid's scrollback (see that function),
+    /// so `MODE_ALTERNATE_SCREEN` still gets set for that bookkeeping.
+    /// But from the caller's point of view `alternate-screen off` means
+    /// psmux deliberately does not honour/expose DEC 1049 at all, so every
+    /// consumer of this flag (`#{alternate_on}`, mouse-forwarding-to-child,
+    /// zoom/dim decisions) should see "not in alt screen" the whole time,
+    /// matching the option's documented contract instead of leaking the
+    /// internal scratch-buffer implementation detail.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
-        self.mode(MODE_ALTERNATE_SCREEN)
+        self.allow_alternate_screen && self.mode(MODE_ALTERNATE_SCREEN)
     }
 
     /// Returns whether the terminal should be in application keypad mode.
@@ -968,6 +1006,18 @@ impl Screen {
         self.attrs.underline()
     }
 
+    /// Returns the extended underline style of the current drawing attributes.
+    #[must_use]
+    pub fn underline_style(&self) -> crate::attrs::UnderlineStyle {
+        self.attrs.underline_style()
+    }
+
+    /// Returns the underline colour of the current drawing attributes.
+    #[must_use]
+    pub fn ulcolor(&self) -> crate::Color {
+        self.attrs.ulcolor()
+    }
+
     /// Returns whether newly drawn text should be rendered with the inverse
     /// text attribute.
     #[must_use]
@@ -995,6 +1045,9 @@ impl Screen {
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        // Start the alternate screen's DECSC slot clean so a value left by a
+        // previous alternate-screen session cannot surface in this one.
+        self.alternate_saved_attrs = crate::attrs::Attrs::default();
     }
 
     fn exit_alternate_grid(&mut self) {
@@ -1040,12 +1093,23 @@ impl Screen {
 
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
-        self.saved_attrs = self.attrs;
+        // The cursor POSITION already lives in the per-grid slot that
+        // `grid_mut()` selects; route the attributes to the matching slot so
+        // the two screens cannot overwrite each other (issue #502).
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            self.alternate_saved_attrs = self.attrs;
+        } else {
+            self.saved_attrs = self.attrs;
+        }
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = self.saved_attrs;
+        self.attrs = if self.mode(MODE_ALTERNATE_SCREEN) {
+            self.alternate_saved_attrs
+        } else {
+            self.saved_attrs
+        };
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -1081,7 +1145,86 @@ impl Screen {
     }
 }
 
+/// U+FE0F VARIATION SELECTOR-16, which requests emoji presentation.
+const VS16: char = '\u{FE0F}';
+
 impl Screen {
+    /// Does appending the zero-width char `c` turn this cell into a
+    /// double-width sequence? (#533)
+    ///
+    /// Emoji presentation is a property of the *sequence*, not of any single
+    /// character: `U+2733` is one column on its own, but `U+2733 U+FE0F` is
+    /// two, in real terminals and in tmux alike. Because `text()` measures
+    /// width one char at a time, the base settles the cell at one column and
+    /// the selector is folded in afterwards as a zero-width mark, so the cell
+    /// stays narrow and every column after it drifts left by one.
+    ///
+    /// The trigger mirrors tmux's `screen_write_combine`, which forces the
+    /// stored width to 2 when a VS16 lands on a cell whose width is still 1
+    /// (`variation-selector-always-wide`, on by default). The width measured
+    /// over the whole cell is checked too, so any other sequence that
+    /// `unicode-width` considers double width is promoted as well.
+    fn wants_wide_promotion(cell: &crate::Cell, c: char) -> bool {
+        use unicode_width::UnicodeWidthStr as _;
+        // A cell that is already wide must not be promoted again: tmux only
+        // promotes when the stored width is 1, so `📛 + VS16` stays 2 columns
+        // rather than growing to 4.
+        cell.has_contents()
+            && !cell.is_wide()
+            && (c == VS16 || cell.contents().width() > 1)
+    }
+
+    /// Widen the narrow cell at (`row`, `col`) into a two column cell, taking
+    /// the following cell as its continuation and advancing the cursor over
+    /// it. The cursor is expected to be sitting on that following cell, which
+    /// is the case for every caller (a zero-width char never moves it).
+    fn promote_cell_to_wide(
+        &mut self,
+        row: u16,
+        col: u16,
+        attrs: crate::attrs::Attrs,
+    ) {
+        let cont = crate::grid::Pos { row, col: col + 1 };
+        if cont.col >= self.grid().size().cols {
+            // The base sits in the last column, so there is nowhere to put the
+            // continuation. Leave the cell narrow rather than wrapping a
+            // half-drawn glyph onto the next row.
+            return;
+        }
+
+        // If the cell we are taking over is itself the base of a wide glyph,
+        // that glyph's own continuation is about to be orphaned, so clear it.
+        let clobbers_wide = self
+            .grid()
+            .drawing_cell(cont)
+            .is_some_and(crate::Cell::is_wide);
+        if clobbers_wide {
+            if let Some(orphan) = self.grid_mut().drawing_cell_mut(
+                crate::grid::Pos {
+                    row,
+                    col: cont.col + 1,
+                },
+            ) {
+                orphan.clear(attrs);
+                orphan.set_wide_continuation(false);
+            }
+        }
+
+        if let Some(base) = self
+            .grid_mut()
+            .drawing_cell_mut(crate::grid::Pos { row, col })
+        {
+            base.set_wide(true);
+        } else {
+            return;
+        }
+        if let Some(cell) = self.grid_mut().drawing_cell_mut(cont) {
+            cell.clear(crate::attrs::Attrs::default());
+            cell.set_wide_continuation(true);
+        }
+        self.grid_mut().col_inc(1);
+    }
+
     pub(crate) fn text(&mut self, c: char) {
         let pos = self.grid().pos();
         let size = self.grid().size();
@@ -1092,11 +1235,20 @@ impl Screen {
             // don't even try to draw control characters
             return;
         }
-        let width = width
+        let width: u16 = width
             .unwrap_or(1)
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+
+        // A glyph wider than the whole row can never be represented: there is
+        // nowhere to put its continuation, and `size.cols - width` underflows
+        // just below (#534, reachable once a pane is shrunk to one column).
+        // tmux drops the glyph in this situation, showing nothing for a CJK
+        // character in a one column pane, so do the same.
+        if width > size.cols {
+            return;
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
@@ -1127,11 +1279,12 @@ impl Screen {
 
         if width == 0 {
             if pos.col > 0 {
+                let mut base_col = pos.col - 1;
                 let mut prev_cell = self
                     .grid_mut()
                     .drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
-                        col: pos.col - 1,
+                        col: base_col,
                     })
                     // pos.row is valid, since it comes directly from
                     // self.grid().pos() which we assume to always have a
@@ -1139,11 +1292,12 @@ impl Screen {
                     // checked for pos.col > 0.
                     .unwrap();
                 if prev_cell.is_wide_continuation() {
+                    base_col = pos.col - 2;
                     prev_cell = self
                         .grid_mut()
                         .drawing_cell_mut(crate::grid::Pos {
                             row: pos.row,
-                            col: pos.col - 2,
+                            col: base_col,
                         })
                         // pos.row is valid, since it comes directly from
                         // self.grid().pos() which we assume to always have a
@@ -1154,6 +1308,9 @@ impl Screen {
                         .unwrap();
                 }
                 prev_cell.append(c);
+                if Self::wants_wide_promotion(prev_cell, c) {
+                    self.promote_cell_to_wide(pos.row, base_col, attrs);
+                }
             } else if pos.row > 0 {
                 let prev_row = self
                     .grid()
@@ -1606,6 +1763,23 @@ impl Screen {
                 [2] => self.attrs.set_dim(),
                 [3] => self.attrs.set_italic(true),
                 [4] => self.attrs.set_underline(true),
+                // SGR 4 with a subparameter: `4:0` .. `4:5` select the
+                // extended underline styles (tmux input.c
+                // input_csi_dispatch_sgr_colon, cases 0..5).  Windows ConPTY
+                // forwards these verbatim, so dropping them here is what made
+                // undercurl invisible inside a pane.
+                [4, n] => self
+                    .attrs
+                    .set_underline_style(
+                        crate::attrs::UnderlineStyle::from_sgr_subparam(*n),
+                    ),
+                // Legacy double underline.  ConPTY rewrites `4:2` to `21`, so
+                // this arm is the one that actually fires for double
+                // underlines coming out of a pane on Windows (tmux input.c
+                // case 21).
+                [21] => self
+                    .attrs
+                    .set_underline_style(crate::attrs::UnderlineStyle::Double),
                 [5] | [6] => self.attrs.set_blink(true),
                 [7] => self.attrs.set_inverse(true),
                 [8] => self.attrs.set_hidden(true),
@@ -1621,6 +1795,10 @@ impl Screen {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }
                 [38, 2, r, g, b] => {
+                    self.attrs.fgcolor =
+                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                }
+                [38, 2, _cs, r, g, b] => {
                     self.attrs.fgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
@@ -1653,6 +1831,10 @@ impl Screen {
                     self.attrs.bgcolor =
                         crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
                 }
+                [48, 2, _cs, r, g, b] => {
+                    self.attrs.bgcolor =
+                        crate::Color::Rgb(to_u8!(*r), to_u8!(*g), to_u8!(*b));
+                }
                 [48, 5, i] => {
                     self.attrs.bgcolor = crate::Color::Idx(to_u8!(*i));
                 }
@@ -1674,6 +1856,49 @@ impl Screen {
                 },
                 [49] => {
                     self.attrs.bgcolor = crate::Color::Default;
+                }
+                // SGR 58: underline colour.  Both the semicolon form
+                // (`58;2;r;g;b`) and the colon forms (`58:2::r:g:b`,
+                // `58:5:n`) are accepted, exactly as tmux does in
+                // input_csi_dispatch_sgr_colon / _sgr (p[0] == 58).
+                [58, 2, r, g, b] => {
+                    self.attrs.set_ulcolor(crate::Color::Rgb(
+                        to_u8!(*r),
+                        to_u8!(*g),
+                        to_u8!(*b),
+                    ));
+                }
+                // `58:2::r:g:b` carries an empty colour-space id, which vte
+                // reports as a leading zero subparameter.
+                [58, 2, _cs, r, g, b] => {
+                    self.attrs.set_ulcolor(crate::Color::Rgb(
+                        to_u8!(*r),
+                        to_u8!(*g),
+                        to_u8!(*b),
+                    ));
+                }
+                [58, 5, i] => {
+                    self.attrs.set_ulcolor(crate::Color::Idx(to_u8!(*i)));
+                }
+                [58] => match next_param!() {
+                    [2] => {
+                        let r = next_param_u8!();
+                        let g = next_param_u8!();
+                        let b = next_param_u8!();
+                        self.attrs
+                            .set_ulcolor(crate::Color::Rgb(r, g, b));
+                    }
+                    [5] => {
+                        self.attrs
+                            .set_ulcolor(crate::Color::Idx(next_param_u8!()));
+                    }
+                    _ => {
+                        unhandled(self);
+                        return;
+                    }
+                },
+                [59] => {
+                    self.attrs.set_ulcolor(crate::Color::Default);
                 }
                 [n] if (90..=97).contains(n) => {
                     self.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 82);

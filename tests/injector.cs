@@ -22,9 +22,16 @@ class Injector
     [DllImport("user32.dll")]
     static extern uint MapVirtualKeyW(uint code, uint mapType);
 
+    // Maps a character to the virtual key plus modifiers that produce it on the
+    // current keyboard layout. Low byte is the VK, high byte is the modifier
+    // mask (1 Shift, 2 Ctrl, 4 Alt); -1 means the character has no key.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern short VkKeyScanW(char ch);
+
     const ushort KEY_EVENT = 1;
     const uint LEFT_CTRL_PRESSED = 0x0008;
     const uint SHIFT_PRESSED = 0x0010;
+    const uint LEFT_ALT_PRESSED = 0x0002;
 
     [StructLayout(LayoutKind.Sequential)]
     struct KEY_EVENT_RECORD
@@ -96,7 +103,7 @@ class Injector
         if (args.Length < 2)
         {
             File.WriteAllText(logFile, "Usage: injector.exe <pid> <keys>\n" +
-                "Keys: chars, ^x=Ctrl+x, {ENTER}, {ESC}, {SLEEP:ms}");
+                "Keys: chars, ^x=Ctrl+x, {ALT:x}, {ENTER}, {ESC}, {LBRACE}, {RBRACE}, {SLEEP:ms}");
             return 99;
         }
 
@@ -186,6 +193,33 @@ class Injector
                     {
                         if (SendKey(handle, 0x22, '\0', 0, log)) injected++;
                     }
+                    else if (token.StartsWith("ALT:"))
+                    {
+                        // {ALT:x} — Alt+x, e.g. copy mode jump-to-mark
+                        char ac = token[4];
+                        ushort avk = (ac >= 'a' && ac <= 'z') ? (ushort)(0x41 + ac - 'a')
+                                   : (ac >= 'A' && ac <= 'Z') ? (ushort)(0x41 + ac - 'A')
+                                   : (ushort)ac;
+                        var arecs = new INPUT_RECORD[] {
+                            MakeKey(true,  0x12, '\0', LEFT_ALT_PRESSED),
+                            MakeKey(true,  avk,  ac,   LEFT_ALT_PRESSED),
+                            MakeKey(false, avk,  ac,   LEFT_ALT_PRESSED),
+                            MakeKey(false, 0x12, '\0', 0)
+                        };
+                        uint aw; bool aok = WriteConsoleInput(handle, arecs, 4, out aw);
+                        log.Add(string.Format("  ALT+{0} vk=0x{1:X2} ok={2} w={3}", ac, avk, aok, aw));
+                        if (aok) injected++;
+                    }
+                    else if (token == "LBRACE")
+                    {
+                        // '{' cannot be written literally: it opens a token.
+                        // Shift + the '[' key is how a real keyboard makes it.
+                        if (SendKey(handle, 0xDB, '{', SHIFT_PRESSED, log)) injected++;
+                    }
+                    else if (token == "RBRACE")
+                    {
+                        if (SendKey(handle, 0xDD, '}', SHIFT_PRESSED, log)) injected++;
+                    }
                     else if (token.StartsWith("SLEEP:"))
                     {
                         int ms = int.Parse(token.Substring(6));
@@ -270,7 +304,40 @@ class Injector
                 else if (c == '&') { vk = 0x37; ctrl = SHIFT_PRESSED; }
                 else if (c == '*') { vk = 0x38; ctrl = SHIFT_PRESSED; }
                 else if (c == '+') { vk = 0xBB; ctrl = SHIFT_PRESSED; }
-                else vk = (ushort)c;
+                else if (c == '}') { vk = 0xDD; ctrl = SHIFT_PRESSED; }
+                else if (c == '{') { vk = 0xDB; ctrl = SHIFT_PRESSED; }
+                else
+                {
+                    // Anything not in the table above: ask Windows for the key
+                    // that produces this character on the CURRENT layout, rather
+                    // than assuming the character code IS the virtual key.
+                    //
+                    // The old fallback was vk = (ushort)c, which is wrong for
+                    // every punctuation character it was reached for. '|' is
+                    // 0x7C, and 0x7C is VK_F13, so typing a pipe pressed F13:
+                    // the character never arrived, and the stray function key was
+                    // free to trigger a binding. That silently turned
+                    // "set-option -g window-status-separator |" into the same
+                    // command with an EMPTY value, and the commands after it
+                    // stopped taking effect.
+                    //
+                    // VkKeyScanW returns the virtual key in the low byte and the
+                    // required modifiers in the high byte (1 = Shift, 2 = Ctrl,
+                    // 4 = Alt), which also makes shifted punctuation correct
+                    // without hand-maintaining a table.
+                    short scan = VkKeyScanW(c);
+                    if (scan == -1)
+                    {
+                        log.Add(string.Format("  SKIP '{0}' (U+{1:X4}): no key on this layout", c, (int)c));
+                        i++;
+                        continue;
+                    }
+                    vk = (ushort)(scan & 0xFF);
+                    int mods = (scan >> 8) & 0xFF;
+                    if ((mods & 1) != 0) ctrl |= SHIFT_PRESSED;
+                    if ((mods & 2) != 0) ctrl |= LEFT_CTRL_PRESSED;
+                    if ((mods & 4) != 0) ctrl |= LEFT_ALT_PRESSED;
+                }
 
                 if (SendKey(handle, vk, c, ctrl, log)) injected++;
                 i++;

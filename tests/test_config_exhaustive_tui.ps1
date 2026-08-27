@@ -202,32 +202,41 @@ function Send-TcpCommand {
     } catch { return @{ ok=$false; err=$_.Exception.Message } }
 }
 
+# There is NO window to focus, and focus is not needed.
+#
+# An earlier fix here switched from FindWindow-by-title to the launching
+# process's MainWindowHandle. That fails too, for a more basic reason: a console
+# application's window is owned by conhost, not by the application, so the psmux
+# process reports MainWindowHandle = 0 and an empty MainWindowTitle. Measured on
+# a freshly launched attached session. Every window based lookup returns zero and
+# the suite aborted at "FATAL: Cannot find psmux window" in every recorded run.
+#
+# keybd_event was the wrong mechanism regardless: it posts to the hardware input
+# queue that feeds the foreground window, while a console app reads its console
+# INPUT BUFFER. WriteConsoleInput (tests/injector.cs) writes to that buffer via
+# AttachConsole(pid), needing no window, no handle and no focus.
 function Focus-PsmuxWindow {
-    $hwnd = [Win32Cfg]::FindWindow($null, $SESSION)
-    if ($hwnd -eq [IntPtr]::Zero) {
-        $proc = Get-Process psmux -EA SilentlyContinue | Where-Object { $_.MainWindowTitle -match $SESSION } | Select-Object -First 1
-        if ($proc) { $hwnd = $proc.MainWindowHandle }
-    }
-    if ($hwnd -ne [IntPtr]::Zero) {
-        [Win32Cfg]::ShowWindow($hwnd, 9) | Out-Null
-        [Win32Cfg]::SetForegroundWindow($hwnd) | Out-Null
-        Start-Sleep -Milliseconds 300
-        return $true
-    }
-    return $false
+    if (-not $script:TuiPid) { return $false }
+    $p = Get-Process -Id $script:TuiPid -EA SilentlyContinue
+    return [bool]$p
 }
 
-# Type a command into psmux command prompt (Ctrl+B : <cmd> Enter)
+# Escape via WriteConsoleInput. This used to be Send-PsmuxEscape, a
+# keybd_event call that never reached the console input buffer, so the popups it
+# was meant to dismiss stayed open and swallowed every later keystroke.
+function Send-PsmuxEscape {
+    if (-not $script:TuiPid) { return }
+    & $script:InjectorExe $script:TuiPid "{ESC}" | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
+# Type a command into the psmux command prompt: Ctrl+B, then :, then the command,
+# then Enter. The pauses are part of the injected sequence so they occur between
+# keystrokes at the target, not just in this script.
 function Send-PsmuxCommand {
     param([string]$Command)
-    Focus-PsmuxWindow | Out-Null
-    [Win32Cfg]::SendCtrlB()
-    Start-Sleep -Milliseconds 200
-    [Win32Cfg]::SendColon()
-    Start-Sleep -Milliseconds 300
-    [Win32Cfg]::SendString($Command)
-    Start-Sleep -Milliseconds 200
-    [Win32Cfg]::SendEnter()
+    if (-not $script:TuiPid) { return }
+    & $script:InjectorExe $script:TuiPid "^b{SLEEP:250}:{SLEEP:350}$Command{ENTER}" | Out-Null
     Start-Sleep -Milliseconds 500
 }
 
@@ -262,8 +271,25 @@ Write-Host "============================================================`n" -For
 Cleanup-Session $SESSION
 Start-Sleep -Seconds 1
 
+# Build the keystroke injector. Compiled from $PSScriptRoot and to a suite
+# specific output name: a relative source path breaks when the runner is invoked
+# from another directory, and a shared output name lets suites overwrite each
+# other's binary in $TEMP.
+$script:InjectorExe = Join-Path $env:TEMP "psmux_injector_cfgtui.exe"
+$cscPath = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) "csc.exe"
+if (-not (Test-Path $cscPath)) {
+    $cscPath = Get-ChildItem "C:\Windows\Microsoft.NET\Framework64\v4*\csc.exe" -EA SilentlyContinue |
+               Select-Object -First 1 -ExpandProperty FullName
+}
+& $cscPath /nologo /optimize /out:$script:InjectorExe (Join-Path $PSScriptRoot "injector.cs") 2>&1 | Out-Null
+if (-not (Test-Path $script:InjectorExe)) {
+    Write-Fail "FATAL: could not build the keystroke injector"
+    exit 1
+}
+
 Write-Info "Launching attached psmux window '$SESSION'..."
 $proc = Start-Process -FilePath $PSMUX -ArgumentList "new-session","-s",$SESSION -PassThru -WindowStyle Normal
+$script:TuiPid = $proc.Id
 Start-Sleep -Seconds 2
 
 if (-not (Wait-SessionReady $SESSION 20000)) {
@@ -291,7 +317,7 @@ $bools = @(
     'allow-rename', 'monitor-activity', 'visual-activity',
     'remain-on-exit', 'destroy-unattached', 'exit-empty',
     'aggressive-resize', 'set-titles', 'visual-bell',
-    'scroll-enter-copy-mode', 'pwsh-mouse-selection',
+    'scroll-enter-copy-mode', 'pwsh-mouse-selection', 'mouse-selection-force',
     'synchronize-panes', 'env-shim', 'warm',
     'allow-predictions', 'claude-code-fix-tty', 'claude-code-force-interactive'
 )
@@ -828,6 +854,7 @@ Test-TuiOption "set-option -g allow-predictions on" "allow-predictions" '\bon\b'
 Test-TuiOption "set-option -g warm on" "warm" '\bon\b' "TUI psmux: warm"
 Test-TuiOption "set-option -g env-shim on" "env-shim" '\bon\b' "TUI psmux: env-shim"
 Test-TuiOption "set-option -g pwsh-mouse-selection on" "pwsh-mouse-selection" '\bon\b' "TUI psmux: pwsh-mouse-selection"
+Test-TuiOption "set-option -g mouse-selection-force on" "mouse-selection-force" '\bon\b' "TUI psmux: mouse-selection-force"
 Test-TuiOption "set-option -g scroll-enter-copy-mode on" "scroll-enter-copy-mode" '\bon\b' "TUI psmux: scroll-enter-copy-mode"
 
 # =============================================================================
@@ -884,7 +911,7 @@ Start-Sleep -Milliseconds 300
 [Win32Cfg]::SendString("set -g mouse off")
 Start-Sleep -Milliseconds 200
 # Press Escape instead of Enter
-[Win32Cfg]::SendEscape()
+Send-PsmuxEscape
 Start-Sleep -Milliseconds 300
 # Verify mouse is still whatever it was (should not have changed) and server alive
 $r = Send-TcpCommand $SESSION "show-options -g mouse"
@@ -922,6 +949,19 @@ Send-PsmuxCommand "set-option -g mouse on"
 Write-Host "`n=== 19. SHOW-OPTIONS VIA TUI ===" -ForegroundColor Cyan
 
 # show-options via TUI: verify server still responds after each
+#
+# NOTE: `show-options` / `show-options -g` with NO specific option name,
+# run from the interactive TUI command prompt (a persistent connection),
+# opens a `ShowTextPopup` overlay (src/server/connection.rs ~2172-2202) to
+# display the full option list -- unlike `show-options -g <name>` below,
+# which returns a single value directly with no popup. That overlay was
+# never dismissed here, so it stayed on screen and swallowed every
+# keystroke Section 20 sent afterward (Ctrl+B/colon/text/Enter all landed
+# on the popup instead of opening a fresh command prompt), which is what
+# made "RAPID SEQUENTIAL SETS" silently fail 4 of 5 checks -- the psmux
+# window was simply not focused on the command prompt anymore. Send
+# Escape after each bare show-options call to close the popup before
+# moving on.
 Write-Test "TUI show-options"
 Send-PsmuxCommand "show-options"
 Start-Sleep -Milliseconds 300
@@ -931,6 +971,12 @@ if ($r.ok -and $r.resp -match 'mouse') {
 } else {
     Write-Fail "TUI show-options (server not responding)"
 }
+Focus-PsmuxWindow | Out-Null
+Start-Sleep -Milliseconds 300
+Send-PsmuxEscape
+Start-Sleep -Milliseconds 300
+Send-PsmuxEscape
+Start-Sleep -Milliseconds 500
 
 Write-Test "TUI show-options -g"
 Send-PsmuxCommand "show-options -g"
@@ -941,6 +987,12 @@ if ($r.ok -and $r.resp -match 'mouse') {
 } else {
     Write-Fail "TUI show-options -g (server not responding)"
 }
+Focus-PsmuxWindow | Out-Null
+Start-Sleep -Milliseconds 300
+Send-PsmuxEscape
+Start-Sleep -Milliseconds 300
+Send-PsmuxEscape
+Start-Sleep -Milliseconds 500
 
 Write-Test "TUI show-options -g mouse"
 Send-PsmuxCommand "show-options -g mouse"
@@ -951,6 +1003,18 @@ if ($r.ok -and $r.resp -match 'mouse') {
 } else {
     Write-Fail "TUI show-options -g mouse (server not responding)"
 }
+# `show-options -g <name>` opens a popup too, contrary to the note above: run
+# from the TUI it displays the value in a small box. Screen-read to be sure,
+# because the box is narrow and easy to miss under the status bar:
+#
+#       +----------------------+
+#       [popup3] 0:pwsh*  ...
+#
+# Left open it swallows the whole next command. That is what made section 20's
+# "rapid sequential sets" fail: prefix, colon, the text and Enter all landed on
+# this box, so escape-time stayed 500 while the checks reported a product bug.
+Send-PsmuxEscape
+Send-PsmuxEscape
 
 # =============================================================================
 # SECTION 20: Multiple set commands in sequence via TUI

@@ -16,6 +16,20 @@ use std::sync::{Arc, Mutex};
 use crate::layout::serialize_screen_rows;
 use crate::types::{Pane, AppState, Mode};
 
+/// Appends the extended underline style and SGR 58 colour of one run to the
+/// hand-written popup JSON, in the same shape `dump_layout_json_fast` uses
+/// (#589).  Both fields are omitted for ordinary runs.
+fn push_run_underline(run: &crate::layout::CellRunJson, out: &mut String) {
+    if run.ul > 1 {
+        let _ = std::fmt::Write::write_fmt(out, format_args!(",\"ul\":{}", run.ul));
+    }
+    if let Some(ulc) = &run.ulc {
+        out.push_str(",\"ulc\":\"");
+        out.push_str(ulc);
+        out.push('"');
+    }
+}
+
 /// Diagnostic-only popup logging, gated by PSMUX_POPUP_DEBUG=1 (no-op otherwise).
 /// Writes to %TEMP%\psmux_popup_debug.log (never inside the repo).
 fn popup_debug(msg: &str) {
@@ -44,6 +58,7 @@ pub fn create_popup_pane(
     pane_id: usize,
     session_name: &str,
     environment: &std::collections::HashMap<String, String>,
+    host_colors: Option<&crate::types::HostColors>,
 ) -> Option<Pane> {
     let pty_sys = portable_pty::native_pty_system();
     let pty_size = portable_pty::PtySize {
@@ -76,6 +91,14 @@ pub fn create_popup_pane(
     cmd_builder.env("TERM", "xterm-256color");
     cmd_builder.env("COLORTERM", "truecolor");
     cmd_builder.env("PSMUX_SESSION", session_name);
+    // A popup pty is not a window pane, so a client started in here is not a
+    // nested session — tmux allows `attach` inside a popup because the popup
+    // pty never appears in all_window_panes.  Mark the child so the psmux
+    // nested-session guard can make the same distinction (#537).
+    cmd_builder.env(crate::util::POPUP_CHILD_ENV, "1");
+    // A psmux client can now legitimately run in here (#537), and it must not
+    // query psmux for the terminal colors, so hand it the ones we already know.
+    crate::pane::set_host_colors_env(&mut cmd_builder, host_colors);
     crate::pane::apply_user_environment(&mut cmd_builder, environment);
     // NOTE: the interactive-shell-for-empty-command behavior (tmux parity, #351)
     // is handled above where cmd_builder is constructed: an empty command uses
@@ -117,6 +140,7 @@ pub fn create_popup_pane(
                 color_query_pending.clone(),
                 output_ring.clone(),
                 pane_id,
+                crate::platform::mouse_inject::get_child_pid(&*child),
             );
         }
         Err(e) => {
@@ -124,7 +148,7 @@ pub fn create_popup_pane(
         }
     }
 
-    let pty_writer = pair.master.take_writer().ok()?;
+    let pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().ok()?);
 
     // Brief delay so the reader thread processes initial output before the
     // first frame is serialized to clients.
@@ -160,6 +184,7 @@ pub fn create_popup_pane(
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
+        scroll_fg_cache: None, mouse_proto_owner: None,
         cursor_shape,
         bell_pending,
         // cpr_pending is now driven by the shared spawn_reader_thread above, so
@@ -168,6 +193,7 @@ pub fn create_popup_pane(
         color_query_pending,
         copy_state: None,
         pane_style: None,
+        pane_options: Default::default(),
         squelch_until: None,
         output_ring,
         // Popup shells are overlays, never tiled panes; never auto-heal them.
@@ -204,7 +230,7 @@ pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
     let pty_sys = portable_pty::native_pty_system();
     let pty_size = portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_sys.openpty(pty_size).ok()?;
-    let pty_writer = pair.master.take_writer().ok()?;
+    let pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().ok()?);
     // Drop the slave: with no child attached the pty stays inert; we never read.
     drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
@@ -229,12 +255,14 @@ pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
+        scroll_fg_cache: None, mouse_proto_owner: None,
         cursor_shape: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET)),
         bell_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cpr_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         color_query_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         copy_state: None,
         pane_style: None,
+        pane_options: Default::default(),
         squelch_until: None,
         output_ring: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         // Empty (`-E`) panes have a NullChild that never "exits"; not healable.
@@ -276,9 +304,20 @@ pub fn serialize_popup_overlay(app: &AppState) -> String {
 
             if let Some(pane) = popup_pane {
                 // PTY popup: serialize using the shared pane screen serializer
+                // The popup child owns the cursor while the popup is up (tmux
+                // popup_mode_cb), so publish its position and visibility too.
+                // Without them the client has nothing to place the cursor on
+                // and leaves it parked on the pane underneath (#507).
+                let mut cur_row: u16 = 0;
+                let mut cur_col: u16 = 0;
+                let mut cur_hidden = false;
                 out.push_str(",\"popup_rows\":[");
                 if let Ok(parser) = pane.term.lock() {
                     let screen = parser.screen();
+                    let (cr, cc) = screen.cursor_position();
+                    cur_row = cr;
+                    cur_col = cc;
+                    cur_hidden = screen.hide_cursor();
                     let rows_data = serialize_screen_rows(screen, inner_h, inner_w);
                     for (i, row) in rows_data.iter().enumerate() {
                         if i > 0 {
@@ -298,8 +337,10 @@ pub fn serialize_popup_overlay(app: &AppState) -> String {
                             out.push_str(&run.bg);
                             let _ = std::fmt::Write::write_fmt(
                                 &mut out,
-                                format_args!("\",\"flags\":{},\"width\":{}}}", run.flags, run.width),
+                                format_args!("\",\"flags\":{},\"width\":{}", run.flags, run.width),
                             );
+                            push_run_underline(run, &mut out);
+                            out.push('}');
                         }
                         out.push_str("]}");
                     }
@@ -307,6 +348,15 @@ pub fn serialize_popup_overlay(app: &AppState) -> String {
                 out.push(']');
                 out.push_str(",\"popup_lines\":[]");
                 out.push_str(",\"popup_has_pty\":true");
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        ",\"popup_cursor_row\":{},\"popup_cursor_col\":{},\"popup_hide_cursor\":{}",
+                        cur_row.min(inner_h.saturating_sub(1)),
+                        cur_col.min(inner_w.saturating_sub(1)),
+                        cur_hidden
+                    ),
+                );
             } else {
                 // Static (non-PTY) popup: plain text lines
                 out.push_str(",\"popup_rows\":[]");
@@ -468,8 +518,10 @@ pub fn serialize_floats_json(app: &AppState) -> String {
                     out.push_str(&run.bg);
                     let _ = std::fmt::Write::write_fmt(
                         &mut out,
-                        format_args!("\",\"flags\":{},\"width\":{}}}", run.flags, run.width),
+                        format_args!("\",\"flags\":{},\"width\":{}", run.flags, run.width),
                     );
+                    push_run_underline(run, &mut out);
+                    out.push('}');
                 }
                 out.push_str("]}");
             }
@@ -575,9 +627,14 @@ pub fn render_popup_overlay(
                             if cell.italic() {
                                 style = style.add_modifier(Modifier::ITALIC);
                             }
-                            if cell.underline() {
-                                style = style.add_modifier(Modifier::UNDERLINED);
-                            }
+                            style = crate::rendering::with_underline(
+                                style,
+                                cell.underline_style().sgr_subparam(),
+                                match cell.underline_color() {
+                                    vt100::Color::Default => None,
+                                    c => Some(crate::rendering::vt_to_color(c)),
+                                },
+                            );
                             if cell.inverse() {
                                 style = style.add_modifier(Modifier::REVERSED);
                             }

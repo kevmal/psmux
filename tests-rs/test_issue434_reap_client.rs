@@ -30,6 +30,7 @@ fn client_info(id: u64, control: bool) -> ClientInfo {
         last_activity: std::time::Instant::now(),
         tty_name: format!("/dev/pts/{}", id),
         is_control: control,
+        last_session: None,
     }
 }
 
@@ -140,4 +141,35 @@ fn reap_last_client_reaches_zero_once() {
     // A stray duplicate must NOT drive it negative / re-fire teardown logic.
     assert!(!app.reap_client(1));
     assert_eq!(app.attached_clients, 0, "stays zero, no spurious re-trigger");
+}
+
+// A persistent connection may send both its implicit `client-attach` and an
+// explicit `attach-session`. Both map to ClientAttach for the same server-side
+// id. Before register_client(), the counter incremented twice while the registry
+// contained one row; the single disconnect then left attached_clients == 1
+// forever even though list-clients was empty.
+#[test]
+fn duplicate_attach_then_single_detach_does_not_leave_ghost_attached() {
+    let mut app = AppState::new("test434_duplicate_attach".to_string());
+
+    assert!(app.register_client(42, false), "first attach registers the client");
+    assert!(!app.register_client(42, false), "duplicate attach is a no-op");
+    assert_eq!(app.attached_clients, 1);
+    assert_eq!(app.client_registry.len(), 1);
+
+    assert!(app.reap_client(42), "one detach reaps the one client");
+    assert_eq!(app.attached_clients, 0, "session is no longer ghost-attached");
+    assert!(app.client_registry.is_empty(), "list-clients has no ghost row");
+}
+
+#[test]
+fn duplicate_control_register_preserves_counter_registry_invariant() {
+    let mut app = AppState::new("test434_duplicate_control".to_string());
+    app.latest_client_id = Some(12);
+
+    assert!(app.register_client(77, true));
+    assert!(!app.register_client(77, true));
+    assert_eq!(app.attached_clients, app.client_registry.len());
+    assert!(app.client_registry.get(&77).unwrap().is_control);
+    assert_eq!(app.latest_client_id, Some(12), "control clients do not replace the latest interactive client");
 }

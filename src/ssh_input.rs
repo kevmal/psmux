@@ -65,15 +65,17 @@ use crossterm::event::{
 ///  2. A regular `write_all` to stdout (belt-and-suspenders).
 ///
 /// Call this **after** crossterm's `EnableMouseCapture` and `InputSource::new`.
+///
+/// The DEC private mode escape sequences for mouse reporting:
+///   1000 = basic mouse tracking
+///   1002 = button-event tracking (drag)
+///   1003 = any-event tracking (motion)
+///   1006 = SGR extended mouse format
+#[cfg(windows)]
+const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+
 #[cfg(windows)]
 pub fn send_mouse_enable() {
-    // The DEC private mode escape sequences for mouse reporting:
-    //   1000 = basic mouse tracking
-    //   1002 = button-event tracking (drag)
-    //   1003 = any-event tracking (motion)
-    //   1006 = SGR extended mouse format
-    const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
-
     // Issue #457: on builds whose ConPTY cannot round-trip VT mouse over SSH,
     // enabling mouse reporting is actively dangerous.  The bypass WriteFile
     // below reaches the client terminal even when ConPTY would otherwise have
@@ -85,9 +87,11 @@ pub fn send_mouse_enable() {
     if !conpty_mouse_supported() {
         ssh_debug_log(&format!(
             "send_mouse_enable: SUPPRESSED — Windows build {} < {} cannot accept \
-             mouse over SSH (issue #457); leaving mouse reporting disabled",
+             mouse over SSH (issue #457); leaving mouse reporting disabled. \
+             Set {}=1 to override if this host's conhost handles mouse (issue #573)",
             windows_build_number().map_or_else(|| "unknown".to_string(), |b| b.to_string()),
             CONPTY_MOUSE_MIN_BUILD,
+            FORCE_MOUSE_ENV,
         ));
         return;
     }
@@ -198,6 +202,112 @@ pub fn send_mouse_enable() {
     // On Unix, crossterm's EnableMouseCapture already works correctly.
 }
 
+/// Keep-alive re-arm of mouse reporting, safe to call periodically in ANY
+/// input mode — unlike [`send_mouse_enable`], which is only safe in VT input
+/// mode (see the local-console branch below for why).
+///
+/// Windows Terminal can silently drop a ConPTY client's mouse registration
+/// (observed after window resizes and across long-lived local sessions):
+/// keys keep flowing but WT stops reporting mouse entirely until the DECSET
+/// 1000/1002/1003/1006 registration is re-written to the output stream.
+/// Historically psmux re-sent it only in SSH mode, so a local WT session
+/// stayed mouse-dead until the client restarted (detach/reattach).
+///
+/// Mode routing:
+///  * pipe mode (mintty / Cygwin pty / no-PTY SSH) — re-send the curated pipe
+///    mode set (which deliberately excludes 1003 motion reporting).
+///  * VT input mode (SSH / JediTerm / WezTerm) — full [`send_mouse_enable`],
+///    including the stdin VTI restore and the DSR probe.
+///  * local Windows console — write ONLY the DECSET bytes and re-assert
+///    `ENABLE_MOUSE_INPUT`.  The full function must not run here: its stdin
+///    restore forces `ENABLE_VIRTUAL_TERMINAL_INPUT` on, which makes conhost
+///    deliver keystrokes as VT byte sequences that the crossterm
+///    INPUT_RECORD reader would surface as garbled text; and the DSR probe's
+///    `\x1b[0n` reply would leak into the active pane as ESC [ 0 n
+///    keystrokes.
+#[cfg(windows)]
+pub fn send_mouse_keepalive() {
+    if pipe_mode_active() {
+        pipe_send_modes_enable();
+        return;
+    }
+    if needs_vt_input() {
+        send_mouse_enable();
+        return;
+    }
+    // `PSMUX_FORCE_MOUSE=0` is an explicit "no mouse on this host" opt-out and
+    // still silences the whole keep-alive.
+    if !keepalive_reasserts_mouse_input() {
+        return;
+    }
+    // Issue #457's build gate covers the DECSET BYTE WRITES only.  On old
+    // conhost builds the bypass write below could reach the terminal, and the
+    // SGR report the terminal then sent back through the ConPTY input pipe
+    // fast-failed that build's VT input parser.  Re-asserting the Win32
+    // `ENABLE_MOUSE_INPUT` flag carries none of that risk and must NOT be
+    // gated: it is the only part of this function that actually restores the
+    // registration (issue #597, see `keepalive_reasserts_mouse_input`).
+    let write_decset_registration = conpty_mouse_supported();
+    // Belt-and-suspenders pair mirroring send_mouse_enable: raw WriteFile on
+    // the console output handle plus a buffered stdout write.  Both are
+    // idempotent for the terminal, so re-sending every refresh is harmless.
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+            fn WriteFile(
+                hFile: *mut std::ffi::c_void,
+                lpBuffer: *const u8,
+                nNumberOfBytesToWrite: u32,
+                lpNumberOfBytesWritten: *mut u32,
+                lpOverlapped: *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetConsoleMode(h: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+            fn SetConsoleMode(h: *mut std::ffi::c_void, mode: u32) -> i32;
+        }
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if write_decset_registration && !h.is_null() && h != (-1isize) as *mut std::ffi::c_void {
+            let mut written: u32 = 0;
+            let _ = WriteFile(
+                h,
+                MOUSE_ENABLE.as_ptr(),
+                MOUSE_ENABLE.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
+        // Re-assert ENABLE_MOUSE_INPUT if a console reset cleared it.  VTI
+        // (0x0200) is intentionally left alone — see the doc comment.
+        //
+        // This is the load-bearing line of the whole function: under ConPTY a
+        // client's own mouse DECSET bytes never reach the terminal (conhost
+        // absorbs them), so the terminal's mouse registration is driven purely
+        // by this console flag, which conhost mirrors outward as
+        // `\x1b[?1003;1006h` / `\x1b[?1003;1006l`.
+        let hin = GetStdHandle(STD_INPUT_HANDLE);
+        if !hin.is_null() && hin != (-1isize) as *mut std::ffi::c_void {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(hin, &mut mode) != 0 && mode & 0x0010 == 0 {
+                SetConsoleMode(hin, mode | 0x0010);
+            }
+        }
+    }
+    if write_decset_registration {
+        use std::io::Write;
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(MOUSE_ENABLE);
+        let _ = out.flush();
+    }
+}
+
+#[cfg(not(windows))]
+pub fn send_mouse_keepalive() {
+    // Unix terminals keep the registration from crossterm's startup
+    // EnableMouseCapture; no keep-alive needed.
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Returns `true` when the current process appears to run inside an SSH session.
@@ -277,12 +387,72 @@ pub fn windows_build_number() -> Option<u32> {
 /// tears down the ConPTY and kills the pane process (issue #457).
 pub const CONPTY_MOUSE_MIN_BUILD: u32 = 22523;
 
+/// Environment override for the build gate (issue #573).
+///
+/// The gate below is deliberately conservative: it refuses mouse on every build
+/// under [`CONPTY_MOUSE_MIN_BUILD`], while the crash that motivated it was only
+/// ever measured on Win10-era conhost (19041/19045).  Later ConPTY generations
+/// that still do not forward the DECSET, Windows Server 2022 (20348) being the
+/// reported case, relied entirely on the bypass write that the gate removes,
+/// so they lost mouse outright with no way to get it back.
+///
+/// `PSMUX_FORCE_MOUSE=1` re-enables mouse on such a host; `=0` pins it off on a
+/// modern build whose conhost misbehaves.  Unset keeps the build check.
+pub const FORCE_MOUSE_ENV: &str = "PSMUX_FORCE_MOUSE";
+
+/// Parses [`FORCE_MOUSE_ENV`] into an explicit yes/no.  Unset, empty, or
+/// unrecognised values yield `None`, meaning "fall back to the build check"
+/// rather than silently picking a side.
+pub fn forced_mouse_setting() -> Option<bool> {
+    let raw = std::env::var(FORCE_MOUSE_ENV).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Some(true),
+        "0" | "off" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Returns `true` only when this host's ConPTY can safely accept VT mouse
 /// input over SSH.  When the build is unknown we err on the side of **not**
 /// enabling mouse: a non-functional mouse is acceptable, a crashed session is
 /// not (issue #457).
+///
+/// [`FORCE_MOUSE_ENV`] overrides the build check in both directions (#573).
 pub fn conpty_mouse_supported() -> bool {
+    if let Some(forced) = forced_mouse_setting() {
+        return forced;
+    }
     windows_build_number().map_or(false, |b| b >= CONPTY_MOUSE_MIN_BUILD)
+}
+
+/// Whether the local-console keep-alive may re-assert `ENABLE_MOUSE_INPUT`
+/// on this host (issue #597).
+///
+/// Under ConPTY a client's own mouse DECSET bytes never reach the terminal:
+/// conhost absorbs `\x1b[?1000h`/`1002h`/`1003h`/`1006h` written to stdout
+/// (by `WriteFile` on the raw handle just as much as by `WriteConsoleW`) and
+/// mirrors mouse state outward on its own, from the Win32 `ENABLE_MOUSE_INPUT`
+/// flag, as `\x1b[?1003;1006h` / `\x1b[?1003;1006l`.  That console flag is
+/// therefore the ONLY registration channel a local client has, and crossterm
+/// already sets it at startup on every Windows build (`EnableMouseCapture`
+/// answers `is_ansi_code_supported() == false`, so it always takes the
+/// `SetConsoleMode` path).
+///
+/// Windows Terminal drops a long-lived local client's registration on its own
+/// (see the keep-alive doc comment).  Gating the restore behind
+/// [`conpty_mouse_supported`] therefore protected nothing — the session had
+/// been running with mouse reporting on since startup anyway — while making
+/// that loss PERMANENT on every build below [`CONPTY_MOUSE_MIN_BUILD`].  Once
+/// the terminal is told `\x1b[?1003;1006l` it falls back to alternate-scroll
+/// and turns the wheel into Up/Down arrow keys, which psmux then forwards into
+/// the pane; that is the "scroll wheel is sending arrow keys" report.
+///
+/// The issue #457 hazard is unrelated to this flag: it is about SGR reports
+/// arriving as VT bytes on the ConPTY INPUT pipe, which only the VT input path
+/// (`send_mouse_enable`) feeds.  `PSMUX_FORCE_MOUSE=0` still turns the whole
+/// keep-alive off for anyone who needs mouse pinned dead.
+pub fn keepalive_reasserts_mouse_input() -> bool {
+    forced_mouse_setting() != Some(false)
 }
 
 /// Unified input source — abstracts over crossterm (local) and SSH VT (remote).
@@ -1234,6 +1404,41 @@ fn vk_to_keycode(vk: u16) -> Option<KeyCode> {
     }
 }
 
+/// Fold ConPTY's VT-input NUL record onto `C-Space` (issue #508).
+///
+/// With `ENABLE_VIRTUAL_TERMINAL_INPUT` set, conhost re-encodes every
+/// NUL-producing chord — Ctrl+Space, Ctrl+@, Ctrl+2, Ctrl+Shift+2, or a
+/// literal 0x00 byte written by a win32-input-mode terminal such as WezTerm —
+/// as the single KEY_EVENT
+///
+/// ```text
+/// vk=VK_2 (0x32)  u_char=0  ctrl=CTRL|SHIFT
+/// ```
+///
+/// the same encoding issue #504 measured on the native input path.  The
+/// `u_char == 0` branch of the reader cannot hand this to the VT parser
+/// (there is no character to feed), and `vk_to_keycode` has no `VK_2` entry,
+/// so the key evaporated and a `C-Space` prefix was dead under WezTerm.
+///
+/// Mirror tmux (`tty-keys.c`: "C-Space is special"), the Ground-state `'\0'`
+/// arm of the VT parser, and `fold_nul_to_ctrl_space` on the native path:
+/// emit `Char(' ')` with CONTROL, SHIFT stripped, ALT preserved.  ALT-bearing
+/// records are excluded, matching the native fold's AltGr guard.
+#[cfg(windows)]
+fn vk_nul_to_ctrl_space(vk: u16, mods: KeyModifiers) -> Option<(KeyCode, KeyModifiers)> {
+    if vk == 0x32
+        && mods.contains(KeyModifiers::CONTROL)
+        && !mods.contains(KeyModifiers::ALT)
+    {
+        Some((
+            KeyCode::Char(' '),
+            mods.difference(KeyModifiers::SHIFT) | KeyModifiers::CONTROL,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Extract crossterm `KeyModifiers` from Win32 `dwControlKeyState`.
 #[cfg(windows)]
 fn vk_modifiers(state: u32) -> KeyModifiers {
@@ -1250,10 +1455,7 @@ fn vk_modifiers(state: u32) -> KeyModifiers {
 #[cfg(windows)]
 static SSH_LOG: std::sync::LazyLock<std::sync::Mutex<Option<std::fs::File>>> =
     std::sync::LazyLock::new(|| {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_default();
-        let dir = format!("{}/.psmux", home);
+        let dir = crate::paths::psmux_dir();
         let _ = std::fs::create_dir_all(&dir);
         let f = std::fs::OpenOptions::new()
             .create(true)
@@ -1276,6 +1478,11 @@ fn ssh_debug_log(msg: &str) {
         }
     }
 }
+
+/// No-op on non-Windows: the SSH reader thread and its log file are
+/// Windows-only (`SSH_LOG` above is not built there).
+#[cfg(not(windows))]
+fn ssh_debug_log(_msg: &str) {}
 
 /// True when verbose per-event logging is enabled.
 #[cfg(windows)]
@@ -1352,9 +1559,11 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
         fn GetStdHandle(nStdHandle: u32) -> *mut c_void;
         fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
         fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+        // *mut c_void buffer to match the declaration in platform.rs: the two
+        // modules each define their own INPUT_RECORD view of the same ABI.
         fn ReadConsoleInputW(
             h: *mut c_void,
-            buf: *mut INPUT_RECORD,
+            buf: *mut c_void,
             len: u32,
             read: *mut u32,
         ) -> i32;
@@ -1586,7 +1795,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 let ok = unsafe {
                     ReadConsoleInputW(
                         handle,
-                        records.as_mut_ptr(),
+                        records.as_mut_ptr() as *mut _,
                         records.len() as u32,
                         &mut count,
                     )
@@ -1652,7 +1861,15 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                                     parser.cancel_escape();
 
                                     let mods = vk_modifiers(key.control_key_state);
-                                    if let Some(code) = vk_to_keycode(key.virtual_key_code) {
+                                    if let Some((code, folded)) =
+                                        vk_nul_to_ctrl_space(key.virtual_key_code, mods)
+                                    {
+                                        let evt = make_key(code, folded);
+                                        if verbose {
+                                            ssh_debug_log(&format!("  → emit(nul-fold): {:?}", evt));
+                                        }
+                                        if tx.send(evt).is_err() { alive = false; }
+                                    } else if let Some(code) = vk_to_keycode(key.virtual_key_code) {
                                         let evt = make_key(code, mods);
                                         if verbose {
                                             ssh_debug_log(&format!("  → emit(vk): {:?}", evt));
@@ -1738,10 +1955,27 @@ mod tests;
 mod tests_issue457_ssh_mouse_build_gate;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue573_mouse_force_override.rs"]
+mod tests_issue573_mouse_force_override;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue597_mouse_keepalive_reassert.rs"]
+mod tests_issue597_mouse_keepalive_reassert;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_windows10_ssh_mouse.rs"]
+mod tests_windows10_ssh_mouse;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_pr468_wezterm_vt_input.rs"]
 mod tests_pr468_wezterm_vt_input;
 
-// ─── Cygwin/MSYS pty (pipe) client input — issue #474 ───────────────────────
+#[cfg(test)]
+#[cfg(windows)]
+#[path = "../tests-rs/test_issue508_wezterm_vt_cspace.rs"]
+mod tests_issue508_wezterm_vt_cspace;
+
+// ─── Raw VT pipe client input — issue #474 / Windows 10 SSH ────────────────
 //
 // Under mintty (Git Bash, MSYS2) the client's stdin is a Cygwin pty: a named
 // pipe carrying raw VT bytes, not a console. Console input APIs fail on it
@@ -1749,12 +1983,19 @@ mod tests_pr468_wezterm_vt_input;
 // to kill the client with "psmux: Incorrect function". This reader consumes
 // the pipe directly with `ReadFile` and feeds the same `VtParser` the SSH
 // path uses, so keys, mouse, paste, and focus events all decode identically.
+//
+// `ssh -T windows-host psmux attach` also gives psmux anonymous stdin/stdout
+// pipes instead of a ConPTY. This is the reliable Win10 mouse path: ConPTY is
+// absent, so DECSET mouse registration reaches the client terminal and its SGR
+// reports reach this parser byte-for-byte. The SSH environment distinguishes
+// that interactive pipe from an unrelated redirected local stdin.
 
-/// True when the client's stdin is a Cygwin/MSYS pty pipe. The NT pipe name
-/// carries a recognizable pattern: `msys-<hex>-pty<N>-{from,to}-master` (or
-/// `cygwin-…`). `PSMUX_PIPE_VT=1|0` forces the answer for tests.
+/// True when stdin is a raw VT pipe supplied by Cygwin/MSYS or by an SSH
+/// session with remote PTY allocation disabled (`ssh -T`). The NT pipe name
+/// identifies Cygwin/MSYS; anonymous SSH pipes are selected only when SSH
+/// environment variables are present. `PSMUX_PIPE_VT=1|0` forces the answer.
 #[cfg(windows)]
-pub fn stdin_is_cygwin_pty() -> bool {
+pub fn stdin_is_vt_pipe() -> bool {
     match std::env::var("PSMUX_PIPE_VT").ok().as_deref() {
         Some("1") => return true,
         Some("0") => return false,
@@ -1783,6 +2024,9 @@ pub fn stdin_is_cygwin_pty() -> bool {
         if GetFileType(h) != FILE_TYPE_PIPE {
             return false;
         }
+        if is_ssh_session() {
+            return true;
+        }
         // FILE_NAME_INFO: u32 byte length followed by the UTF-16 name.
         let mut buf = [0u8; 1024];
         if GetFileInformationByHandleEx(h, FILE_NAME_INFO, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) == 0 {
@@ -1800,11 +2044,11 @@ pub fn stdin_is_cygwin_pty() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn stdin_is_cygwin_pty() -> bool {
+pub fn stdin_is_vt_pipe() -> bool {
     false
 }
 
-/// Marks the client as running in pipe (Cygwin pty) mode so other client
+/// Marks the client as running in raw VT pipe mode so other client
 /// code — the periodic size query in the render loop — can key off it.
 static PIPE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1822,7 +2066,13 @@ pub fn pipe_stdout_write(bytes: &[u8]) {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetStdHandle(n: u32) -> *mut c_void;
-        fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ovl: *mut c_void) -> i32;
+        fn WriteFile(
+            h: *mut c_void,
+            buf: *const u8,
+            len: u32,
+            written: *mut u32,
+            ovl: *mut c_void,
+        ) -> i32;
     }
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     unsafe {
@@ -1830,8 +2080,22 @@ pub fn pipe_stdout_write(bytes: &[u8]) {
         if h.is_null() || h == (-1isize) as *mut c_void {
             return;
         }
-        let mut written: u32 = 0;
-        let _ = WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let chunk_len = (bytes.len() - offset).min(u32::MAX as usize) as u32;
+            let mut written: u32 = 0;
+            let ok = WriteFile(
+                h,
+                bytes.as_ptr().add(offset),
+                chunk_len,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+            if ok == 0 || written == 0 {
+                break;
+            }
+            offset += written as usize;
+        }
     }
 }
 
@@ -1846,9 +2110,9 @@ pub fn request_pipe_terminal_size() {
 }
 
 /// Enable the VT modes psmux needs from a pipe-mode terminal: SGR mouse
-/// reporting, focus events, and bracketed paste. mintty handles these
-/// natively (no ConPTY in the path), so the issue #457 build gating that
-/// applies to SSH-over-ConPTY does not apply here.
+/// reporting, focus events, and bracketed paste. The pipe connects directly
+/// to mintty or the SSH channel (no ConPTY in the path), so the issue #457
+/// build gating that applies to SSH-over-ConPTY does not apply here.
 pub fn pipe_send_modes_enable() {
     pipe_stdout_write(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
 }
@@ -1866,9 +2130,11 @@ fn start_pipe_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
     extern "system" {
         fn GetStdHandle(n: u32) -> *mut c_void;
         fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ovl: *mut c_void) -> i32;
+        // *mut u8 buffer to match the PeekNamedPipe declarations in main.rs
+        // (clashing_extern_declarations).
         fn PeekNamedPipe(
             h: *mut c_void,
-            buf: *mut c_void,
+            buf: *mut u8,
             len: u32,
             read: *mut u32,
             avail: *mut u32,
@@ -1884,7 +2150,7 @@ fn start_pipe_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
 
     PIPE_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let (tx, rx) = mpsc::sync_channel::<Event>(1024);
-    ssh_debug_log("pipe reader starting (cygwin pty mode)");
+    ssh_debug_log("pipe reader starting (raw VT pipe mode)");
 
     std::thread::spawn(move || {
         let handle = handle as *mut c_void;
@@ -1973,10 +2239,9 @@ fn start_pipe_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
 }
 
 impl InputSource {
-    /// Input source for a client attached over a Cygwin/MSYS pty (issue
-    /// #474): VT byte stream from the stdin pipe. Falls back to crossterm if
-    /// the reader cannot start (the client then fails the same way it did
-    /// before pipe mode existed).
+    /// Input source for a client attached over a Cygwin/MSYS pty (issue #474)
+    /// or an SSH channel without a remote PTY: VT byte stream from stdin.
+    /// Falls back to crossterm if the reader cannot start.
     pub fn new_pipe() -> io::Result<Self> {
         #[cfg(windows)]
         {

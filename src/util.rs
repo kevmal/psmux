@@ -20,6 +20,51 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Resolve a `-c` start-dir to one a freshly spawned pane shell can actually
+/// enter, falling back to the user's home directory when it cannot.
+///
+/// `portable_pty`'s `cwd()` maps to the child's initial working directory, and
+/// on Windows a directory the child cannot enter makes the spawn itself fail —
+/// before the shell runs, so no amount of profile-level healing helps. The pane
+/// dies on creation and psmux tears it straight back down. That is the
+/// "prefix + | splits, opens, then immediately aborts" report.
+///
+/// Two cases produce an unusable start-dir in practice:
+///   - the directory no longer exists (it was deleted, or renamed, since the
+///     pane that is being split last `cd`'d into it), and
+///   - a UNC path. `\\wsl.localhost\...` after a `cd` into WSL is the common
+///     one. These are rejected even when currently reachable: whether they work
+///     depends on the WSL VM being up and the share being mounted, so a split
+///     that succeeds now and dies in ten minutes is worse than one that
+///     predictably lands in the home directory.
+///
+/// Returning `None` means "do not set a cwd at all" and lets the child inherit
+/// the server's — the last resort for the case where even home is unusable.
+pub fn usable_start_dir(dir: &str) -> Option<std::path::PathBuf> {
+    // UNC rejection is a Windows concept (the `\\wsl.localhost\...` case). On
+    // Unix a leading `//` is a legitimate absolute path, so treating it as UNC
+    // would wrongly send existing directories to the home fallback.
+    #[cfg(windows)]
+    fn is_unc(p: &str) -> bool {
+        p.starts_with("\\\\") || p.starts_with("//")
+    }
+    #[cfg(not(windows))]
+    fn is_unc(_p: &str) -> bool {
+        false
+    }
+
+    if !dir.is_empty() && !is_unc(dir) && std::path::Path::new(dir).is_dir() {
+        return Some(std::path::PathBuf::from(dir));
+    }
+
+    let home = crate::paths::home_dir();
+    if !home.is_empty() && std::path::Path::new(&home).is_dir() {
+        return Some(std::path::PathBuf::from(home));
+    }
+
+    None
+}
+
 /// Expand `~` to the user's home directory in a shell command string,
 /// then rewrite `~/.psmux/plugins/` to `~/.config/psmux/plugins/` when
 /// the classic path does not exist but the XDG path does (issue psmux-plugins#2).
@@ -230,7 +275,13 @@ pub fn base64_encode(data: &str) -> String {
 
 pub fn base64_decode(encoded: &str) -> Option<String> {
     let mut result = Vec::new();
-    let chars: Vec<u8> = encoded.bytes().filter(|&b| b != b'=').collect();
+    // tmux parity: b64_pton (compat/base64.c) skips ASCII whitespace anywhere
+    // in the payload, so OSC 52 producers that wrap long base64 still decode.
+    // Any other non-alphabet byte still rejects the whole payload below.
+    let chars: Vec<u8> = encoded
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
     for chunk in chars.chunks(4) {
         if chunk.len() < 2 { break; }
         let b0 = BASE64_CHARS.iter().position(|&c| c == chunk[0])? as u8;
@@ -251,10 +302,164 @@ pub fn base64_decode(encoded: &str) -> Option<String> {
 /// Return color name as a string. Uses static strings for Default and
 /// the 256 indexed colors to avoid heap allocations on every cell.
 /// Quote and escape an argument for safe transmission over the control protocol.
-/// Wraps the value in double quotes and escapes any embedded double quotes or backslashes.
+/// Wraps the value in double quotes and escapes any embedded double quotes or
+/// backslashes. Also escapes the two line-terminator bytes (0x0A/0x0D): the wire
+/// protocol is line-oriented and the server reads one command per `read_line`, so
+/// a raw newline inside an argument would cut the line and the tail would be
+/// executed as a separate command against the caller's session (issue #560, a
+/// send-keys injection). Escaping them to `\n`/`\r` keeps the whole argument on a
+/// single wire line. Backslash is escaped first so the escape bytes introduced
+/// here are not doubled.
 pub fn quote_arg(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     format!("\"{}\"", escaped)
+}
+
+/// Quote an argument for the wire only when the server's quote-aware
+/// re-tokenizer would otherwise corrupt it: empty (collapses into joining
+/// whitespace), whitespace (re-split), or quote characters (stripped as
+/// quoting syntax). Quoting always goes through `quote_arg` so backslashes
+/// are escaped to match what `parse_command_line` decodes inside double
+/// quotes — the old encoders escaped only `"`, so every `\\` collapsed to
+/// `\` and a trailing `\` consumed the closing quote and swallowed the
+/// following flags (issue #547). Values needing no quoting are passed
+/// through untouched on purpose: outside quotes the parser treats
+/// backslashes as literal, so an unquoted value is byte-exact.
+pub fn quote_arg_if_needed(s: &str) -> String {
+    if s.is_empty()
+        || s.chars().any(char::is_whitespace)
+        || s.contains('"')
+        || s.contains('\'')
+    {
+        quote_arg(s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Parse the canonical tmux logging idiom `cat > <path>` / `cat >> <path>`
+/// so `pipe-pane` can service it in-process as a direct file sink.
+///
+/// On Windows the piped command runs under PowerShell (`resolve_run_shell`),
+/// where `cat` is the `Get-Content` alias: it never reads stdin, exits at
+/// once, and the redirection leaves a 0-byte file — so the single most
+/// common tmux sink, and the one this repo's own docs show, could not work
+/// through the shell at all. Recognizing the idiom here lets the server
+/// write the pane's raw ConPTY bytes to the file itself: byte-faithful (no
+/// PowerShell line decoding/re-encoding) and with no child process to fail
+/// silently.
+///
+/// Returns `(path, append)` — `append` is true for `>>`. The path may be
+/// single- or double-quoted (one level stripped; inner quote characters
+/// arrive intact through the #547/#563 wire round-trip). Anything that is
+/// not exactly this shape — options on `cat`, an unquoted path containing
+/// whitespace, trailing tokens after a quoted path, shell metacharacters,
+/// anything a shell would expand (`$var`, backticks, `%var%`, leading `~`)
+/// — returns `None` and falls through to the shell sink unchanged: the
+/// file sink must only ever intercept a path the user meant literally.
+pub fn parse_cat_file_sink(cmd: &str) -> Option<(String, bool)> {
+    let trimmed = cmd.trim();
+    // PowerShell aliases are case-insensitive, so `CAT`/`Cat` hit the same
+    // Get-Content trap as `cat` — match the word the same way.
+    if trimmed.len() < 3 || !trimmed[..3].eq_ignore_ascii_case("cat") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    // `cat` must end at a word boundary: whitespace or the redirection itself.
+    if !rest.is_empty() && !rest.starts_with('>') && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (append, rest) = if let Some(r) = rest.strip_prefix(">>") {
+        (true, r)
+    } else if let Some(r) = rest.strip_prefix('>') {
+        (false, r)
+    } else {
+        return None;
+    };
+    let path_part = rest.trim();
+    if path_part.is_empty() {
+        return None;
+    }
+    let quoted = |q: char| {
+        path_part.len() >= 2 && path_part.starts_with(q) && path_part.ends_with(q)
+    };
+    let path = if quoted('"') || quoted('\'') {
+        let inner = &path_part[1..path_part.len() - 1];
+        // A quote character inside means this was not one plainly quoted
+        // path (e.g. `"a" "b"`, or nested quoting) — shell territory. `$`
+        // and backticks are what PowerShell would expand inside double
+        // quotes; `#` is what tmux would expand as a format (`#I`, `#{...}`).
+        // Intercepting any of them would silently take the LITERAL text as
+        // a filename, so they go to the shell too.
+        if inner.is_empty() || inner.contains(['"', '\'', '$', '`', '#']) {
+            return None;
+        }
+        inner.to_string()
+    } else {
+        // Unquoted: whitespace, further shell syntax, or anything a shell
+        // would expand means the command is more than a plain literal file
+        // redirect — leave it to the shell.
+        if path_part.chars().any(char::is_whitespace)
+            || path_part.contains(['>', '<', '|', '&', '"', '\'', ';', '$', '`', '%', '(', ')', '^', '#'])
+            || path_part.starts_with('~')
+        {
+            return None;
+        }
+        path_part.to_string()
+    };
+    Some((path, append))
+}
+
+/// Path-shape gate for the direct file sink. The open runs on the server's
+/// single event loop, so every path class whose CreateFile can stall or hit
+/// a device instead of a file must be refused BEFORE opening:
+///
+/// - UNC (`\\server\share`, `//server/share`, `\\?\UNC\...`): CreateFile
+///   against an unreachable host blocks for tens of seconds and would
+///   freeze every pane. `\\?\C:\...` (extended-length local) is allowed.
+/// - DOS reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+///   `LPT1`-`LPT9`, with or without an extension, in any directory):
+///   CreateFile opens the DEVICE — `cat > CON` would tee raw VT bytes into
+///   the server's own console while looking like a successful log.
+///
+/// Returns `Some(reason)` when the path must be refused. Remote-drive
+/// detection needs a live Win32 call and lives with the caller.
+pub fn refuse_file_sink_path(path: &str) -> Option<String> {
+    if path.starts_with("\\\\.\\") {
+        return Some("device namespace not supported for the direct file sink".to_string());
+    }
+    let is_unc_verbatim = path.to_ascii_lowercase().starts_with("\\\\?\\unc\\");
+    let is_verbatim_local = path.starts_with("\\\\?\\") && !is_unc_verbatim;
+    if !is_verbatim_local
+        && (path.starts_with("\\\\") || path.starts_with("//"))
+    {
+        return Some("UNC path not supported for the direct file sink".to_string());
+    }
+    let basename = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path);
+    let stem = basename.split('.').next().unwrap_or(basename);
+    // `NUL:` / `COM1:` etc. are still the device — strip the DOS-style
+    // trailing colon before matching.
+    let stem_upper = stem.trim().trim_end_matches(':').to_ascii_uppercase();
+    let reserved = matches!(stem_upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem_upper.len() == 4
+            && (stem_upper.starts_with("COM") || stem_upper.starts_with("LPT"))
+            && stem_upper.as_bytes()[3].is_ascii_digit()
+            && stem_upper.as_bytes()[3] != b'0');
+    if reserved {
+        return Some(format!(
+            "reserved device name '{}' not supported for the direct file sink",
+            stem_upper
+        ));
+    }
+    None
 }
 
 /// Parse `VARIABLE=value` for tmux `new-session -e` / internal `server -e`
@@ -322,10 +527,70 @@ pub fn collect_server_session_env_args(args: &[String]) -> Result<Vec<(String, S
     Ok(out)
 }
 
+/// Encode bytes as lowercase hex with no separators.
+///
+/// Used to carry a payload that must survive the control wire BYTE-EXACT.
+/// Every command line the server receives is tokenized before a handler sees
+/// it (`;` splits it into sub-commands, quote grouping is stripped, runs of
+/// whitespace collapse), so any operand that is data rather than a word has to
+/// be reduced to `[0-9a-f]` first.  `send -H` already does this for keystrokes;
+/// buffer contents use the same shape.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Decode the output of [`hex_encode`].  `None` for an odd length or any
+/// non-hex character — a malformed payload is reported to the sender, never
+/// silently turned into partial data.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::parse_command_line;
+
+    /// The whole point of the hex wire: a buffer that the tokenizer would
+    /// otherwise destroy survives encode → tokenize → decode byte for byte.
+    #[test]
+    fn test_hex_buffer_wire_survives_tokenizer() {
+        let content = "printf '%s' 'QUOTED ARG'\tTAB\nline \"two\"; not-a-command\n\x1b[0m";
+        let line = format!("set-buffer -b pb -H {}", hex_encode(content.as_bytes()));
+        // What the server actually receives: the tokenized command line.
+        let toks = parse_command_line(&line);
+        assert_eq!(toks.len(), 5, "hex payload must stay a single token");
+        let decoded = hex_decode(&toks[4]).expect("valid hex");
+        assert_eq!(String::from_utf8(decoded).unwrap(), content);
+    }
+
+    #[test]
+    fn test_hex_encode_is_lowercase_pairs() {
+        assert_eq!(hex_encode(b"\x00\x0f\xff A"), "000fff2041");
+    }
+
+    #[test]
+    fn test_hex_decode_rejects_malformed() {
+        assert_eq!(hex_decode("abc"), None, "odd length");
+        assert_eq!(hex_decode("zz"), None, "non-hex digit");
+        assert_eq!(hex_decode(""), Some(Vec::new()));
+    }
 
     #[test]
     fn test_quote_arg_simple() {
@@ -582,3 +847,84 @@ pub fn color_to_name(c: vt100::Color) -> std::borrow::Cow<'static, str> {
         vt100::Color::Rgb(r,g,b) => Cow::Owned(format!("rgb:{},{},{}", r,g,b)),
     }
 }
+
+/// Environment marker put on a popup/float child so it is not mistaken for a
+/// pane child by the nested-session guard.  See [`inside_psmux_pane`].
+pub const POPUP_CHILD_ENV: &str = "PSMUX_POPUP";
+
+/// True when this process runs inside a psmux **pane**, i.e. when a client that
+/// grabs this terminal would genuinely nest a session inside another one.
+///
+/// tmux's `server_client_check_nested()` needs BOTH conditions to hold: `$TMUX`
+/// is set AND the client's tty is the tty of one of the server's window panes.
+/// A `display-popup` runs on a pty created by `job_run()`, which is never
+/// registered in `all_window_panes`, so the tty half of the test fails and tmux
+/// lets `tmux attach -t other` through inside a popup.  That is precisely what
+/// makes the popup scratch-session idiom work upstream.
+///
+/// psmux has no ttys to compare, so the popup child carries
+/// [`POPUP_CHILD_ENV`] instead (set in `popup::create_popup_pane`, cleared for
+/// every real pane child in `pane::set_tmux_env`), and a popup child is treated
+/// as not-in-a-pane exactly like tmux treats it (#537).
+pub fn inside_psmux_pane() -> bool {
+    if in_popup_child() {
+        return false;
+    }
+    std::env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1")
+        || std::env::var("PSMUX_SESSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+}
+
+/// True when this process was spawned as a popup/float child.
+pub fn in_popup_child() -> bool {
+    std::env::var(POPUP_CHILD_ENV).ok().as_deref() == Some("1")
+}
+
+/// True when the terminal this process talks to is drawn by psmux itself: a
+/// pane child or a popup/float child.
+///
+/// Use this, not [`inside_psmux_pane`], for anything that treats the terminal
+/// as a terminal (querying it and waiting for a reply). The two differ on
+/// purpose in both directions:
+///
+///   * a popup counts here but not there, because a popup is not a nested
+///     session yet its terminal is still psmux (#537), and
+///   * `PSMUX_ACTIVE` counts there but NOT here. That variable only says "this
+///     process is a psmux client", which every top-level client sets on itself
+///     before it queries its real terminal. Treating it as evidence that psmux
+///     draws the terminal would suppress the host-color query for EVERY client
+///     and quietly undo #473. Only what the server plants on the children it
+///     spawns is evidence about who draws the terminal.
+pub fn psmux_drawn_terminal() -> bool {
+    in_popup_child()
+        || std::env::var("PSMUX_SESSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_run_shell_format_and_start_dir.rs"]
+mod tests_run_shell_format_and_start_dir;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue537_popup_attach.rs"]
+mod tests_issue537_popup_attach;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_nested_client_color_query.rs"]
+mod tests_nested_client_color_query;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_deps_base64_parity.rs"]
+mod tests_deps_base64_parity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue560_quote_arg_control_bytes.rs"]
+mod tests_issue560_quote_arg_control_bytes;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pipe_pane_cat_file_sink.rs"]
+mod tests_pipe_pane_cat_file_sink;

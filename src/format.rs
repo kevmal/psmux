@@ -95,6 +95,16 @@ pub fn expand_format(fmt: &str, app: &AppState) -> String {
     expand_format_for_window(fmt, app, app.active_idx)
 }
 
+/// The REAL (user-visible) active window index. While a temporary -t focus
+/// is applied for command targeting, `active_idx` points at the target
+/// window; the pre-switch index saved in `temp_focus_saved_active` is what
+/// "active" means to the user, so `#{window_active}` and the `*` flag must
+/// compare against it (issue #551 — `display-message -t <win>` reported
+/// every targeted window as active).
+fn real_active_idx(app: &AppState) -> usize {
+    app.temp_focus_saved_active.unwrap_or(app.active_idx)
+}
+
 /// Expand tmux format strings for a specific window index.
 pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> String {
     let mut result = String::with_capacity(fmt.len() * 2);
@@ -192,7 +202,7 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'F' => {
-                    if win_idx == app.active_idx { result.push('*'); }
+                    if win_idx == real_active_idx(app) { result.push('*'); }
                     else if win_idx == app.last_window_idx { result.push('-'); }
                     i += 2; continue;
                 }
@@ -246,53 +256,152 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     result
 }
 
-/// Execute a shell command and return its stdout (trimmed).
-/// Used for `#(command)` expansion (tmux compatibility).
+// NOTE: this doc block used to sit here, detached, describing `run_shell_command`
+// as if it were unconditionally async — which it is not, and has not been since
+// d981d94. `cargo` flagged it as an unused doc comment and it was left in place;
+// meanwhile it was the only documentation anyone reading this file would find,
+// and it described the wrong half of the function. It now lives on
+// `run_shell_command` itself, covering BOTH branches.
+thread_local! {
+    // When true, `#()` expansion is ASYNC (spawn a background worker, return the
+    // cached value, apply the result on a later repaint). Default false = SYNC.
+    static FORMAT_ASYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard that puts `#()` expansion in ASYNC mode for its lifetime.
 ///
-/// Results are cached in `app.format_shell_cache` keyed by the command
-/// string, with TTL = `status-interval` seconds (matching tmux's refresh
-/// semantics for `#(...)`). When `status-interval` is 0, a 1s floor is
-/// used so typing latency is bounded — tmux never repaints fast enough
-/// for the spawn cost to dominate, but our server-push path can fire
-/// ~30 times per second during active TUI redraws.
+/// ONLY the periodic status-bar / render path should use this: that path runs
+/// every server-loop tick, so a slow `#(command)` there must never block the
+/// loop (issue #272 / PR #477). Every other caller — one-shot `display-message
+/// -p '#(cmd)'`, hooks, etc. — expands `#()` synchronously so a single expansion
+/// returns the command's real output immediately. PR #477 made ALL expansion
+/// async, which silently broke one-shot `#()` (it returned the empty pre-first-
+/// result value and never repainted). This restores tmux-parity: async only for
+/// the status bar, synchronous everywhere else.
 ///
-/// Cache miss / expiry path spawns a fresh subprocess synchronously.
-/// First call after expiry pays the spawn cost; subsequent calls within
-/// the TTL window return instantly. See issue #272.
+/// DO NOT construct this at a render call site. It is created inside the three
+/// functions that make up the render path —
+/// `server::helpers::expand_status_formats`, `list_windows_json_with_tabs`, and
+/// `append_extra_style_json`. It was previously created at the call sites, and
+/// the server auto-push block was written without it, so `#()` in the status bar
+/// spawned a process synchronously on the event loop that also delivers
+/// keystrokes — on every pane output burst. Keeping construction inside the
+/// functions means a new render path cannot reintroduce that.
+pub struct AsyncFormatGuard(bool);
+impl AsyncFormatGuard {
+    pub fn new() -> Self {
+        // Save and restore the PREVIOUS value rather than unconditionally
+        // clearing on drop. If two guarded helpers ever nest, a blind
+        // `set(false)` in the inner Drop would silently drop the outer region
+        // back to synchronous — re-creating the exact bug this guard exists to
+        // prevent, but only in the nested case and therefore much harder to
+        // spot. Restoring makes nesting a non-event.
+        let prev = FORMAT_ASYNC.with(|c| c.replace(true));
+        AsyncFormatGuard(prev)
+    }
+}
+impl Drop for AsyncFormatGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        FORMAT_ASYNC.with(|c| c.set(prev));
+    }
+}
+
+/// Expand `#(command)` (tmux compatibility). Has two modes, selected by the
+/// thread-local [`FORMAT_ASYNC`] flag that [`AsyncFormatGuard`] sets:
+///
+/// - **Sync (the default, no guard active):** run the command inline with
+///   `Command::output()` and return its real stdout. Correct — and required —
+///   for one-shot callers like `display-message -p '#(cmd)'`, which have no
+///   later repaint to pick up an async result. It BLOCKS the calling thread for
+///   as long as the child runs.
+/// - **Async (under an [`AsyncFormatGuard`]):** return the last cached stdout
+///   and, when it is missing or older than the TTL, spawn a background worker to
+///   refresh it. Never blocks; the worker's result is delivered over
+///   `format_job_tx` and applied by the drain in the server loop, which then
+///   repaints. Before the first result the expansion is empty.
+///
+/// The async cache is `app.format_shell_cache`, keyed by command string, TTL =
+/// `status-interval` seconds (1s floor). A command already in flight is not
+/// re-spawned, so a burst of pushes runs it at most once per TTL (issue #272).
+///
+/// The sync branch writes that cache but deliberately does not read it: a
+/// one-shot caller asked for the command's output *now*, and serving it a value
+/// from up to `status-interval` ago would make `#(date)` and friends silently
+/// stale. That asymmetry is why the guard has to be right — anything on the
+/// render path that misses it does not merely lose caching, it blocks the loop.
 fn run_shell_command(cmd: &str, app: &AppState) -> String {
+    // Synchronous one-shot expansion (the default): run the command inline and
+    // return its real output. A one-shot `display-message -p '#(cmd)'` has no
+    // later repaint to pick up an async result, so it must block here.
+    if !FORMAT_ASYNC.with(|c| c.get()) {
+        use std::process::Command;
+        use crate::platform::HideWindowCommandExt;
+        let output = if cfg!(windows) {
+            Command::new("cmd").args(["/C", cmd]).hide_window().output()
+        } else {
+            Command::new("sh").args(["-c", cmd]).output()
+        };
+        let value = match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => String::new(),
+        };
+        // Refresh the cache so a following async status render starts fresh.
+        if let Ok(mut guard) = app.format_shell_cache.lock() {
+            guard.insert(cmd.to_string(), crate::types::ShellEntry {
+                at: std::time::Instant::now(), value: value.clone(), running: false,
+            });
+        }
+        return value;
+    }
+
     let ttl = std::time::Duration::from_secs(app.status_interval.max(1));
 
-    // Fast path: return cached value if still fresh.
-    if let Ok(guard) = app.format_shell_cache.lock() {
-        if let Some((stored_at, value)) = guard.get(cmd) {
-            if stored_at.elapsed() < ttl {
-                return value.clone();
+    let mut guard = match app.format_shell_cache.lock() {
+        Ok(g) => g,
+        Err(_) => return String::new(),
+    };
+
+    // Fast path: a fresh value, returned without spawning. Otherwise capture the
+    // last output + freshness base and decide whether to spawn a refresh worker.
+    let (last_value, base_at, should_spawn) = match guard.get(cmd) {
+        Some(e) => {
+            if e.at.elapsed() < ttl {
+                return e.value.clone();
             }
+            (e.value.clone(), e.at, !e.running)
+        }
+        None => (String::new(), std::time::Instant::now(), true),
+    };
+
+    if should_spawn {
+        if let Some(tx) = app.format_job_tx.as_ref() {
+            let tx = tx.clone();
+            let cmd_owned = cmd.to_string();
+            // Mark in-flight (keeping the old freshness base) before spawning so
+            // other #() expansions in the same push don't double-spawn.
+            guard.insert(cmd.to_string(), crate::types::ShellEntry { at: base_at, value: last_value.clone(), running: true });
+            drop(guard);
+            std::thread::spawn(move || {
+                use std::process::Command;
+                use crate::platform::HideWindowCommandExt;
+                let output = if cfg!(windows) {
+                    Command::new("cmd").args(["/C", &cmd_owned]).hide_window().output()
+                } else {
+                    Command::new("sh").args(["-c", &cmd_owned]).output()
+                };
+                let value = match output {
+                    Ok(o) if o.status.success() => {
+                        String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    }
+                    _ => String::new(),
+                };
+                let _ = tx.send((cmd_owned, value));
+            });
         }
     }
 
-    // Cache miss or expired: spawn the subprocess.
-    use std::process::Command;
-    use crate::platform::HideWindowCommandExt;
-    let output = if cfg!(windows) {
-        Command::new("cmd").args(["/C", cmd]).hide_window().output()
-    } else {
-        Command::new("sh").args(["-c", cmd]).output()
-    };
-    let value = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => String::new(),
-    };
-
-    // Insert/refresh the cache entry. Lock failures (poisoned) are
-    // ignored — the subprocess already ran, the user still gets output.
-    if let Ok(mut guard) = app.format_shell_cache.lock() {
-        guard.insert(cmd.to_string(), (std::time::Instant::now(), value.clone()));
-    }
-
-    value
+    last_value
 }
 
 /// Escape '%' to '%%' in expanded variable content so chrono's strftime
@@ -379,7 +488,7 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
                 let two_arg = args.len() >= 2;
                 let mut parts = Vec::new();
                 for wi in 0..app.windows.len() {
-                    let fmt = if wi == app.active_idx { current_fmt } else { normal_fmt };
+                    let fmt = if wi == real_active_idx(app) { current_fmt } else { normal_fmt };
                     parts.push(expand_format_for_window(fmt, app, wi));
                 }
                 // Two-argument form joins without separator (user controls layout),
@@ -416,7 +525,7 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
         return result;
     }
 
-    // Plain variable or option name
+    // Plain variable or option name. Unknown names render empty (tmux parity).
     expand_var(expr, app, win_idx)
 }
 
@@ -820,8 +929,14 @@ fn expand_var_or_format(target: &str, app: &AppState, win_idx: usize) -> String 
         if target.is_empty() || target.parse::<f64>().is_ok() {
             return target.to_string();
         }
-        let val = expand_var(target, app, win_idx);
-        if val.is_empty() && !target.is_empty() {
+        // Use the inner form so a REAL variable that is merely empty is
+        // distinguishable from a name that is not a variable at all. Testing
+        // `val.is_empty()` conflated them, so `#{b:pane_path}` rendered the
+        // literal text "pane_path" whenever no OSC 7 had arrived yet — every
+        // modifier over an optional variable echoed its own name instead of
+        // rendering nothing.
+        let val = expand_var_inner(target, app, win_idx);
+        if val == UNKNOWN_VAR {
             // Try as option
             if let Some(opt_val) = lookup_option(target, app) {
                 return opt_val;
@@ -1038,7 +1153,29 @@ fn find_comparison_in_cond(cond: &str) -> Option<(&str, &str, &str)> {
 // ─────────────────── variable expansion ──────────────────────────
 
 /// Expand a named variable.
+/// Sentinel returned by [`expand_var_inner`] for a name that is not a format
+/// variable at all, as distinct from a real variable whose value happens to be
+/// empty.
+///
+/// Those two cases used to be indistinguishable — both came back as `""` — and
+/// [`expand_var_or_format`] treated any empty result as "unknown name" and fell
+/// back to echoing the name as a literal. The visible consequence was that a
+/// modifier over an optional variable printed the variable's own name:
+/// `#{b:pane_path}` rendered the text `pane_path` whenever the shell had not
+/// yet sent an OSC 7. A bare `#{pane_path}` rendered correctly (empty), so the
+/// bug only appeared once a modifier was involved.
+///
+/// Contains a NUL so it can never collide with a real expansion.
+const UNKNOWN_VAR: &str = "\u{0}psmux:unknown-var";
+
+/// Expand a plain variable name. Unknown names expand to the empty string,
+/// matching tmux.
 pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
+    let v = expand_var_inner(var, app, win_idx);
+    if v == UNKNOWN_VAR { String::new() } else { v }
+}
+
+fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
     let win = match app.windows.get(win_idx) {
         Some(w) => w,
         None => {
@@ -1051,10 +1188,18 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                     .map(|d| d.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 "pid" | "server_pid" => std::process::id().to_string(),
+                "server_instance" => {
+                    crate::session::read_namespace_instance(app.socket_name.as_deref())
+                        .unwrap_or_default()
+                }
                 "version" => VERSION.to_string(),
                 "host" | "hostname" => hostname_cached(),
                 "host_short" => { let h = hostname_cached(); h.split('.').next().unwrap_or(&h).to_string() }
                 _ => {
+                    // Not "unknown": with no window we simply cannot resolve a
+                    // window/pane variable. Reporting UNKNOWN_VAR here would
+                    // make a modifier chain echo the variable's name, so treat
+                    // an unresolvable-but-real variable as empty.
                     if let Some(v) = lookup_option(var, app) { v } else { String::new() }
                 }
             };
@@ -1106,11 +1251,11 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         // ── Window ──
         "window_index" => app.win_display_index(win_idx).to_string(),
         "window_name" => win.name.clone(),
-        "window_active" => if win_idx == app.active_idx { "1".into() } else { "0".into() },
+        "window_active" => if win_idx == real_active_idx(app) { "1".into() } else { "0".into() },
         "window_panes" => count_panes(&win.root).to_string(),
         "window_flags" | "window_raw_flags" => {
             let mut f = String::new();
-            if win_idx == app.active_idx { f.push('*'); }
+            if win_idx == real_active_idx(app) { f.push('*'); }
             else if win_idx == app.last_window_idx { f.push('-'); }
             if win.zoom_saved.is_some() { f.push('Z'); }
             if win.activity_flag { f.push('#'); }
@@ -1121,9 +1266,9 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_id" => format!("@{}", win.id),
         "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
         "window_zoomed_flag" => if win.zoom_saved.is_some() { "1".into() } else { "0".into() },
-        "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, app.last_window_area),
-        "window_width" => app.last_window_area.width.to_string(),
-        "window_height" => app.last_window_area.height.to_string(),
+        "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, win.area),
+        "window_width" => win.area.width.to_string(),
+        "window_height" => win.area.height.to_string(),
         "window_format" => "1".into(),
         "window_activity" => app.created_at.timestamp().to_string(),
         "window_silence_flag" => if win.silence_flag { "1".into() } else { "0".into() },
@@ -1134,7 +1279,13 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "window_last_flag" => if win_idx == app.last_window_idx { "1".into() } else { "0".into() },
         "window_start_flag" => if win_idx == 0 { "1".into() } else { "0".into() },
         "window_end_flag" => if win_idx == app.windows.len().saturating_sub(1) { "1".into() } else { "0".into() },
-        "window_bigger" => "0".into(),
+        "window_bigger" => {
+            if win.area.width > app.client_area.width || win.area.height > app.client_area.height {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "window_cell_width" => "8".into(),
         "window_cell_height" => "16".into(),
         "window_offset_x" | "window_offset_y" | "window_stack_index" => "0".into(),
@@ -1197,8 +1348,10 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                     }
                 }
                 if let Some(pid) = p.child_pid {
-                    // Fallback: upstream process-tree heuristic, then shell binary name.
-                    crate::platform::process_info::get_foreground_process_name(pid)
+                    // Fallback: the deepest foreground descendant (what tmux
+                    // reports — `cat` running under a shell, not the shell),
+                    // then the pane's own process, then a generic label.
+                    crate::platform::process_info::get_deepest_foreground_process_name(pid)
                         .or_else(|| crate::platform::process_info::get_process_name(pid))
                         .unwrap_or_else(|| "shell".into())
                 } else if !p.title.is_empty() {
@@ -1287,7 +1440,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_left" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { rect.x.to_string() } else { "0".into() }
@@ -1296,7 +1449,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_top" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { rect.y.to_string() } else { "0".into() }
@@ -1305,7 +1458,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_right" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { (rect.x + rect.width).saturating_sub(1).to_string() } else { "79".into() }
@@ -1314,7 +1467,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_bottom" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) { (rect.y + rect.height).saturating_sub(1).to_string() } else { "23".into() }
@@ -1323,23 +1476,23 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_top" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
-                    if rect.y == app.last_window_area.y { "1".into() } else { "0".into() }
+                    if rect.y == win.area.y { "1".into() } else { "0".into() }
                 } else { "1".into() }
             } else { "1".into() }
         }
         "pane_at_bottom" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
                     let bottom = rect.y + rect.height;
-                    let win_bottom = app.last_window_area.y + app.last_window_area.height;
+                    let win_bottom = win.area.y + win.area.height;
                     if bottom >= win_bottom { "1".into() } else { "0".into() }
                 } else { "1".into() }
             } else { "1".into() }
@@ -1347,23 +1500,23 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_at_left" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
-                    if rect.x == app.last_window_area.x { "1".into() } else { "0".into() }
+                    if rect.x == win.area.x { "1".into() } else { "0".into() }
                 } else { "1".into() }
             } else { "1".into() }
         }
         "pane_at_right" => {
             if let Some(p) = target_pane() {
                 let mut rects = Vec::new();
-                crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
+                crate::tree::compute_rects(&win.root, win.area, &mut rects);
                 if let Some((_, rect)) = rects.iter().find(|(path, _)| {
                     crate::tree::get_active_pane_id_at_path(&win.root, path) == Some(p.id)
                 }) {
                     let right = rect.x + rect.width;
-                    let win_right = app.last_window_area.x + app.last_window_area.width;
+                    let win_right = win.area.x + win.area.width;
                     if right >= win_right { "1".into() } else { "0".into() }
                 } else { "1".into() }
             } else { "1".into() }
@@ -1437,7 +1590,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                         let cols = p.last_cols;
                         // Convert screen-absolute mouse_y to pane-relative row
                         let mut rects = Vec::new();
-                        crate::tree::compute_rects(&w.root, app.last_window_area, &mut rects);
+                        crate::tree::compute_rects(&w.root, w.area, &mut rects);
                         let pane_y_offset = rects.iter()
                             .find(|(path, _)| crate::tree::get_active_pane_id_at_path(&w.root, path) == Some(p.id))
                             .map(|(_, rect)| rect.y)
@@ -1463,7 +1616,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                         let screen = parser.screen();
                         let cols = p.last_cols;
                         let mut rects = Vec::new();
-                        crate::tree::compute_rects(&w.root, app.last_window_area, &mut rects);
+                        crate::tree::compute_rects(&w.root, w.area, &mut rects);
                         let (pane_x_offset, pane_y_offset) = rects.iter()
                             .find(|(path, _)| crate::tree::get_active_pane_id_at_path(&w.root, path) == Some(p.id))
                             .map(|(_, rect)| (rect.x, rect.y))
@@ -1608,9 +1761,19 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "buffer_created" => app.created_at.timestamp().to_string(),
 
         // ── Client ──
-        "client_width" => app.last_window_area.width.to_string(),
-        "client_height" => (app.last_window_area.height + if app.status_visible { 1 } else { 0 }).to_string(),
-        "client_session" | "client_last_session" => app.session_name.clone(),
+        "client_width" => app.client_area.width.to_string(),
+        "client_height" => (app.client_area.height + if app.status_visible { 1 } else { 0 }).to_string(),
+        "client_session" => app.session_name.clone(),
+        // The session this client came from, empty when it has not switched.
+        // This was aliased to client_session, so it echoed the CURRENT session
+        // and could neither predict what `-l` would do nor verify what it did
+        // (issue #566). tmux reports empty for a client with no last session,
+        // which is what an unset value gives here.
+        "client_last_session" => app
+            .latest_client_id
+            .and_then(|cid| app.client_registry.get(&cid))
+            .and_then(|info| info.last_session.clone())
+            .unwrap_or_default(),
         "client_name" | "client_tty" => "client0".into(),
         "client_pid" => std::process::id().to_string(),
         "client_prefix" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) { "1".into() } else { "0".into() },
@@ -1637,12 +1800,22 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "host" | "hostname" => hostname_cached(),
         "host_short" => { let h = hostname_cached(); h.split('.').next().unwrap_or(&h).to_string() }
         "user" | "username" => env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or_else(|_| "unknown".into()),
+        // NOTE: `#{pid}`/`#{server_pid}` are SESSION-scoped on psmux, not
+        // namespace-scoped as they are on tmux: psmux runs one server process
+        // per session, so this is the pid of whichever session's server answered
+        // the request. Use `#{server_instance}` to identify the namespace.
         "pid" | "server_pid" => std::process::id().to_string(),
+        // Namespace-scoped identity (issue #509): constant for the life of this
+        // `-L` namespace's server set, and different after a genuine restart.
+        // Every server in the namespace reads the same token, so the value does
+        // not depend on which one answered.
+        "server_instance" => {
+            crate::session::read_namespace_instance(app.socket_name.as_deref()).unwrap_or_default()
+        }
         "version" => VERSION.to_string(),
         "start_time" => app.created_at.timestamp().to_string(),
         "socket_path" => {
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            format!("{}/.psmux/default", home)
+            format!("{}/default", crate::paths::psmux_dir())
         }
 
         // ── Options as format variables ──
@@ -1684,10 +1857,10 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
         "current_file" => crate::config::current_config_file(),
 
-        // Anything else: try as option, then env
+        // Anything else: try as option, then report "not a variable at all".
         _ => {
             if let Some(val) = lookup_option(var, app) { val }
-            else { String::new() }
+            else { UNKNOWN_VAR.to_string() }
         }
     }
 }
@@ -1897,3 +2070,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue272_format_shell_cache.rs"]
 mod tests_issue272_format_shell_cache;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_modifier_over_empty_var.rs"]
+mod tests_modifier_over_empty_var;

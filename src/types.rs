@@ -9,6 +9,32 @@ use chrono::Local;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Git provenance captured at compile time by `build.rs`. These let a binary
+/// report the exact commit it was built from, so a build compiled from an
+/// arbitrary checkout is fully identifiable. Every value falls back to
+/// `"unknown"` / `"false"` when the crate is built outside a git checkout.
+pub const GIT_HASH: &str = env!("PSMUX_GIT_HASH");
+pub const GIT_HASH_FULL: &str = env!("PSMUX_GIT_HASH_FULL");
+pub const GIT_DATE: &str = env!("PSMUX_GIT_DATE");
+pub const GIT_DIRTY: &str = env!("PSMUX_GIT_DIRTY");
+
+/// Human-readable build provenance line, e.g.
+///
+///   `psmux 3.3.7 (a1b2c3d 2026-07-20)`
+///   `psmux 3.3.7 (a1b2c3d 2026-07-20, dirty)`   ← built from a modified tree
+///   `psmux 3.3.7 (unknown commit)`               ← built without a git checkout
+pub fn build_version_string() -> String {
+    if GIT_HASH == "unknown" {
+        return format!("psmux {VERSION} (unknown commit)");
+    }
+    let dirty_suffix = if GIT_DIRTY == "true" { ", dirty" } else { "" };
+    if GIT_DATE == "unknown" {
+        format!("psmux {VERSION} ({GIT_HASH}{dirty_suffix})")
+    } else {
+        format!("psmux {VERSION} ({GIT_HASH} {GIT_DATE}{dirty_suffix})")
+    }
+}
+
 /// Notifications emitted to control mode clients (tmux wire-compatible).
 #[derive(Clone, Debug)]
 pub enum ControlNotification {
@@ -64,6 +90,10 @@ pub struct ControlClient {
     pub output_paused_panes: HashSet<usize>,
     /// Timestamp of last output sent per pane (for pause-after age tracking).
     pub pane_last_output: HashMap<usize, Instant>,
+    /// Default viewport reported by `refresh-client -C`.
+    pub size: Option<(u16, u16)>,
+    /// Per-window viewport overrides reported as `refresh-client -C @id:WxH`.
+    pub window_sizes: HashMap<usize, (u16, u16)>,
 }
 
 /// Per-client metadata stored in the server's client registry.
@@ -79,6 +109,19 @@ pub struct ClientInfo {
     pub tty_name: String,
     /// True for CONTROL/CONTROL_NOECHO clients
     pub is_control: bool,
+    /// The session THIS client was in before it switched here, if any.
+    ///
+    /// psmux runs one server per session, so a switch tears the client off one
+    /// server and re-attaches it to another; only the client process spans both
+    /// and knows the pair. It reports the session it left on the attach
+    /// handshake and it is recorded here. Before this existed, `switch-client
+    /// -l` consulted a single data-dir-global `last_session` file that every
+    /// attach overwrote, so the only value that could survive its
+    /// "not the current session" filter was one written by a DIFFERENT client,
+    /// and `-l` relocated this client into a session it had never visited
+    /// (issue #566). `None` means this client has not switched yet, which is
+    /// the honest answer rather than somebody else's history.
+    pub last_session: Option<String>,
 }
 
 pub struct Pane {
@@ -134,6 +177,27 @@ pub struct Pane {
     /// When false, the child expects VT SGR mouse sequences (nvim, vim).
     /// Refreshed every 2 seconds.
     pub mouse_input_cache: Option<(Instant, bool)>,
+    /// Cached foreground-process classification for the scroll-wheel
+    /// alternate-scroll decision (issue #277): `(timestamp, is_shell,
+    /// foreground_exe_name)`. `is_shell` mirrors
+    /// `platform::process_info::foreground_is_shell`'s tri-state contract
+    /// (only a confirmed non-shell foreground enables alternate-scroll);
+    /// `foreground_exe_name` is used to special-case legacy DOS-heritage
+    /// pagers (`more.com`) that don't consume arrow keys. Refreshed every
+    /// 2 seconds, same TTL as the other mouse-inject detectors above.
+    pub scroll_fg_cache: Option<(Instant, bool, Option<String>)>,
+    /// Wheel-forward attribution for the pane's mouse protocol (#548
+    /// follow-up): `(mode, app_owned)` for the currently active DECSET
+    /// 1000/1002/1003 tracking, `None` while no protocol is on.
+    /// `app_owned` is sampled ONCE per protocol transition, at enablement
+    /// time, from `foreground_is_shell`: PSReadLine enables tracking
+    /// spuriously while the shell owns the prompt (`app_owned = false`,
+    /// wheel enters copy mode like tmux over a plain pane), while a real
+    /// main-screen mouse consumer (Copilot CLI, the #570 echo child)
+    /// enables it after taking the foreground (`app_owned = true`, wheel
+    /// is forwarded — tmux `mouse_any_flag` parity).  Updated by
+    /// `window_ops::update_mouse_proto_owner` on the server data tick.
+    pub mouse_proto_owner: Option<(vt100::MouseProtocolMode, bool)>,
     /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
     /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
     pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -161,6 +225,12 @@ pub struct Pane {
     /// Stored for API compatibility; ConPTY rendering doesn't support
     /// per-pane fg/bg tinting so this is not rendered yet.
     pub pane_style: Option<String>,
+    /// Pane-scoped options set via `set-option -p` (issue #580, the Claude
+    /// Code teammate backend's scope).  Currently wired: `remain-on-exit`
+    /// (`on`/`off`/`failed`, consulted by `prune_exited` and overriding the
+    /// session-global).  Unwired pane options are rejected loudly at set
+    /// time rather than stored as silent no-ops.
+    pub pane_options: std::collections::HashMap<String, String>,
     /// When set, the layout serialiser renders this pane as blank until
     /// the deadline passes.  Used to hide injected cd+cls commands during
     /// warm session claiming so the user never sees a flash.
@@ -227,6 +297,10 @@ pub struct Window {
     pub active_path: Vec<usize>,
     pub name: String,
     pub id: usize,
+    /// Actual tmux-style window geometry, independent from any client viewport.
+    pub area: Rect,
+    /// Per-window `window-size` override. `resize-window` sets this to manual.
+    pub window_size: Option<String>,
     /// Activity flag: set when pane output is received while window is not active
     pub activity_flag: bool,
     /// Bell flag: set when a bell (\x07) is detected in a pane
@@ -404,6 +478,9 @@ pub struct CopyModeState {
     pub text_object_pending: Option<u8>,
     pub register_pending: bool,
     pub register: Option<char>,
+    /// Mark and last-jump are pane-local like the rest of copy state (#498)
+    pub mark: Option<(usize, u16, u16)>,
+    pub last_jump: Option<(u8, char)>,
     /// true when the pane was in CopySearch (not CopyMode)
     pub in_search: bool,
     /// search input buffer (only meaningful when in_search == true)
@@ -415,9 +492,29 @@ pub struct CopyModeState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusDir { Left, Right, Up, Down }
 
+/// One cached `#(command)` expansion: the last output plus the state of any
+/// in-flight background worker refreshing it.
+#[derive(Clone)]
+pub struct ShellEntry {
+    /// When `value` was last refreshed; the TTL base for re-running the command.
+    pub at: std::time::Instant,
+    /// Last run's stdout (trimmed); empty on failure or before the first result.
+    pub value: String,
+    /// A background worker for this command is currently in flight.
+    pub running: bool,
+}
+
 pub struct AppState {
     pub windows: Vec<Window>,
     pub active_idx: usize,
+    /// While a temporary -t focus is applied (FocusTargetTemp), holds the
+    /// REAL user-visible active window index saved before the switch.
+    /// Format evaluation uses it for "is this the active window" variables
+    /// (#{window_active}, the `*` flag) so `display-message -t <win>` does
+    /// not report every targeted window as active (issue #551) — the target
+    /// is only *temporarily* focused to serve the request. None when no
+    /// temporary focus is in effect.
+    pub temp_focus_saved_active: Option<usize>,
     pub mode: Mode,
     pub escape_time_ms: u64,
     pub repeat_time_ms: u64,
@@ -434,6 +531,8 @@ pub struct AppState {
     pub drag: Option<DragState>,
     /// In-progress mouse drag on a floating pane (move/resize), if any.
     pub float_drag: Option<FloatDrag>,
+    /// Most recently reported client viewport. New dynamic windows inherit it.
+    pub client_area: Rect,
     pub last_window_area: Rect,
     pub mouse_enabled: bool,
     /// bold-is-bright: when on (default), rewrite crossterm's 256-indexed
@@ -462,6 +561,11 @@ pub struct AppState {
     /// forwarded to the application (click-to-focus, scroll, app-level
     /// mouse tracking continue to work).  Default: on.  (issue #245)
     pub mouse_selection: bool,
+    /// mouse-selection-force: when on, psmux keeps client-side drag selection
+    /// even when the pane application enabled mouse tracking. Plain clicks are
+    /// deferred until release and replayed to the application; drags are
+    /// consumed by psmux. Default: off.
+    pub mouse_selection_force: bool,
     /// paste-detection: when on (default), Ctrl+V Press is suppressed and the
     /// Windows paste detection mechanism intercepts clipboard content injected
     /// by the console host.  When off, Ctrl+V is forwarded as send-key C-v so
@@ -513,6 +617,16 @@ pub struct AppState {
     pub copy_register_pending: bool,
     /// Currently selected named register (a-z), None = default unnamed
     pub copy_register: Option<char>,
+    /// Copy-mode mark set by `X` (set-mark): (scroll_offset, row, col).
+    /// `M-x` (jump-to-mark) swaps the cursor with it, so pressing it twice
+    /// returns you to where you started, same as tmux (#498).
+    pub copy_mark: Option<(usize, u16, u16)>,
+    /// Last f/F/t/T jump as (kind, char), so `;` (jump-again) and `,`
+    /// (jump-reverse) can repeat it (#498).
+    pub copy_last_jump: Option<(u8, char)>,
+    /// When true the pane keeps following live output while in copy mode
+    /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
+    pub copy_refresh_live: bool,
     /// Named registers a-z for copy-mode yank/paste
     pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
@@ -521,6 +635,18 @@ pub struct AppState {
     /// Current key table for switch-client -T (None = normal mode)
     pub current_key_table: Option<String>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
+    /// Sender for the same channel `control_rx` receives on, so code already
+    /// running ON the server loop can queue follow-up work for a later
+    /// iteration instead of recursing.
+    ///
+    /// Used by the copy-mode key tables: a `bind -T copy-mode-vi y send-keys -X
+    /// copy-pipe-and-cancel "clip.exe"` resolves while handling a keystroke, and
+    /// the `send-keys -X` implementation lives in the loop's own
+    /// `CtrlReq::SendKeysX` arm. Re-entering it directly is not possible, and
+    /// routing back out through `execute_command_string` would make the server
+    /// open a TCP connection to itself while the loop is blocked doing so —
+    /// a deadlock. Queueing costs one loop iteration and cannot deadlock.
+    pub control_tx: Option<mpsc::Sender<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_key: String,
     /// Receiver for async run-shell results (title, output).
@@ -528,6 +654,12 @@ pub struct AppState {
     pub run_shell_rx: Option<mpsc::Receiver<(String, String)>>,
     /// Sender cloned into each run-shell background thread.
     pub run_shell_tx: Option<mpsc::Sender<(String, String)>>,
+    /// Receiver for async #(command) format-job results (cmd, output).
+    /// Preinitialized in the server loop (unlike run_shell_*) because
+    /// run_shell_command sees only &AppState and can't create it lazily.
+    pub format_job_rx: Option<mpsc::Receiver<(String, String)>>,
+    /// Sender cloned into each #() background worker.
+    pub format_job_tx: Option<mpsc::Sender<(String, String)>>,
     pub session_name: String,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
@@ -539,6 +671,8 @@ pub struct AppState {
     pub client_sizes: std::collections::HashMap<u64, (u16, u16)>,
     /// The most recently active client ID (for window_size="latest").
     pub latest_client_id: Option<u64>,
+    /// Most recent client that explicitly reported a viewport size.
+    pub latest_size_client_id: Option<u64>,
     /// Client registry: all active PERSISTENT and CONTROL clients.
     pub client_registry: std::collections::HashMap<u64, ClientInfo>,
     pub created_at: chrono::DateTime<Local>,
@@ -562,8 +696,6 @@ pub struct AppState {
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
-    /// Tab positions on status bar: (window_index, x_start, x_end)
-    pub tab_positions: Vec<(usize, u16, u16)>,
     /// history-limit: scrollback buffer size (default 2000)
     pub history_limit: usize,
     /// display-time: how long messages are shown (ms, default 750)
@@ -680,7 +812,7 @@ pub struct AppState {
     /// during active typing), which serializes a slow helper (e.g. pwsh
     /// at ~280 ms cold-start) onto the server main loop and lags echo.
     /// Keyed by command string; entries expire after `status_interval`.
-    pub format_shell_cache: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+    pub format_shell_cache: std::sync::Mutex<std::collections::HashMap<String, ShellEntry>>,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
     /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
@@ -697,6 +829,9 @@ pub struct AppState {
     pub status_format: Vec<String>,
     /// window-size: "smallest", "largest", "manual", "latest" (default "latest")
     pub window_size: String,
+    /// Requested manual geometry, keyed by window ID. The visible geometry may
+    /// be smaller while a control client has a per-window size constraint.
+    pub manual_window_sizes: std::collections::HashMap<usize, (u16, u16)>,
     /// allow-passthrough: "on", "off", "all" (default "off")
     pub allow_passthrough: String,
     /// copy-command: command to pipe yanked text to (default empty)
@@ -774,6 +909,27 @@ pub struct AppState {
     pub next_forward_id: u64,
 }
 
+/// What a tmux window target spec resolved to, the output of
+/// [`AppState::resolve_window_spec`].
+///
+/// The two cases are tmux's: an existing window, or (only where tmux sets
+/// `CMD_FIND_WINDOW_INDEX`, i.e. move-window/link-window `-t`) a destination
+/// number that no window holds yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowTarget {
+    /// Vec position of an existing window.
+    Pos(usize),
+    /// A display index that currently holds no window.
+    FreeIndex(usize),
+}
+
+impl WindowTarget {
+    /// Vec position of the existing window, or None for a free index.
+    pub fn pos(self) -> Option<usize> {
+        match self { WindowTarget::Pos(p) => Some(p), WindowTarget::FreeIndex(_) => None }
+    }
+}
+
 impl AppState {
     /// Whether this is the hidden `__warm__` pre-spawn server: a server started
     /// ahead of time so the next `new-session` can claim it instead of paying a
@@ -835,6 +991,39 @@ impl AppState {
         }
     }
 
+    /// Register a newly attached client exactly once.
+    ///
+    /// A persistent connection can deliver more than one attach command for
+    /// the same server-assigned client id.  Treating each command as a new
+    /// client desynchronizes `attached_clients` from `client_registry`, because
+    /// the registry entry is naturally unique while the counter is not.
+    /// Returns `true` only when a new registry entry was inserted.
+    pub fn register_client(&mut self, cid: u64, is_control: bool) -> bool {
+        if self.client_registry.contains_key(&cid) {
+            return false;
+        }
+
+        let tty = format!("/dev/pts/{}", cid);
+        self.client_registry.insert(cid, ClientInfo {
+            id: cid,
+            width: self.client_area.width,
+            height: self.client_area.height,
+            connected_at: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
+            tty_name: tty,
+            is_control,
+            last_session: None,
+        });
+        self.attached_clients = self.attached_clients.saturating_add(1);
+        // Preserve the existing distinction between an interactive TUI client
+        // and a control-mode client: only the former becomes the latest client
+        // used for terminal sizing/input routing.
+        if !is_control {
+            self.latest_client_id = Some(cid);
+        }
+        true
+    }
+
     /// Reap a dead client's `client_registry` entry exactly once, keeping the
     /// `attached_clients` counter in lock-step with the registry.
     ///
@@ -871,14 +1060,253 @@ impl AppState {
     /// holds `target`, matching tmux. Returns false when indices are not tracked
     /// so the caller can use the legacy Vec-position move.
     pub fn move_active_window_to_index(&mut self, target: usize) -> bool {
-        if !self.window_indices_valid() { return false; }
-        if let Some(p) = self.win_pos(target) {
-            if p != self.active_idx { return false; } // occupied by another window
-            return true; // already at target
+        let pos = self.active_idx;
+        self.move_window_to_index(pos, target).is_ok()
+    }
+
+    /// move-window for an arbitrary source: give the window at Vec position
+    /// `pos` the display index `target`, then keep the arrays sorted by index.
+    ///
+    /// tmux (server_link_window) refuses when another window already holds the
+    /// destination index unless the caller killed the occupant first (-k), and
+    /// reports it as `index in use: N` at exit 1. That refusal used to be a
+    /// bare `false` that every caller discarded, so the command exited 0 having
+    /// done nothing (issue #602).
+    pub fn move_window_to_index(&mut self, pos: usize, target: usize) -> Result<(), String> {
+        if self.windows.is_empty() { return Err("can't find window".to_string()); }
+        if !self.window_indices_valid() {
+            // A state that pushed windows straight onto the Vec (mock AppState,
+            // and any path that skipped `on_window_appended`) has no parallel
+            // array. `win_pos`/`win_display_index` already fall back to the
+            // affine pos+base mapping there, so materialise exactly that rather
+            // than refusing: the alternative was a legacy Vec-position splice
+            // whose result did not match tmux for any layout with a gap.
+            let base = self.window_base_index;
+            self.window_indices = (0..self.windows.len()).map(|i| i + base).collect();
         }
-        self.window_indices[self.active_idx] = target;
+        if pos >= self.windows.len() {
+            return Err(format!("can't find window: {}", pos));
+        }
+        if let Some(p) = self.win_pos(target) {
+            if p != pos { return Err(format!("index in use: {}", target)); }
+            return Ok(()); // already at target
+        }
+        self.window_indices[pos] = target;
         self.resort_windows_by_index();
-        true
+        Ok(())
+    }
+
+    /// Make room at display index `idx` by pushing every window at `idx` or
+    /// above one index higher, tmux's `winlink_shuffle_up`. Used by
+    /// move-window/link-window `-a` (after) and `-b` (before).
+    pub fn shuffle_window_indices_up(&mut self, idx: usize) {
+        if !self.window_indices_valid() { return; }
+        for wi in self.window_indices.iter_mut() {
+            if *wi >= idx { *wi += 1; }
+        }
+    }
+
+    /// Renumber every window contiguously from `base-index`, tmux's
+    /// `session_renumber_windows` (what `move-window -r` runs).
+    pub fn renumber_windows(&mut self) {
+        if !self.window_indices_valid() { return; }
+        self.renumber_windows_contiguous();
+    }
+
+    /// Apply one move-window request, tmux cmd-move-window.c order of
+    /// operations, shared by the server, the CLI and the in-process command
+    /// prompt so all three agree (issue #602).
+    ///
+    /// `src`/`dst` are RAW target specs. The error string is what tmux prints
+    /// on stderr and exits 1 with; `-k` (kill the occupant of an index already
+    /// in use) is the caller's job, because only the server owns PTY teardown:
+    /// it sees `index in use: N` and may kill and retry.
+    pub fn move_window(
+        &mut self,
+        src: Option<&str>,
+        dst: Option<&str>,
+        detach: bool,
+        renumber: bool,
+        after: bool,
+        before: bool,
+    ) -> Result<(), String> {
+        // -r renumbers the session and ignores the window target entirely.
+        if renumber {
+            self.renumber_windows();
+            return Ok(());
+        }
+        if self.windows.is_empty() { return Err("can't find window".to_string()); }
+        // Source: -s, else the current window (tmux's `.source` default).
+        let spos = match src {
+            Some(s) => self.resolve_window_spec(s, false)?.pos()
+                .ok_or_else(|| format!("can't find window: {}", s))?,
+            None => self.active_idx.min(self.windows.len() - 1),
+        };
+        // Destination resolved with CMD_FIND_WINDOW_INDEX, so a number naming
+        // no window is a free slot rather than an error. A bare `move-window`
+        // with no -t takes the next free index.
+        let mut idx = match dst {
+            Some(d) => match self.resolve_window_spec(d, true)? {
+                WindowTarget::Pos(p) => self.win_display_index(p),
+                WindowTarget::FreeIndex(i) => i,
+            },
+            None => self.alloc_window_index(),
+        };
+        // -a / -b push the destination and everything above it up by one so the
+        // moved window lands after / before the target (winlink_shuffle_up).
+        if after || before {
+            if after { idx += 1; }
+            self.shuffle_window_indices_up(idx);
+        }
+        if self.win_display_index(spos) == idx { return Ok(()); }
+        let moved_id = self.windows.get(spos).map(|w| w.id);
+        // Occupied and no -k: tmux's "index in use: N" at exit 1. This used to
+        // be a discarded `false`, so the command exited 0 having done nothing.
+        if let Some(occupant) = self.win_pos(idx) {
+            if occupant != spos { return Err(format!("index in use: {}", idx)); }
+        }
+        self.move_window_to_index(spos, idx)?;
+        // Without -d the moved window becomes current and the window that WAS
+        // current becomes the last window (tmux passes `!dflag` to
+        // server_link_window as its select flag).
+        if !detach {
+            if let Some(id) = moved_id {
+                if let Some(newpos) = self.windows.iter().position(|w| w.id == id) {
+                    let prev = self.active_idx;
+                    if prev != newpos {
+                        self.last_window_idx = prev;
+                        self.active_idx = newpos;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Vec position of the window a move-window `-k` would have to kill first:
+    /// the current occupant of the destination index, when it is not the source
+    /// itself. Only the server can act on it (PTY teardown lives there).
+    pub fn move_window_kill_target(
+        &self,
+        src: Option<&str>,
+        dst: Option<&str>,
+    ) -> Option<usize> {
+        let d = dst?;
+        let spos = match src {
+            Some(s) => self.resolve_window_spec(s, false).ok()?.pos()?,
+            None => self.active_idx,
+        };
+        match self.resolve_window_spec(d, true).ok()? {
+            WindowTarget::Pos(p) if p != spos => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Resolve a tmux window target spec against this session, the single
+    /// resolver every window-target path shares (issue #602).
+    ///
+    /// `spec` is a whole `-t`/`-s` value: an optional `session:` prefix is
+    /// dropped, because routing already picked the server. What is left is
+    /// resolved the way tmux's `cmd_find_get_window_with_session` does, in the
+    /// same order: `@id`, `+N`/`-N` offsets, the symbolic `!`/`^`/`$` (and
+    /// their `{last}`/`{start}`/`{end}`/`{next}`/`{previous}` spellings), a
+    /// display index, then an exact window name.
+    ///
+    /// `index_ok` mirrors tmux's `CMD_FIND_WINDOW_INDEX`, which only
+    /// move-window's and link-window's `-t` set:
+    ///   * set   - `+N`/`-N` are ARITHMETIC on the current window's display
+    ///             index, and a number naming no window is a free destination
+    ///             index rather than an error.
+    ///   * clear - `+N`/`-N` step N places through the session's ordered window
+    ///             list, wrapping (tmux `winlink_next_by_number`), and a number
+    ///             naming no window is `can't find window: N`.
+    ///
+    /// Before this existed, `swap-window -t +1` reached the server as the
+    /// unsigned 1 (Rust's `usize` parser accepts a leading `+`), `-t -1` never
+    /// left the CLI because it was read as a session name, and an index that
+    /// named no window silently fell back to a raw Vec position.
+    pub fn resolve_window_spec(&self, spec: &str, index_ok: bool) -> Result<WindowTarget, String> {
+        let raw = spec.trim();
+        // Drop a leading `session:`; tmux splits on the FIRST colon too.
+        let body = match raw.find(':') { Some(p) => &raw[p + 1..], None => raw };
+        let body = body.trim();
+        // tmux reports only the WINDOW part: `swap-window -t p:77` prints
+        // "can't find window: 77", not the whole "p:77".
+        let missing = || format!("can't find window: {}", body);
+        if self.windows.is_empty() { return Err(missing()); }
+        let last_pos = self.windows.len() - 1;
+        // `sess:` with nothing after it (and a bare `-t sess`) means the
+        // session's current window.
+        if body.is_empty() { return Ok(WindowTarget::Pos(self.active_idx.min(last_pos))); }
+        // tmux's symbolic spellings (cmd-find.c window_table).
+        let body = match body {
+            "{start}" => "^",
+            "{last}" => "!",
+            "{end}" => "$",
+            "{next}" => "+",
+            "{previous}" => "-",
+            other => other,
+        };
+        if let Some(id) = body.strip_prefix('@') {
+            let id: usize = id.parse().map_err(|_| missing())?;
+            return self.windows.iter().position(|w| w.id == id)
+                .map(WindowTarget::Pos).ok_or_else(missing);
+        }
+        if let Some(digits) = body.strip_prefix(['+', '-']) {
+            let forward = body.starts_with('+');
+            if !digits.is_empty() && !digits.chars().all(|c| c.is_ascii_digit()) {
+                return Err(missing());
+            }
+            let n: usize = if digits.is_empty() { 1 } else { digits.parse().map_err(|_| missing())? };
+            let cur = self.active_idx.min(last_pos);
+            if index_ok {
+                // CMD_FIND_WINDOW_INDEX: arithmetic on the display index.
+                let base = self.win_display_index(cur);
+                let idx = if forward {
+                    base.checked_add(n).ok_or_else(missing)?
+                } else {
+                    base.checked_sub(n).ok_or_else(missing)?
+                };
+                return Ok(match self.win_pos(idx) {
+                    Some(p) => WindowTarget::Pos(p),
+                    None => WindowTarget::FreeIndex(idx),
+                });
+            }
+            // winlink_next_by_number / winlink_previous_by_number: N steps
+            // through the ordered list, wrapping at either end. NOT index
+            // arithmetic: with windows 0, 2, 9, 10, `+1` from 2 is 9.
+            let len = self.windows.len();
+            let step = n % len;
+            let pos = if forward { (cur + step) % len } else { (cur + len - step) % len };
+            return Ok(WindowTarget::Pos(pos));
+        }
+        match body {
+            "!" => {
+                let p = self.last_window_idx;
+                if p < self.windows.len() { Ok(WindowTarget::Pos(p)) } else { Err(missing()) }
+            }
+            "^" => Ok(WindowTarget::Pos(0)),
+            "$" => Ok(WindowTarget::Pos(last_pos)),
+            _ => {
+                if body.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(idx) = body.parse::<usize>() {
+                        if let Some(p) = self.win_pos(idx) { return Ok(WindowTarget::Pos(p)); }
+                        if index_ok { return Ok(WindowTarget::FreeIndex(idx)); }
+                        return Err(missing());
+                    }
+                }
+                // Exact name. tmux refuses an ambiguous match rather than
+                // picking one, so more than one hit is still "can't find".
+                let mut hit = None;
+                for (i, w) in self.windows.iter().enumerate() {
+                    if w.name == body {
+                        if hit.is_some() { return Err(missing()); }
+                        hit = Some(i);
+                    }
+                }
+                hit.map(WindowTarget::Pos).ok_or_else(missing)
+            }
+        }
     }
 
     /// Display (tmux-style) index of the window at Vec position `pos`.
@@ -926,11 +1354,33 @@ impl AppState {
         }
     }
 
+    /// Shift every existing window's display index by the delta between the
+    /// old and new `base-index` value. Without this, `window_indices` (baked
+    /// in at window-creation time) keeps showing the base-index that was in
+    /// effect when each window was created, so `set-option base-index` after
+    /// session start silently had no visible effect on #I / find-window
+    /// (task #7 batch A bug 3). Real tmux applies base-index the same way:
+    /// existing gaps between window numbers are preserved, only the origin
+    /// moves.
+    pub fn rebase_window_indices(&mut self, new_base: usize) {
+        let old_base = self.window_base_index;
+        if !self.window_indices_valid() || new_base == old_base { return; }
+        let delta = new_base as isize - old_base as isize;
+        for wi in self.window_indices.iter_mut() {
+            let shifted = *wi as isize + delta;
+            *wi = shifted.max(0) as usize;
+        }
+    }
+
     /// Keep `windows` and `window_indices` sorted ascending by index, preserving
     /// which window is active by re-resolving `active_idx` via the window id.
+    /// `last_window_idx` is a Vec position too and is re-resolved the same way,
+    /// or a move-window would leave `#{window_last_flag}` pointing at whichever
+    /// window happened to slide into the old slot.
     fn resort_windows_by_index(&mut self) {
         if !self.window_indices_valid() { return; }
         let active_id = self.windows.get(self.active_idx).map(|w| w.id);
+        let last_id = self.windows.get(self.last_window_idx).map(|w| w.id);
         let mut order: Vec<usize> = (0..self.windows.len()).collect();
         order.sort_by_key(|&i| self.window_indices[i]);
         if order.iter().enumerate().all(|(i, &o)| i == o) { return; } // already sorted
@@ -949,6 +1399,11 @@ impl AppState {
         if let Some(aid) = active_id {
             if let Some(p) = self.windows.iter().position(|w| w.id == aid) {
                 self.active_idx = p;
+            }
+        }
+        if let Some(lid) = last_id {
+            if let Some(p) = self.windows.iter().position(|w| w.id == lid) {
+                self.last_window_idx = p;
             }
         }
     }
@@ -974,6 +1429,10 @@ impl AppState {
                 self.renumber_windows_contiguous();
             }
         }
+        let live_ids: std::collections::HashSet<usize> =
+            self.windows.iter().map(|window| window.id).collect();
+        self.manual_window_sizes
+            .retain(|window_id, _| live_ids.contains(window_id));
     }
 
     /// Create a new AppState with sensible defaults.
@@ -982,6 +1441,7 @@ impl AppState {
         Self {
             windows: Vec::new(),
             active_idx: 0,
+            temp_focus_saved_active: None,
             mode: Mode::Passthrough,
             escape_time_ms: 500,
             repeat_time_ms: 500,
@@ -994,6 +1454,7 @@ impl AppState {
             allow_predictions: false,
             drag: None,
             float_drag: None,
+            client_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             mouse_enabled: true,
             bold_is_bright: true,
@@ -1003,6 +1464,7 @@ impl AppState {
             scroll_enter_copy_mode: true,
             pwsh_mouse_selection: false,
             mouse_selection: true,
+            mouse_selection_force: false,
             paste_detection: true,
             choose_tree_preview: false,
             paste_buffers: Vec::new(),
@@ -1027,21 +1489,28 @@ impl AppState {
             copy_text_object_pending: None,
             copy_register_pending: false,
             copy_register: None,
+            copy_mark: None,
+            copy_last_jump: None,
+            copy_refresh_live: false,
             named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
             current_key_table: None,
             control_rx: None,
+            control_tx: None,
             control_port: None,
             session_key: String::new(),
             run_shell_rx: None,
             run_shell_tx: None,
+            format_job_rx: None,
+            format_job_tx: None,
             session_name,
             session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),
             latest_client_id: None,
+            latest_size_client_id: None,
             client_registry: std::collections::HashMap::new(),
             created_at: Local::now(),
             next_win_id: 1,
@@ -1054,7 +1523,6 @@ impl AppState {
             pipe_panes: Vec::new(),
             last_window_idx: 0,
             last_pane_path: Vec::new(),
-            tab_positions: Vec::new(),
             history_limit: 2000,
             display_time_ms: 750,
             display_panes_time_ms: 1000,
@@ -1127,6 +1595,7 @@ impl AppState {
             status_lines: 1,
             status_format: Vec::new(),
             window_size: "latest".to_string(),
+            manual_window_sizes: std::collections::HashMap::new(),
             allow_passthrough: "off".to_string(),
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
@@ -1225,10 +1694,10 @@ pub enum Action {
 pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool),  // cmd, name, detached, start_dir, title (-T), empty (-E)
-    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E)
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T)
-    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T)
+    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489)
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E), env (-e, #489)
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489), zoom (-Z)
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T), env (-e, #489), zoom (-Z)
     /// new-pane: create a floating pane over the active window's layout.
     /// Flags match tmux: `-X`/`-Y` position, `-x`/`-y` size, `-B` border,
     /// `-T` title, `-c` dir, `-d` detached, `-P` print (returns the pane id).
@@ -1253,34 +1722,53 @@ pub enum CtrlReq {
     },
     KillPane,
     KillPaneById(usize),
-    CapturePane(mpsc::Sender<String>),
-    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>),
+    /// Capture a pane's plain text. Fields: resp, target pane id
+    /// (`-t %N`, None = active pane), preserve trailing spaces (`-N`).
+    CapturePane(mpsc::Sender<String>, Option<usize>, bool),
+    /// Capture a pane's text with ANSI SGR sequences. Fields: resp,
+    /// start (-S), end (-E), target pane id (`-t %N`, None = active pane),
+    /// preserve trailing spaces (`-N`).
+    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
     FocusWindow(usize),
     /// Focus window by @N id lookup
     FocusWindowById(usize),
     /// Focus window by name lookup
     FocusWindowByName(String),
-    /// Temporary focus for -t targeting: server saves/restores active_idx
-    FocusWindowTemp(usize),
-    /// Temporary focus by @N id for -t targeting
-    FocusWindowByIdTemp(usize),
-    /// Temporary focus by name for -t targeting
-    FocusWindowByNameTemp(String),
     FocusPane(usize),
     FocusPaneByIndex(usize),
-    /// Temporary pane focus for -t targeting
-    FocusPaneTemp(usize),
-    FocusPaneByIndexTemp(usize),
+    /// Temporary focus for generic -t targeting, with validation (issue #545).
+    /// The server resolves the window and/or pane FIRST and replies Err when
+    /// the target does not exist, so the connection thread can report
+    /// "can't find window/pane: X" and skip the follow-on command instead of
+    /// letting it run against whatever window happens to be active (the old
+    /// FocusWindow*Temp handlers silently no-opped on a miss, so kill-pane,
+    /// send-keys, rename-window, capture-pane etc. with a stale target
+    /// destroyed/typed-into/read the ACTIVE window at rc=0). On success the
+    /// focus is applied with the same temp-restore bookkeeping as before.
+    /// `win` carries an index or, when `win_is_id` is set, an @id; `win_name`
+    /// carries a window-name target. `pane` carries a %id when `pane_is_id`
+    /// is set, otherwise a positional pane index within the target window.
+    FocusTargetTemp {
+        win: Option<usize>,
+        win_is_id: bool,
+        win_name: Option<String>,
+        pane: Option<usize>,
+        pane_is_id: bool,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     SessionInfo(mpsc::Sender<String>),
     /// `list-sessions -F <fmt>` — render the session row using a tmux format
     /// string. Drop-in compat with iTerm2 and other CC clients that always
     /// pass `-F` to get structured output.
     SessionInfoFormat(mpsc::Sender<String>, String),
-    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>),
+    /// Capture a plain-text row range. Fields: resp, start (-S), end (-E),
+    /// target pane id (`-t %N`, None = active pane), preserve trailing
+    /// spaces (`-N`).
+    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
     ClientAttach(u64),
     ClientDetach(u64),
     DumpLayout(mpsc::Sender<String>),
-    DumpState(mpsc::Sender<String>, bool),  // (resp, allow_nc)
+    DumpState(mpsc::Sender<String>, bool, u64),  // (resp, allow_nc, client_id)
     SendText(String),
     SendKey(String),
     SendPaste(String),
@@ -1314,8 +1802,19 @@ pub enum CtrlReq {
     /// Fields: client_id, pane_id, sgr_button, col_0based, row_0based, press
     PaneMouse(u64, usize, u8, i16, i16, bool),
     /// Client-side semantic scroll: targeted by pane ID.
-    /// Fields: client_id, pane_id, up (true=up, false=down)
-    PaneScroll(u64, usize, bool),
+    /// Fields: client_id, pane_id, up (true=up, false=down), pointer position as
+    /// pane-relative 0-based (col, row).  The position is optional because older
+    /// clients send `pane-scroll PANE up|down` with no coordinates; when it is
+    /// absent the server falls back to the pane centre.
+    PaneScroll(u64, usize, bool, Option<(i16, i16)>),
+    /// Hand a normal-mode client-side drag selection off to server-side copy
+    /// mode because the pointer crossed the pane's top edge — or, when the
+    /// view is direct-scrolled (scroll-enter-copy-mode off, #193), its
+    /// bottom edge (the selection must continue into scrollback).
+    /// Fields: client_id, pane_id,
+    /// anchor col, anchor row, current col, current row (pane-relative
+    /// 0-based, may be out of range), rect (block) selection flag.
+    CopyDragBegin(u64, usize, i16, i16, i16, i16, bool),
     /// Client-side semantic split resize: set sizes at a tree path.
     /// Fields: client_id, path, new sizes
     SplitSetSizes(u64, Vec<usize>, Vec<u16>),
@@ -1340,7 +1839,20 @@ pub enum CtrlReq {
     ToggleSync,
     SetPaneTitle(String),
     SetPaneStyle(String),
-    SendKeys(String, bool),
+    /// select-pane -T/-P without activation (#592, tmux parity): applies
+    /// title and/or style to the active pane in ONE request so the pair
+    /// survives a single temp-focus window (restore fires after the first
+    /// non-temp request, so two separate sends would mis-target the second).
+    SetPaneAttrs { title: Option<String>, style: Option<String> },
+    // send-keys arguments as SEPARATE tokens (#490): each token is either a
+    // named key (Enter, C-c, Up, ...) matched in its entirety or literal
+    // text typed verbatim with its whitespace intact. Never re-join and
+    // re-split on whitespace — that collapsed runs of spaces inside quoted
+    // arguments and stripped leading/trailing spaces.
+    SendKeys(Vec<String>, bool),
+    /// send-keys -H: hexadecimal operands already decoded to raw bytes,
+    /// written to the pane verbatim.
+    SendBytes(Vec<u8>),
     SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String, bool),
     SelectWindow(usize),
@@ -1349,6 +1861,17 @@ pub enum CtrlReq {
     ListAllPanes(mpsc::Sender<String>),
     ListAllPanesFormat(mpsc::Sender<String>, String),
     KillWindow,
+    /// kill-window with an explicit window target. The server resolves the
+    /// target itself and reports an unresolvable one as an error instead of
+    /// killing whatever window happens to be active (tmux parity: tmux says
+    /// "can't find window: X" and kills nothing). `win` carries an index or,
+    /// when `win_is_id` is set, an @id; `name` carries a window-name target.
+    KillWindowTarget {
+        win: Option<usize>,
+        win_is_id: bool,
+        name: Option<String>,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     KillSession,
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),
@@ -1377,9 +1900,11 @@ pub enum CtrlReq {
     ListBuffers(mpsc::Sender<String>),
     ListBuffersFormat(mpsc::Sender<String>, String),
     ShowBuffer(mpsc::Sender<String>),
-    ShowBufferAt(mpsc::Sender<String>, usize),
-    /// Show a named buffer by name
-    ShowNamedBuffer(mpsc::Sender<String>, String),
+    /// `None` means no buffer exists at that index (issue #264: lets callers
+    /// like paste-buffer distinguish "buffer not found" from "empty buffer").
+    ShowBufferAt(mpsc::Sender<Option<String>>, usize),
+    /// Show a named buffer by name. `None` means no such named buffer exists.
+    ShowNamedBuffer(mpsc::Sender<Option<String>>, String),
     DeleteBuffer,
     DeleteBufferAt(usize),
     /// Delete a named buffer by name
@@ -1405,6 +1930,13 @@ pub enum CtrlReq {
         horizontal: bool,
     },
     RespawnPane(Option<String>, bool, Option<String>, bool),  // optional workdir (-c), kill flag (-k), command (-- shell-command), empty (-E)
+    /// set-option -p (issue #580): pane-scoped option. Fields: raw -t pane
+    /// target ("" = active pane), option name, value ("" = unset via -u/-U),
+    /// reply ("" on success, "ERROR: ..." otherwise). Unwired pane options
+    /// are rejected loudly instead of stored as silent no-ops.
+    SetPaneOption(String, String, String, mpsc::Sender<String>),
+    /// show-options -p (issue #580): list a pane's scoped options.
+    ShowPaneOptions(String, mpsc::Sender<String>),
     BindKey(String, String, String, bool),  // table, key, command, repeat
     UnbindKey(String, Option<String>),  // key, optional table (None = prefix)
     UnbindAll,
@@ -1415,12 +1947,56 @@ pub enum CtrlReq {
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
     SetOptionOnlyIfUnset(String, String),  // set-option -o
+    SetOptionToggle(String),  // set-option <bool-option> with no value (#535)
+    /// Per-window `window-size` override; None unsets the local value.
+    SetWindowSize(Option<String>),
     ShowOptions(mpsc::Sender<String>),
     ShowWindowOptions(mpsc::Sender<String>),
     SourceFile(String),
-    MoveWindow(Option<usize>),
-    // (source display index, target display index); source None = active window
-    SwapWindow(Option<usize>, usize),
+    /// Expand `#{...}` format variables against the live server state and send
+    /// the result back: `(format_string, reply)`.
+    ///
+    /// Connection threads parse commands without access to `AppState` (it is an
+    /// owned local of the server loop, not shared behind a lock), so anything
+    /// they need format-expanded has to make this round trip. `run-shell` is the
+    /// motivating caller: its command was never expanded at all, so a bind like
+    /// `run-shell "helper --path '#{pane_current_path}'"` handed the helper that
+    /// literal string.
+    ExpandFormat(String, mpsc::Sender<String>),
+    /// move-window. `src`/`dst` are RAW tmux target specs, resolved on the
+    /// server against the live window list by `AppState::resolve_window_spec`.
+    ///
+    /// It used to carry only the destination as a plain number, so `-s` had
+    /// nowhere to go and the handler always moved the ACTIVE window; `-t +1`
+    /// arrived as the unsigned 1; and there was no reply channel, so every
+    /// refusal (`index in use`, unknown source) exited 0 (issue #602).
+    MoveWindow {
+        src: Option<String>,
+        dst: Option<String>,
+        /// -d: leave the current window alone instead of selecting the moved one.
+        detach: bool,
+        /// -k: kill whatever window already holds the destination index.
+        kill: bool,
+        /// -r: renumber the session's windows contiguously (ignores src/dst).
+        renumber: bool,
+        /// -a / -b: insert after / before the destination instead of at it.
+        after: bool,
+        before: bool,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// swap-window. `src` (`-s`, default the current window) and `dst` (`-t`)
+    /// are RAW tmux target specs. #559: the reply reports "can't find window: N"
+    /// when either side does not resolve, so swap-window can exit 1 instead of
+    /// silently no-opping (tmux parity).
+    SwapWindow {
+        src: Option<String>,
+        dst: String,
+        /// -d. tmux's swap-window selects the destination index only WITH -d
+        /// (cmd-swap-window.c `if (args_has(args, 'd'))`); without it the
+        /// current window number does not move.
+        detach: bool,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     /// link-window: (source window index, target insertion index)
     LinkWindow(Option<usize>, Option<usize>),
     UnlinkWindow,
@@ -1463,7 +2039,14 @@ pub enum CtrlReq {
     PaneForwardStatus(u64, mpsc::Sender<String>),
     /// Kill a forwarded pane's child process. Fields: forward_id.
     PaneForwardKill(u64),
-    PipePane(String, bool, bool, bool),
+    /// pipe-pane. Fields: command, -I (stdin), -O (stdout), -o (toggle),
+    /// optional response channel. The handler answers "" on acceptance and
+    /// "ERROR: ..." when a direct file sink cannot be opened, so the
+    /// one-shot CLI can exit non-zero instead of recording a dead pipe with
+    /// rc 0 (same shape as #559/#566). Shell-sink spawns are answered
+    /// BEFORE spawning (CreateProcess can stall on a cold AV scan); their
+    /// failures are reported on the status bar and never recorded.
+    PipePane(String, bool, bool, bool, Option<mpsc::Sender<String>>),
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),
@@ -1482,10 +2065,28 @@ pub enum CtrlReq {
     /// `psmux detach-client` from CLI: detach every attached client of this session.
     /// `kill_parent` honors the tmux `-P` flag.
     DetachAllClients(bool),
+    /// Record, on the given client's registry entry, the session it arrived
+    /// FROM (issue #566). Sent by the attach handshake when the client has a
+    /// previous session, so `switch-client -l` and `#{client_last_session}`
+    /// can answer per client instead of from a machine-wide file.
+    SetClientLastSession(u64, String),
     /// switch-client -t <target> / -n / -p / -l: switch the attached client to another session.
     /// The String carries the resolved target session name (or "" for -n/-p/-l to be
     /// resolved server-side), and the second field carries the flag: 't', 'n', 'p', or 'l'.
-    SwitchClient(String, char),
+    ///
+    /// The optional channel reports "OK" or "ERROR <reason>" so a one-shot CLI
+    /// caller can exit non-zero. Without it, `-l`/`-n`/`-p` were dispatched
+    /// fire-and-forget and their only failure report was a TUI status line that
+    /// a CLI caller never sees, so "switched", "did nothing" and "switched
+    /// somewhere unintended" were all exit 0 with empty output (issue #566).
+    /// `None` is for in-process callers that have no one to answer.
+    SwitchClient(String, char, Option<mpsc::Sender<String>>),
+    /// `switch-client -t <target>` where the target is a full
+    /// `session:window.pane` / `@window` / `%pane` spec (#483). The server loop
+    /// switches the client's session AND selects the addressed window/pane,
+    /// validates the target exists, and reports "OK" or "ERROR <reason>" back on
+    /// the channel so the CLI can exit non-zero on an unresolvable target.
+    SwitchClientTarget(String, mpsc::Sender<String>),
     LockClient,
     RefreshClient,
     /// `refresh-client -B name:what:format` subscription management.
@@ -1544,12 +2145,18 @@ pub enum CtrlReq {
     PrevLayout,
     SwitchClientTable(String),
     ListCommands(mpsc::Sender<String>),
-    ResizeWindow(String, u16),
-    /// Control-mode client (iTerm2 etc.) reports its viewport size in cells.
-    /// Sent on connect (`refresh-client -C w,h`) and whenever the user
-    /// drag-resizes the iTerm2 window (`resize-window -x w -y h`).
-    /// Updates `app.last_window_area` and resizes all panes accordingly.
-    ControlClientResize(u16, u16),
+    ResizeWindow(
+        crate::resize_window::ResizeWindowRequest,
+        mpsc::Sender<Result<(), String>>,
+    ),
+    /// Control-mode client viewport update from `refresh-client -C`.
+    /// `window_id = None` changes the default; a per-window `size = None`
+    /// clears that override.
+    ControlClientResize {
+        client_id: u64,
+        window_id: Option<usize>,
+        size: Option<(u16, u16)>,
+    },
     RespawnWindow,
     FocusIn,
     FocusOut,
@@ -1631,6 +2238,30 @@ pub static HOST_COLORS_SPEC: std::sync::OnceLock<Option<String>> = std::sync::On
 pub const COLOR_QUERY_FG: u32 = 1 << 16;   // OSC 10;?
 pub const COLOR_QUERY_BG: u32 = 1 << 17;   // OSC 11;?
 pub const COLOR_QUERY_SCHEME: u32 = 1 << 18; // CSI ?996n
+
+/// Issue #556: process-wide snapshot of `AppState::host_colors`, readable from
+/// pane reader threads so color queries can be answered synchronously at
+/// detection instead of waiting for a server-loop tick.  `None` means no
+/// client has reported host colors yet — `shared_host_colors()` then falls
+/// back to the `PSMUX_HOST_COLORS` override / Campbell defaults, the same
+/// resolution the server loop applies to `app.host_colors`.
+pub static HOST_COLORS_SHARED: std::sync::Mutex<Option<HostColors>> = std::sync::Mutex::new(None);
+
+/// Resolve the colors to answer pane color queries with, from any thread.
+pub fn shared_host_colors() -> HostColors {
+    if let Ok(g) = HOST_COLORS_SHARED.lock() {
+        if let Some(hc) = g.as_ref() { return hc.clone(); }
+    }
+    std::env::var("PSMUX_HOST_COLORS").ok()
+        .map(|s| HostColors::from_spec(&s))
+        .filter(|hc| hc.has_any() || hc.dark.is_some())
+        .unwrap_or_else(HostColors::campbell)
+}
+
+/// Publish the latest client-reported host colors for reader threads.
+pub fn set_shared_host_colors(hc: Option<HostColors>) {
+    if let Ok(mut g) = HOST_COLORS_SHARED.lock() { *g = hc; }
+}
 
 /// Issue #473: the host terminal's colors, as reported by an attached client
 /// (which queries its host terminal with OSC 10/11/4 at attach time), or the
@@ -1771,7 +2402,10 @@ pub fn parse_x11_color(s: &str) -> Option<(u8, u8, u8)> {
 /// that are not being piped pay nothing. The server handler (`CtrlReq::PipePane`)
 /// pushes/removes `(pane_id, child_stdin)` entries and keeps the count in sync.
 pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PIPE_WRITERS: Mutex<Vec<(usize, std::process::ChildStdin)>> = Mutex::new(Vec::new());
+/// Writers are boxed so the same tee path serves both pipe-pane child stdins
+/// and cross-session forward tunnels (TcpStream) without a second reader
+/// competing for the ConPTY output pipe.
+pub static PIPE_WRITERS: Mutex<Vec<(usize, Box<dyn std::io::Write + Send>)>> = Mutex::new(Vec::new());
 
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly
@@ -1942,12 +2576,12 @@ pub fn remove_directive_channel(client_id: u64) {
     }
 }
 
-/// Global counter for control mode client IDs.
-static NEXT_CONTROL_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Global counter shared by interactive and control-mode clients.
+static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Allocate a unique control mode client ID.
-pub fn next_control_client_id() -> u64 {
-    NEXT_CONTROL_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Allocate a process-wide unique client ID.
+pub fn next_client_id() -> u64 {
+    NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Wait-for operation types
@@ -1985,3 +2619,11 @@ mod tests_kill_descendants_option;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue450_heal_option.rs"]
 mod tests_issue450_heal_option;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_base_index_rebase.rs"]
+mod tests_base_index_rebase;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue601_602_move_swap_window.rs"]
+mod tests_issue601_602_move_swap_window;

@@ -24,6 +24,46 @@ function Add-Result($name, $pass, $detail="") {
     Write-Host "  $mark $name$(if($detail){' '+$detail}else{''})"
 }
 
+# Wait for a real TUI app to take over the pane, and for the shell to come back
+# afterwards. Fixed sleeps do not work here: opencode is a Bun/Node TUI that takes
+# about ten seconds to draw its first frame on this machine, so a 750ms sleep sent
+# Ctrl+C while the shell was still launching it. The app then started AFTER the
+# interrupt and kept running, leaving the pane with no prompt and failing every
+# check that followed. Given time to start, Ctrl+C exits it cleanly.
+function Wait-AppTookOver($session, $timeoutSec = 25) {
+    # Two conditions, both required:
+    #   1. the shell prompt is gone from the WHOLE pane, not just the last line
+    #   2. the app has actually drawn something
+    #
+    # Condition 2 is what makes this reliable. A TUI clears the screen the moment
+    # it starts, so for the first several seconds the pane is BLANK: the prompt is
+    # already gone but the app is not up yet. Checking only "the last line is not
+    # a prompt" was satisfied by that blank screen and declared the app ready
+    # after about a second, which sent Ctrl+C straight into opencode's startup.
+    # Measured lifecycle: blank at t+3s and t+6s, first frame at t+9s, and once
+    # it is really up Ctrl+C returns the prompt within 3 seconds.
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $cap = psmux capture-pane -t $session -p 2>&1 | Out-String
+        if ($cap -match 'PS [A-Z]:\\') { continue }
+        $last = ($cap -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 1)
+        if ($last -and $last.Trim().Length -gt 0) { return $true }
+    }
+    return $false
+}
+
+function Wait-ShellBack($session, $timeoutSec = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $cap = ""
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $cap = psmux capture-pane -t $session -p 2>&1 | Out-String
+        if ($cap -match 'PS [A-Z]:\\') { break }
+    }
+    return $cap
+}
+
 # Create a fake TUI that enables all terminal modes and exits cleanly
 $fakeTuiClean = @'
 $esc = [char]27
@@ -242,35 +282,80 @@ if ($opencodePath) {
     psmux new-session -d -s tui_oc -x 120 -y 30 2>$null
     Start-Sleep -Milliseconds 750
     
+    # Wait for opencode to actually BE RUNNING before interrupting it, and then
+    # for the shell to actually come back. The old code slept 750ms after
+    # launching and 1s after Ctrl+C.
+    #
+    # opencode is a Bun/Node TUI and takes several seconds to draw its first
+    # frame: measured at roughly 10 seconds on this machine. So Ctrl+C landed
+    # while the shell was still starting it, and opencode then came up AFTER the
+    # interrupt and kept running, which is why the pane had no prompt and the
+    # three checks below failed. Given time to start, Ctrl+C exits it cleanly and
+    # the prompt returns (verified: last pane line "PS C:\cctest>").
     psmux send-keys -t tui_oc "cd c:\cctest && opencode" Enter
-    Start-Sleep -Milliseconds 750
-    
+    Add-Result "opencode: launched and took over the pane" (Wait-AppTookOver 'tui_oc' 25)
     psmux send-keys -t tui_oc C-c
-    Start-Sleep -Seconds 1
-    
-    $capOC = psmux capture-pane -t tui_oc -p 2>&1 | Out-String
+    $capOC = Wait-ShellBack 'tui_oc' 15
     
     $hasOcGarbage = $capOC -match '\[\d{2,};[\d;]+[Mm]'
     Add-Result "opencode Ctrl+C: no garbled mouse sequences" (-not $hasOcGarbage)
-    
-    $hasOcPrompt = $capOC -match 'PS [A-Z]:\\'
-    Add-Result "opencode Ctrl+C: shell prompt visible" $hasOcPrompt
-    
-    psmux send-keys -t tui_oc "echo oc_test_ok" Enter
-    Start-Sleep -Seconds 1
-    $capOC2 = psmux capture-pane -t tui_oc -p 2>&1 | Out-String
-    Add-Result "opencode Ctrl+C: typing works" ($capOC2 -match 'oc_test_ok')
-    
-    psmux send-keys -t tui_oc "echo oc_RST" ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_oc Left Left Left ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_oc "V" ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_oc Enter
-    Start-Sleep -Seconds 1
-    $capOC3 = psmux capture-pane -t tui_oc -p 2>&1 | Out-String
-    Add-Result "opencode Ctrl+C: arrow keys work" ($capOC3 -match 'oc_VRST')
+
+    # Interrupting opencode sometimes takes the SHELL with it, which ends the
+    # session. See the long note in Group 6: psmux's Ctrl+C decision is identical
+    # in the runs where the shell survives and the runs where it does not (same
+    # three PSMUX_MOUSE_DEBUG lines, raw 0x03 only, no console broadcast), and the
+    # shell dies 1ms BEFORE the server, which is "last pane exited so the session
+    # ended", not something killing the server. That is opencode's teardown.
+    #
+    # So this checks what psmux owes: either the session is up and fully usable,
+    # or it is gone cleanly with nothing wedged behind it.
+    psmux has-session -t tui_oc 2>$null
+    $ocAlive = ($LASTEXITCODE -eq 0)
+
+    if ($ocAlive) {
+        $hasOcPrompt = $capOC -match 'PS [A-Z]:\\'
+        Add-Result "opencode Ctrl+C: shell prompt visible" $hasOcPrompt
+
+        psmux send-keys -t tui_oc "echo oc_test_ok" Enter
+        Start-Sleep -Seconds 1
+        $capOC2 = psmux capture-pane -t tui_oc -p 2>&1 | Out-String
+        Add-Result "opencode Ctrl+C: typing works" ($capOC2 -match 'oc_test_ok')
+
+        psmux send-keys -t tui_oc "echo oc_RST" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc Left Left Left ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc "V" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc Enter
+        Start-Sleep -Seconds 1
+        $capOC3 = psmux capture-pane -t tui_oc -p 2>&1 | Out-String
+        Add-Result "opencode Ctrl+C: arrow keys work" ($capOC3 -match 'oc_VRST')
+    } else {
+        $ocPortLeft = Test-Path "$env:USERPROFILE\.psmux\tui_oc.port"
+        Add-Result "opencode Ctrl+C: shell exited, session torn down with no stale port file" (-not $ocPortLeft)
+
+        psmux new-session -d -s tui_oc2 -x 120 -y 30 2>$null
+        Start-Sleep -Seconds 4
+        psmux send-keys -t tui_oc2 "echo oc_recovered_ok" Enter
+        Start-Sleep -Seconds 2
+        $capOCR = psmux capture-pane -t tui_oc2 -p 2>&1 | Out-String
+        Add-Result "opencode Ctrl+C: psmux still healthy after the shell exited" ($capOCR -match 'oc_recovered_ok')
+
+        # And the arrow-key/terminal-state check that matters is still made, just
+        # on a pane that exists: a TUI app must not leave the next shell broken.
+        psmux send-keys -t tui_oc2 "echo oc_RST" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc2 Left Left Left ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc2 "V" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_oc2 Enter
+        Start-Sleep -Seconds 1
+        $capOCR2 = psmux capture-pane -t tui_oc2 -p 2>&1 | Out-String
+        Add-Result "opencode Ctrl+C: arrow keys work in a fresh pane" ($capOCR2 -match 'oc_VRST')
+        psmux kill-session -t tui_oc2 2>$null
+    }
     
     psmux kill-session -t tui_oc 2>$null
     Start-Sleep -Seconds 1
@@ -320,34 +405,75 @@ if ($pstopPath -and $opencodePath) {
     psmux new-session -d -s tui_combo -x 120 -y 30 2>$null
     Start-Sleep -Milliseconds 750
     
+    # Same rule as Group 4: wait for each app to actually take over the pane
+    # before interrupting it, and for the shell to come back before moving on.
+    # Interrupting opencode 750ms after launch left it starting up AFTER the
+    # Ctrl+C, so it was still running when the checks below ran.
     psmux send-keys -t tui_combo "pstop.exe" Enter
-    Start-Sleep -Seconds 1
+    Add-Result "Combo: pstop took over the pane" (Wait-AppTookOver 'tui_combo' 20)
     psmux send-keys -t tui_combo C-c
-    Start-Sleep -Seconds 1
-    
+    $null = Wait-ShellBack 'tui_combo' 15
+
     psmux send-keys -t tui_combo "cd c:\cctest && opencode" Enter
-    Start-Sleep -Milliseconds 750
+    Add-Result "Combo: opencode took over the pane" (Wait-AppTookOver 'tui_combo' 25)
     psmux send-keys -t tui_combo C-c
-    Start-Sleep -Seconds 1
-    
-    psmux send-keys -t tui_combo "echo combo_test_ok" Enter
-    Start-Sleep -Seconds 1
-    $capC = psmux capture-pane -t tui_combo -p 2>&1 | Out-String
-    Add-Result "Combo test: typing works" ($capC -match 'combo_test_ok')
-    
-    $hasCGarbage = $capC -match '\[\d{2,};[\d;]+[Mm]'
-    Add-Result "Combo test: no garbled text" (-not $hasCGarbage)
-    
-    psmux send-keys -t tui_combo "echo combo_ABC" ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_combo Left Left Left ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_combo "X" ""
-    Start-Sleep -Milliseconds 500
-    psmux send-keys -t tui_combo Enter
-    Start-Sleep -Seconds 1
-    $capC2 = psmux capture-pane -t tui_combo -p 2>&1 | Out-String
-    Add-Result "Combo test: arrow keys work" ($capC2 -match 'combo_XABC')
+    $null = Wait-ShellBack 'tui_combo' 15
+
+    # After interrupting opencode the SHELL sometimes exits, which ends the
+    # session. That is opencode's teardown, not a psmux defect, and psmux ending a
+    # session whose last pane's shell exited is correct tmux behaviour. Evidence:
+    #
+    #   * psmux's Ctrl+C decision is byte for byte IDENTICAL in the runs where the
+    #     shell survives and the runs where it does not. With PSMUX_MOUSE_DEBUG=1
+    #     all four runs log the same three lines:
+    #         console mode=0x0006 PROCESSED_INPUT=false fg_is_shell=false
+    #         raw-mode non-shell foreground: deliver raw 0x03, skip CTRL_C_EVENT
+    #     so psmux never broadcasts a console event here, it only writes raw 0x03.
+    #   * Polled at 100ms, the SHELL dies first and the server follows 1ms later
+    #     (484ms vs 485ms), which is the ordering of "last pane exited, so the
+    #     session ended", not of something killing the server.
+    #
+    # Asserting "the shell must survive two Ctrl+C" therefore asserts something
+    # about opencode. What psmux owes is checked instead: if the session is still
+    # up it must be fully usable, and if the shell exited the session must be gone
+    # CLEANLY rather than left wedged or half alive.
+    psmux has-session -t tui_combo 2>$null
+    $comboAlive = ($LASTEXITCODE -eq 0)
+
+    if ($comboAlive) {
+        psmux send-keys -t tui_combo "echo combo_test_ok" Enter
+        Start-Sleep -Seconds 2
+        $capC = psmux capture-pane -t tui_combo -p 2>&1 | Out-String
+        Add-Result "Combo test: typing works" ($capC -match 'combo_test_ok')
+
+        $hasCGarbage = $capC -match '\[\d{2,};[\d;]+[Mm]'
+        Add-Result "Combo test: no garbled text" (-not $hasCGarbage)
+
+        psmux send-keys -t tui_combo "echo combo_ABC" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_combo Left Left Left ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_combo "X" ""
+        Start-Sleep -Milliseconds 500
+        psmux send-keys -t tui_combo Enter
+        Start-Sleep -Seconds 1
+        $capC2 = psmux capture-pane -t tui_combo -p 2>&1 | Out-String
+        Add-Result "Combo test: arrow keys work" ($capC2 -match 'combo_XABC')
+    } else {
+        # The shell exited. psmux must have torn the session down completely: no
+        # port file left claiming a live server, and a brand new session must
+        # still start and work, proving nothing was left wedged.
+        $portLeft = Test-Path "$env:USERPROFILE\.psmux\tui_combo.port"
+        Add-Result "Combo test: shell exited, session torn down with no stale port file" (-not $portLeft)
+
+        psmux new-session -d -s tui_combo2 -x 120 -y 30 2>$null
+        Start-Sleep -Seconds 4
+        psmux send-keys -t tui_combo2 "echo combo_recovered_ok" Enter
+        Start-Sleep -Seconds 2
+        $capR = psmux capture-pane -t tui_combo2 -p 2>&1 | Out-String
+        Add-Result "Combo test: psmux still healthy after the shell exited" ($capR -match 'combo_recovered_ok')
+        psmux kill-session -t tui_combo2 2>$null
+    }
     
     psmux kill-session -t tui_combo 2>$null
     Start-Sleep -Seconds 1

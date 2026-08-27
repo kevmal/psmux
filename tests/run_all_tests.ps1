@@ -7,7 +7,12 @@
 param(
     [switch]$SkipPerf,       # Skip long-running perf/stress tests
     [switch]$IncludeWSL,     # Include WSL-dependent tests
-    [switch]$IncludeInteractive  # Include tests that need interactive TUI
+    [switch]$IncludeInteractive, # Include tests that need interactive TUI
+    [int]$DefaultTimeoutSec = 240,  # Per-suite timeout (normal suites)
+    [int]$LongTimeoutSec = 900,     # Per-suite timeout (perf/stress/latency suites)
+    [string]$Only,           # Regex filter: run only suites whose name matches
+    [switch]$Resume,         # Continue the latest run: skip suites that already have a result
+    [string]$TestDir         # Override test directory (default: this script's folder)
 )
 
 # ── Safety gate: this runner is DESTRUCTIVE to a live psmux ──────────────────
@@ -32,6 +37,117 @@ if ($env:PSMUX_TEST_SANDBOX -ne '1') {
 $ErrorActionPreference = "Continue"
 $startTime = Get-Date
 
+# NO_COLOR poisons every color assertion in the tree: psmux honors it and
+# strips SGR, so a runner launched from a shell that sets it (AI agent tool
+# shells do) fakes a machine-wide "psmux drops all colour" regression across
+# the issue2/263/425/451 families. Proven 2026-08-05: 12 suites red with it,
+# all green without, identical binary. Scrub it for this process and every
+# suite we spawn.
+Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+
+# Suppress Windows hard-error popups for this process and EVERYTHING it
+# spawns (the error mode is inherited through CreateProcess). The runner and
+# the suites kill whole process trees constantly, and a console child caught
+# mid-initialization while its console/job is being torn down dies with
+# STATUS_DLL_INIT_FAILED (0xc0000142). Without this, each such death posts a
+# MODAL "pwsh.exe - Application Error" dialog to the desktop; Windows queues
+# them, so they keep resurfacing one OK-click at a time for hours after a
+# sweep. Measured 2026-08-21: every 0xc0000142 popup in a 7-day window fell
+# inside a full-sweep run (bursts of 10-12 around the codex-suite tree
+# kills), zero outside them.
+#   SEM_FAILCRITICALERRORS (0x1) | SEM_NOGPFAULTERRORBOX (0x2) |
+#   SEM_NOOPENFILEERRORBOX (0x8000)
+Add-Type -Name ErrMode -Namespace PsmuxRunner -MemberDefinition `
+    '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint uMode);'
+[void][PsmuxRunner.ErrMode]::SetErrorMode(0x1 -bor 0x2 -bor 0x8000)
+
+# ── Abort channel: stop a run WITHOUT needing the runner window ──────────────
+#
+# WHY A FILE AND NOT JUST Ctrl+C: the suites launch attached psmux clients in
+# their own consoles, and those windows TAKE THE FOREGROUND within seconds of a
+# run starting. Measured 2026-08-26 by sampling GetForegroundWindow every 300ms
+# across a -Only tui_proof run: the runner console held focus for 2 seconds, a
+# psmux.exe window took it, and the runner never got it back. Ctrl+C is only
+# delivered to the console that HAS focus, so for most of a multi-hour run the
+# runner console is simply not reachable from the keyboard. The only exit left
+# was killing pwsh from Task Manager, which skips the summary and strands every
+# psmux server the in-flight suite had started (measured: 3 orphans).
+#
+# So the abort signal is a FILE any other shell can create:
+#     tests\stop_tests.cmd     (or: New-Item $env:TEMP\psmux-teststop.flag)
+# It is polled once a second inside the per-suite wait loop and again before
+# each suite starts, so an abort lands within ~1s even in the middle of a 900s
+# perf suite, and nothing further is started.
+#
+# Ctrl+C still works when the window IS reachable, but it is now routed through
+# the same flag instead of killing the process. The native handler installed
+# here runs BEFORE PowerShell's own (handlers fire in reverse registration
+# order) and returns TRUE to swallow the event, so the runner survives long
+# enough to kill the suite's process tree, tear down psmux and print the report
+# for everything that did run.
+$script:StopFile = Join-Path $env:TEMP "psmux-teststop.flag"
+
+# A stop flag left behind by a previous abort would kill this run on its first
+# poll. Clear it before the handler can ever look at it.
+Remove-Item $script:StopFile -Force -ErrorAction SilentlyContinue
+
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class PsmuxTestAbort {
+    delegate bool HandlerRoutine(uint ctrlType);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
+
+    // The delegate MUST stay rooted. Windows calls it from a thread it injects
+    // into this process; if the GC collects it first the call lands on freed
+    // memory and the runner dies with an access violation instead of aborting.
+    static HandlerRoutine _handler;
+    static string _flagFile;
+
+    public static volatile bool Requested;
+    public static string Reason = "";
+
+    public static void Install(string flagFile) {
+        _flagFile = flagFile;
+        _handler = new HandlerRoutine(OnCtrl);
+        SetConsoleCtrlHandler(_handler, true);
+    }
+
+    static bool OnCtrl(uint t) {
+        // 0 = CTRL_C, 1 = CTRL_BREAK, 2 = CTRL_CLOSE, 5 = LOGOFF, 6 = SHUTDOWN
+        Reason = (t == 1) ? "Ctrl+Break" : "Ctrl+C";
+        Requested = true;
+        // Mirror to the flag file so the abort survives even if this handler
+        // races the main thread, and so a watcher can see the run is stopping.
+        try { File.WriteAllText(_flagFile, Reason); } catch { }
+        // Swallow C/BREAK so the runner can clean up. CLOSE/LOGOFF/SHUTDOWN are
+        // not ours to veto: Windows kills us shortly after regardless.
+        return (t == 0 || t == 1);
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
+[PsmuxTestAbort]::Install($script:StopFile)
+
+$script:AbortReason = $null
+
+# Returns the abort reason, or $null when the run should continue.
+function Test-AbortRequested {
+    if ($script:AbortReason) { return $script:AbortReason }
+    if ([PsmuxTestAbort]::Requested) { return [PsmuxTestAbort]::Reason }
+    if (Test-Path $script:StopFile) {
+        $why = ""
+        try { $why = (Get-Content $script:StopFile -Raw -ErrorAction SilentlyContinue) } catch {}
+        if ($why) { $why = $why.Trim() }
+        if (-not $why) { $why = "stop file" }
+        return $why
+    }
+    return $null
+}
+
 # ── Logging setup ──────────────────────────────────────────────
 # All logs go to $env:TEMP\psmux-test-logs\ (never inside the repo).
 # Each run gets a timestamped folder with:
@@ -40,15 +156,33 @@ $startTime = Get-Date
 #   suites\<name>.log – full stdout/stderr captured from each test file
 $script:LogRoot = Join-Path $env:TEMP "psmux-test-logs"
 $script:RunId   = $startTime.ToString("yyyy-MM-dd_HH-mm-ss")
+$latestFile = Join-Path $script:LogRoot "latest_run.txt"
+
+# -Resume: continue the most recent run instead of starting a new one.
+# Suites that already have a line in results.jsonl are skipped.
+$script:CompletedSuites = @{}
+if ($Resume -and (Test-Path $latestFile)) {
+    $prevId = (Get-Content $latestFile -Raw).Trim()
+    $prevDir = Join-Path $script:LogRoot $prevId
+    if (Test-Path (Join-Path $prevDir "results.jsonl")) {
+        $script:RunId = $prevId
+        foreach ($line in (Get-Content (Join-Path $prevDir "results.jsonl"))) {
+            try {
+                $r = $line | ConvertFrom-Json
+                $script:CompletedSuites[$r.Name] = $r
+            } catch {}
+        }
+    }
+}
+
 $script:RunDir  = Join-Path $script:LogRoot $script:RunId
 $script:SuiteDir = Join-Path $script:RunDir "suites"
 New-Item -ItemType Directory -Path $script:SuiteDir -Force | Out-Null
 
 $script:ProgressLog = Join-Path $script:RunDir "progress.log"
 $script:SummaryLog  = Join-Path $script:RunDir "summary.log"
+$script:ResultsJsonl = Join-Path $script:RunDir "results.jsonl"
 
-# Also maintain a symlink-like "latest" pointer
-$latestFile = Join-Path $script:LogRoot "latest_run.txt"
 Set-Content -Path $latestFile -Value $script:RunId -Encoding UTF8
 
 function Write-Log {
@@ -62,6 +196,108 @@ function Write-Log {
 Write-Log "=== psmux test run started ==="
 Write-Log "Run ID: $script:RunId"
 Write-Log "Log directory: $script:RunDir"
+if ($script:CompletedSuites.Count -gt 0) {
+    Write-Log "Resuming: $($script:CompletedSuites.Count) suites already have results and will be skipped"
+}
+
+# ── Windows Job Object: guarantees the WHOLE process tree of a test dies ─────
+# Why: the old Start-Job pattern hung FOREVER when a test left behind a child
+# that inherited stdout (Stop-Job blocks on the pipe), and orphaned children
+# survived across suites. A job object with KILL_ON_JOB_CLOSE kills every
+# descendant (even orphans whose parent already exited) in one call.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class PsmuxTestJob {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpInfo, uint cbInfoLength);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferBytes;
+        public ulong WriteTransferBytes;
+        public ulong OtherTransferBytes;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
+    const int  JobObjectExtendedLimitInformation  = 9;
+    const uint PROCESS_SET_QUOTA_AND_TERMINATE    = 0x0100 | 0x0001;
+
+    public static IntPtr Create() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return IntPtr.Zero;
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        int len = Marshal.SizeOf(info);
+        IntPtr buf = Marshal.AllocHGlobal(len);
+        try {
+            Marshal.StructureToPtr(info, buf, false);
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buf, (uint)len)) {
+                CloseHandle(job);
+                return IntPtr.Zero;
+            }
+        } finally { Marshal.FreeHGlobal(buf); }
+        return job;
+    }
+
+    public static bool Assign(IntPtr job, int pid) {
+        IntPtr h = OpenProcess(PROCESS_SET_QUOTA_AND_TERMINATE, false, pid);
+        if (h == IntPtr.Zero) return false;
+        bool ok = AssignProcessToJobObject(job, h);
+        CloseHandle(h);
+        return ok;
+    }
+
+    // Terminate every process in the job, then release it.
+    public static void Kill(IntPtr job) {
+        if (job == IntPtr.Zero) return;
+        TerminateJobObject(job, 0xDEAD);
+        CloseHandle(job);
+    }
+}
+'@ -ErrorAction SilentlyContinue
+
+function Get-SuiteTimeout {
+    param([string]$Name)
+    # Perf/stress/latency suites legitimately run long; everything else gets the default.
+    if ($Name -match 'perf|stress|latency|benchmark|extreme|battle|install_speed|e2e|sustained|exhaustive|nsis|installer|realistic_typing|robust_') { return $LongTimeoutSec }
+    return $DefaultTimeoutSec
+}
 
 # ── Binary discovery ──
 $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe" -ErrorAction SilentlyContinue).Path
@@ -70,7 +306,7 @@ if (-not $PSMUX) { $PSMUX = (Get-Command psmux -ErrorAction SilentlyContinue).So
 if (-not $PSMUX) { Write-Error "psmux binary not found"; exit 1 }
 
 Write-Log "Binary: $PSMUX"
-Write-Log "Params: SkipPerf=$SkipPerf IncludeWSL=$IncludeWSL IncludeInteractive=$IncludeInteractive"
+Write-Log "Params: SkipPerf=$SkipPerf IncludeWSL=$IncludeWSL IncludeInteractive=$IncludeInteractive DefaultTimeoutSec=$DefaultTimeoutSec LongTimeoutSec=$LongTimeoutSec Only='$Only' Resume=$Resume"
 
 Write-Host "Binary: $PSMUX" -ForegroundColor Cyan
 Write-Host "Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
@@ -147,18 +383,20 @@ function Show-ProgressDashboard {
 
     # Status badge
     $badge = switch ($Status) {
-        "PASS"  { "[PASS]" }
-        "FAIL"  { "[FAIL]" }
-        "SKIP"  { "[SKIP]" }
-        "ERROR" { "[ERR!]" }
-        default { "[....]" }
+        "PASS"    { "[PASS]" }
+        "FAIL"    { "[FAIL]" }
+        "TIMEOUT" { "[TIME]" }
+        "SKIP"    { "[SKIP]" }
+        "ERROR"   { "[ERR!]" }
+        default   { "[....]" }
     }
     $badgeColor = switch ($Status) {
-        "PASS"  { "Green" }
-        "FAIL"  { "Red" }
-        "SKIP"  { "Yellow" }
-        "ERROR" { "Magenta" }
-        default { "DarkGray" }
+        "PASS"    { "Green" }
+        "FAIL"    { "Red" }
+        "TIMEOUT" { "Red" }
+        "SKIP"    { "Yellow" }
+        "ERROR"   { "Magenta" }
+        default   { "DarkGray" }
     }
 
     Write-Host ""
@@ -192,26 +430,35 @@ function Show-ProgressDashboard {
 }
 
 function Clean-Server {
-    # Gracefully ask all servers to exit
-    try { & $PSMUX kill-server 2>&1 | Out-Null } catch {}
-    Start-Sleep -Milliseconds 500
-    # Force-kill any lingering processes
-    Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    # Wait for OS to release TCP ports and file handles
-    Start-Sleep -Seconds 3
+    # If no psmux processes exist there is nothing to tear down; just clear files.
+    $alive = @(Get-Process psmux -ErrorAction SilentlyContinue)
+    if ($alive.Count -gt 0) {
+        # Gracefully ask all servers to exit, but BOUNDED: a wedged server must not
+        # hang the runner (the old unbounded `& $PSMUX kill-server` could block forever).
+        try {
+            $ks = Start-Process -FilePath $PSMUX -ArgumentList "kill-server" -PassThru -NoNewWindow `
+                    -RedirectStandardOutput (Join-Path $script:RunDir "ks_out.tmp") `
+                    -RedirectStandardError  (Join-Path $script:RunDir "ks_err.tmp")
+            if (-not $ks.WaitForExit(5000)) { try { $ks.Kill() } catch {} }
+        } catch {}
+        # Force-kill any lingering processes, then poll (up to 3s) instead of fixed sleeps
+        Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $deadline = [DateTime]::Now.AddSeconds(3)
+        while ([DateTime]::Now -lt $deadline) {
+            if (-not (Get-Process psmux -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Milliseconds 150
+        }
+        Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Brief settle so the OS releases TCP ports/file handles of killed servers
+        Start-Sleep -Milliseconds 500
+    }
     # Remove stale port/key files
     Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
     # Remove any test config files (tests should restore originals but may fail)
     Remove-Item "$env:USERPROFILE\.psmux.conf" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:USERPROFILE\.psmuxrc" -Force -ErrorAction SilentlyContinue
-    # Verify no psmux processes remain
-    $remaining = Get-Process psmux -ErrorAction SilentlyContinue
-    if ($remaining) {
-        Start-Sleep -Seconds 2
-        Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-    }
+    Remove-Item (Join-Path $script:RunDir "ks_*.tmp") -Force -ErrorAction SilentlyContinue
 }
 
 function Run-TestFile {
@@ -245,46 +492,149 @@ function Run-TestFile {
     Write-Host "$('=' * 60)" -ForegroundColor DarkGray
 
     try {
-        # Run test with a 10-minute max timeout to prevent infinite hangs
-        $testJob = Start-Job -ScriptBlock {
-            param($f)
-            $o = & pwsh -NoProfile -ExecutionPolicy Bypass -File $f 2>&1 | Out-String
-            @{ Output = $o; ExitCode = $LASTEXITCODE }
-        } -ArgumentList $FilePath
+        # Run the test as a real child process inside a Windows Job Object.
+        #  - stdout/stderr go straight to files: nothing ever blocks on a pipe,
+        #    and the log is tail-able in real time while the test runs.
+        #  - On timeout (or after completion) the job object kills the ENTIRE
+        #    process tree, including orphans whose parent already exited.
+        $timeoutSec = Get-SuiteTimeout $baseName
+        $outFile = Join-Path $script:SuiteDir "$baseName.out.tmp"
+        $errFile = Join-Path $script:SuiteDir "$baseName.err.tmp"
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
-        $done = Wait-Job $testJob -Timeout 600  # 10 minutes max per test
-        if ($done) {
-            $r = Receive-Job $testJob
-            $output = $r.Output
-            $exitCode = $r.ExitCode
-        } else {
-            Stop-Job $testJob
-            $output = "[TIMEOUT] Test $baseName exceeded 600 seconds and was killed`n"
-            $exitCode = -2
-            Write-Host "  [TIMEOUT] Test killed after 600s" -ForegroundColor Red
+        $job = [PsmuxTestJob]::Create()
+        # Pin the suite's working directory to the repo root: several suites
+        # resolve `.\target\release\psmux.exe` relative to CWD, so inheriting
+        # whatever directory the runner was launched from silently breaks them.
+        $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+        $proc = Start-Process -FilePath "pwsh" `
+            -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",$FilePath `
+            -PassThru -NoNewWindow -WorkingDirectory $repoRoot `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $inJob = $false
+        if ($job -ne [IntPtr]::Zero) { $inJob = [PsmuxTestJob]::Assign($job, $proc.Id) }
+
+        # Wait with a heartbeat so long/hung tests are visible while they run.
+        # The same 1s tick polls the abort channel, so a stop request lands
+        # within a second even inside a 900s perf suite.
+        $timedOut = $false
+        $aborted = $false
+        $lastBeat = [DateTime]::Now
+        while (-not $proc.WaitForExit(1000)) {
+            $why = Test-AbortRequested
+            if ($why) { $aborted = $true; $script:AbortReason = $why; break }
+            if ($sw.Elapsed.TotalSeconds -ge $timeoutSec) { $timedOut = $true; break }
+            if (([DateTime]::Now - $lastBeat).TotalSeconds -ge 10) {
+                $lastBeat = [DateTime]::Now
+                $lastLine = ""
+                try { $lastLine = (Get-Content $outFile -Tail 1 -ErrorAction SilentlyContinue) } catch {}
+                if ($lastLine) { $lastLine = ($lastLine | Out-String).Trim() }
+                if ($lastLine.Length -gt 80) { $lastLine = $lastLine.Substring(0, 80) }
+                Write-Host ("  ... {0,4:F0}s / {1}s  {2}" -f $sw.Elapsed.TotalSeconds, $timeoutSec, $lastLine) -ForegroundColor DarkGray
+                Write-Log ("HEARTBEAT $baseName {0:F0}s/{1}s" -f $sw.Elapsed.TotalSeconds, $timeoutSec)
+            }
         }
-        Remove-Job $testJob -Force
+
+        # A real Ctrl+C reaches the suite as well as the runner: the child was
+        # started -NoNewWindow so it shares this console, and it dies at the same
+        # instant we are signalled. The wait loop then exits NORMALLY, and
+        # without this re-check the half-executed suite gets scored on its
+        # truncated output - exit code 0, no assertions printed, therefore
+        # "PASS". Measured 2026-08-26: test_fake_1 was killed 8s into a 15s body
+        # and recorded PASS 0P/0F exit=0, and that bogus pass went into
+        # results.jsonl where -Resume would skip the suite as already done.
+        if (-not $aborted -and -not $timedOut) {
+            $why = Test-AbortRequested
+            # Deliberately biased towards calling it an abort: re-running a suite
+            # that had genuinely just finished costs one suite, whereas trusting
+            # a truncated pass loses coverage silently.
+            if ($why) { $aborted = $true; $script:AbortReason = $why }
+        }
+
+        if ($aborted) {
+            # Same teardown as a timeout: the job object kills the whole tree,
+            # including the psmux servers the suite started, so an abort does not
+            # strand processes the way a Task Manager kill of the runner did.
+            Write-Host "`n  [ABORT] Stop requested ($script:AbortReason). Killing $baseName process tree." -ForegroundColor Yellow
+            Write-Log "ABORT $baseName - stop requested ($script:AbortReason), killing process tree"
+            if ($inJob) {
+                [PsmuxTestJob]::Kill($job)
+            } else {
+                & taskkill /F /T /PID $proc.Id 2>&1 | Out-Null
+            }
+            try { $proc.WaitForExit(5000) | Out-Null } catch {}
+            $sw.Stop()
+            Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+            return @{
+                Name = $baseName
+                Status = "ABORT"
+                ExitCode = -3
+                Passed = 0; Failed = 0; Skipped = 0
+                Duration = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                Reason = "interrupted ($script:AbortReason)"
+                Output = ""
+            }
+        }
+
+        if ($timedOut) {
+            Write-Host "  [TIMEOUT] Killing $baseName process tree after ${timeoutSec}s" -ForegroundColor Red
+            Write-Log "TIMEOUT $baseName after ${timeoutSec}s, killing process tree"
+            if ($inJob) {
+                [PsmuxTestJob]::Kill($job)   # kills every descendant, even orphans
+            } else {
+                # Fallback: taskkill the tree if job-object assignment failed
+                & taskkill /F /T /PID $proc.Id 2>&1 | Out-Null
+            }
+            try { $proc.WaitForExit(5000) | Out-Null } catch {}
+            $exitCode = -2
+        } else {
+            try { $proc.WaitForExit() } catch {}  # ensure ExitCode is available
+            $exitCode = $proc.ExitCode
+            # Suite finished: reap anything it left behind (leaked children would
+            # otherwise accumulate across 541 suites and poison later tests)
+            if ($inJob) { [PsmuxTestJob]::Kill($job) }
+        }
         $sw.Stop()
+
+        # Collect output from the redirect files (out first, then err)
+        $output = ""
+        try { $output = [System.IO.File]::ReadAllText($outFile) } catch {}
+        try {
+            $errText = [System.IO.File]::ReadAllText($errFile)
+            if ($errText.Trim()) { $output += "`r`n--- STDERR ---`r`n$errText" }
+        } catch {}
+        if ($timedOut) {
+            $output += "`r`n[TIMEOUT] Test $baseName exceeded $timeoutSec seconds; process tree was killed`r`n"
+        }
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
         # Write full output to per-suite log file
         $suiteHeader = "Suite: $baseName`r`nFile:  $FilePath`r`nStart: $(($startTime + $sw.Elapsed - $sw.Elapsed).ToString('yyyy-MM-dd HH:mm:ss'))`r`nEnd:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`nExit:  $exitCode`r`nDuration: $([math]::Round($sw.Elapsed.TotalSeconds,1))s`r`n$('=' * 70)`r`n"
         [System.IO.File]::WriteAllText($suiteLog, "$suiteHeader$output", [System.Text.Encoding]::UTF8)
 
-        # Count PASS/FAIL from output (multiple patterns used by different test scripts)
+        # Count PASS/FAIL from output (multiple patterns used by different test scripts).
+        # The colon form ("  PASS: msg" / "FAIL: msg") is used by the agent-teams
+        # suites; without it their results recorded as 0P/0F despite real outcomes.
         $passCount = ([regex]::Matches($output, '\[PASS\]')).Count
         $passCount += ([regex]::Matches($output, '(?m)^PASS\s')).Count
+        $passCount += ([regex]::Matches($output, '(?m)^\s*PASS:(?!\s*\d+\s*$)')).Count
         $passCount += ([regex]::Matches($output, '=> PASS$', [System.Text.RegularExpressions.RegexOptions]::Multiline)).Count
         $failCount = ([regex]::Matches($output, '\[FAIL\]')).Count
         $failCount += ([regex]::Matches($output, '(?m)^FAIL\s')).Count
+        # Negative lookahead: a bare number after the colon is a summary line
+        # ("FAIL: 0"), not an assertion result, and must not be counted.
+        $failCount += ([regex]::Matches($output, '(?m)^\s*FAIL:(?!\s*\d+\s*$)')).Count
         $failCount += ([regex]::Matches($output, '=> FAIL$', [System.Text.RegularExpressions.RegexOptions]::Multiline)).Count
         $skipCount = ([regex]::Matches($output, '\[SKIP\]')).Count
 
         # Show output
         Write-Host $output
 
-        $status = if ($exitCode -eq 0 -and $failCount -eq 0) { "PASS" } else { "FAIL" }
+        $status = if ($timedOut) { "TIMEOUT" }
+                  elseif ($exitCode -eq 0 -and $failCount -eq 0) { "PASS" }
+                  else { "FAIL" }
 
-        Write-Log ("{0,-5} {1,-45} {2}P/{3}F  exit={4}  {5}s" -f $status, $baseName, $passCount, $failCount, $exitCode, [math]::Round($sw.Elapsed.TotalSeconds,1))
+        Write-Log ("{0,-7} {1,-45} {2}P/{3}F  exit={4}  {5}s" -f $status, $baseName, $passCount, $failCount, $exitCode, [math]::Round($sw.Elapsed.TotalSeconds,1))
 
         return @{
             Name = $baseName
@@ -313,7 +663,12 @@ function Run-TestFile {
 }
 
 # ── Collect all test files ──
-$allTests = Get-ChildItem "$PSScriptRoot\test_*.ps1" | Sort-Object Name
+$testRoot = if ($TestDir) { $TestDir } else { $PSScriptRoot }
+$allTests = Get-ChildItem "$testRoot\test_*.ps1" | Sort-Object Name
+if ($Only) {
+    $allTests = @($allTests | Where-Object { $_.BaseName -match $Only })
+    Write-Log "Filter -Only '$Only' matched $($allTests.Count) suites"
+}
 $totalSuites = $allTests.Count
 Write-Host ""
 Write-Host ("  {0} test suites discovered" -f $totalSuites) -ForegroundColor Cyan
@@ -333,8 +688,44 @@ Write-Host ""
 
 # ── Run each test ──
 $suiteIndex = 0
+$script:RunAborted = $false
+$script:NotRunCount = 0
 foreach ($testFile in $allTests) {
     $suiteIndex++
+
+    # Abort check BEFORE anything is started, so a stop request never launches
+    # one more suite. Covers the Clean-Server gap between suites too.
+    $why = Test-AbortRequested
+    if ($why) {
+        $script:AbortReason = $why
+        $script:RunAborted = $true
+        $script:NotRunCount = $totalSuites - $suiteIndex + 1
+        Write-Log "ABORT requested ($why) before [$suiteIndex/$totalSuites] $($testFile.BaseName); $script:NotRunCount suites not run"
+        break
+    }
+
+    # Resume: skip suites that already completed in the run being resumed
+    if ($script:CompletedSuites.ContainsKey($testFile.BaseName)) {
+        $prev = $script:CompletedSuites[$testFile.BaseName]
+        $result = @{
+            Name = $prev.Name; Status = $prev.Status
+            Passed = [int]$prev.Passed; Failed = [int]$prev.Failed
+            Duration = [double]$prev.Duration; Reason = "already completed (resume)"
+        }
+        [void]$results.Add($result)
+        Write-Host ("  [RESUME] {0,-45} {1} (from previous run)" -f $testFile.BaseName, $prev.Status) -ForegroundColor DarkCyan
+        switch ($result.Status) {
+            "PASS"    { $script:LivePass++ }
+            "FAIL"    { $script:LiveFail++ }
+            "TIMEOUT" { $script:LiveFail++ }
+            "ERROR"   { $script:LiveFail++ }
+            "SKIP"    { $script:LiveSkip++ }
+        }
+        $script:LivePassTests += $result.Passed
+        $script:LiveFailTests += $result.Failed
+        continue
+    }
+
     Write-Log "--- [$suiteIndex/$totalSuites] Queuing $($testFile.BaseName) ---"
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -343,12 +734,30 @@ foreach ($testFile in $allTests) {
     [void]$results.Add($result)
     [void]$script:SuiteDurations.Add($sw.Elapsed.TotalSeconds)
 
+    # An interrupted suite has NO verdict: it was killed part way through, so its
+    # pass/fail counts are meaningless. Deliberately skip the results.jsonl
+    # record here - that file is what -Resume replays, and writing an ABORT into
+    # it would make the resumed run treat a half-executed suite as done and
+    # silently skip it forever.
+    if ($result.Status -eq "ABORT") {
+        $script:RunAborted = $true
+        $script:NotRunCount = $totalSuites - $suiteIndex
+        Write-Log "ABORT during [$suiteIndex/$totalSuites] $($testFile.BaseName); $script:NotRunCount further suites not run"
+        break
+    }
+
+    # Crash-safe per-suite result record (also powers -Resume)
+    $rec = @{ Name=$result.Name; Status=$result.Status; Passed=$result.Passed;
+              Failed=$result.Failed; Duration=$result.Duration; ExitCode=$result.ExitCode } | ConvertTo-Json -Compress
+    [System.IO.File]::AppendAllText($script:ResultsJsonl, "$rec`r`n")
+
     # Update live counters
     switch ($result.Status) {
-        "PASS"  { $script:LivePass++ }
-        "FAIL"  { $script:LiveFail++ }
-        "ERROR" { $script:LiveFail++ }
-        "SKIP"  { $script:LiveSkip++ }
+        "PASS"    { $script:LivePass++ }
+        "FAIL"    { $script:LiveFail++ }
+        "TIMEOUT" { $script:LiveFail++ }
+        "ERROR"   { $script:LiveFail++ }
+        "SKIP"    { $script:LiveSkip++ }
     }
     $script:LivePassTests += $result.Passed
     $script:LiveFailTests += $result.Failed
@@ -357,7 +766,13 @@ foreach ($testFile in $allTests) {
 }
 
 # ── Final cleanup ──
+# Runs on the abort path too: this is what stops an interrupted run from leaving
+# live psmux servers behind.
 Clean-Server
+
+# The flag has been consumed. Clear it so the next run is not aborted on its
+# first poll by a stale file.
+Remove-Item $script:StopFile -Force -ErrorAction SilentlyContinue
 
 # ── Generate Report ──
 $endTime = Get-Date
@@ -366,13 +781,20 @@ $totalDuration = ($endTime - $startTime).TotalSeconds
 $bullet = [char]0x25CF  # ●
 
 Write-Host "`n"
+if ($script:RunAborted) {
+    Write-Host ("=" * 80) -ForegroundColor Yellow
+    Write-Host "  RUN INTERRUPTED ($script:AbortReason)" -ForegroundColor Yellow
+    Write-Host ("  {0} suites did not run. Results below cover only what completed." -f $script:NotRunCount) -ForegroundColor Yellow
+    Write-Host "  Resume where this left off:  tests\run_full_interactive.cmd -Resume" -ForegroundColor Yellow
+    Write-Host ("=" * 80) -ForegroundColor Yellow
+}
 Write-Host ("=" * 80) -ForegroundColor White
 Write-Host "  COMPREHENSIVE TEST REPORT" -ForegroundColor White
 Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor DarkGray
 Write-Host ("=" * 80) -ForegroundColor White
 
 $passed = @($results | Where-Object { $_.Status -eq "PASS" })
-$failed = @($results | Where-Object { $_.Status -eq "FAIL" -or $_.Status -eq "ERROR" })
+$failed = @($results | Where-Object { $_.Status -in @("FAIL","ERROR","TIMEOUT") })
 $skipped = @($results | Where-Object { $_.Status -eq "SKIP" })
 
 $totalTests = 0; $totalPassed = 0; $totalFailed = 0
@@ -408,10 +830,11 @@ foreach ($r in $results) {
         $catStats[$cat] = @{ Pass=0; Fail=0; Skip=0; Time=[double]0 }
     }
     switch ($r.Status) {
-        "PASS"  { $catStats[$cat].Pass++ }
-        "FAIL"  { $catStats[$cat].Fail++ }
-        "ERROR" { $catStats[$cat].Fail++ }
-        "SKIP"  { $catStats[$cat].Skip++ }
+        "PASS"    { $catStats[$cat].Pass++ }
+        "FAIL"    { $catStats[$cat].Fail++ }
+        "TIMEOUT" { $catStats[$cat].Fail++ }
+        "ERROR"   { $catStats[$cat].Fail++ }
+        "SKIP"    { $catStats[$cat].Skip++ }
     }
     $catStats[$cat].Time += $r.Duration
 }
@@ -429,7 +852,7 @@ if ($failed.Count -gt 0) {
     Write-Host ("  " + ("-" * 55)) -ForegroundColor Red
     Write-Host "  FAILED SUITES" -ForegroundColor Red
     foreach ($r in $failed) {
-        Write-Host ("    $bullet [FAIL] {0,-42} {1,3}P/{2}F  ({3}s)" -f $r.Name, $r.Passed, $r.Failed, $r.Duration) -ForegroundColor Red
+        Write-Host ("    $bullet [{0}] {1,-42} {2,3}P/{3}F  ({4}s)" -f $r.Status, $r.Name, $r.Passed, $r.Failed, $r.Duration) -ForegroundColor Red
     }
 }
 
@@ -469,8 +892,14 @@ foreach ($r in $perfResults) {
 
 Write-Host "`n"
 Write-Host ("=" * 80) -ForegroundColor White
-if ($totalFailed -gt 0) {
-    Write-Host "  RESULT: FAILURES DETECTED ($totalFailed tests failed)" -ForegroundColor Red
+# An interrupted run has no verdict. Reporting "ALL TESTS PASSED" here because
+# nothing had failed yet at the moment of the abort would be a lie in the one
+# place people grep for a result.
+if ($script:RunAborted) {
+    Write-Host "  RESULT: INTERRUPTED ($script:AbortReason) - $script:NotRunCount suites did not run" -ForegroundColor Yellow
+    Write-Log "=== FINAL RESULT: INTERRUPTED ($script:AbortReason) - $script:NotRunCount of $totalSuites suites did not run ==="
+} elseif ($totalFailed -gt 0 -or $failed.Count -gt 0) {
+    Write-Host "  RESULT: FAILURES DETECTED ($totalFailed tests failed, $($failed.Count) suites failed/timed out)" -ForegroundColor Red
     Write-Log "=== FINAL RESULT: FAILURES DETECTED ($totalFailed tests failed across $($failed.Count) suites) ==="
 } else {
     Write-Host "  RESULT: ALL TESTS PASSED ($totalPassed tests across $($passed.Count) suites)" -ForegroundColor Green
@@ -500,7 +929,10 @@ foreach ($r in $results) {
     [void]$summaryLines.Add($line)
 }
 [void]$summaryLines.Add("=" * 70)
-if ($totalFailed -gt 0) {
+if ($script:RunAborted) {
+    [void]$summaryLines.Add("RESULT: INTERRUPTED ($script:AbortReason) - $script:NotRunCount suites did not run")
+    [void]$summaryLines.Add("Resume with: tests\run_full_interactive.cmd -Resume")
+} elseif ($totalFailed -gt 0 -or $failed.Count -gt 0) {
     [void]$summaryLines.Add("RESULT: FAILURES DETECTED")
 } else {
     [void]$summaryLines.Add("RESULT: ALL TESTS PASSED")
@@ -514,7 +946,15 @@ Write-Log "=== Run finished ==="
 Write-Host ""
 Write-Host "  Logs saved to: $script:RunDir" -ForegroundColor Cyan
 
-if ($totalFailed -gt 0) {
+# 130 is the conventional "terminated by SIGINT" code. It is deliberately NOT 1:
+# an interrupted run has no verdict, and reporting it as a failure would make an
+# aborted sweep look like a red one in any wrapper that keys off the exit code.
+if ($script:RunAborted) {
+    Write-Host ""
+    Write-Host "  RUN INTERRUPTED - $script:NotRunCount suites did not run." -ForegroundColor Yellow
+    Write-Host "  Resume with: tests\run_full_interactive.cmd -Resume" -ForegroundColor Yellow
+    exit 130
+} elseif ($totalFailed -gt 0 -or $failed.Count -gt 0) {
     exit 1
 } else {
     exit 0

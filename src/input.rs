@@ -1,18 +1,17 @@
 use std::io::{self, Write};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::native_pty_system;
 use ratatui::prelude::*;
 
-use crate::types::{AppState, Mode, FocusDir, LayoutKind, DragState, Node, Pane};
-use crate::tree::{active_pane, active_pane_mut, compute_rects, compute_split_borders,
-    split_sizes_at, adjust_split_sizes, path_exists, resize_all_panes};
+use crate::types::{AppState, Mode, FocusDir, LayoutKind, Node, Pane};
+use crate::tree::{active_pane, active_pane_mut, compute_rects, path_exists};
 use crate::pane::{create_window, split_active};
 use crate::commands::{execute_action, execute_command_prompt, execute_command_string};
 use crate::config::normalize_key_for_binding;
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, switch_with_copy_save, move_copy_cursor,
-    scroll_copy_up, scroll_copy_down, scroll_pane_scrollback, paste_latest, yank_selection,
+    scroll_copy_up, scroll_copy_down, paste_latest, yank_selection,
     search_copy_mode, search_next, search_prev, scroll_to_top, scroll_to_bottom};
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
@@ -29,29 +28,86 @@ fn refresh_search_prompt(app: &mut AppState) {
     }
 }
 
-/// Write a mouse event to the child PTY using the encoding the child requested.
-fn write_mouse_event(master: &mut dyn std::io::Write, button: u8, col: u16, row: u16, press: bool, enc: vt100::MouseProtocolEncoding) {
-    match enc {
-        vt100::MouseProtocolEncoding::Sgr => {
-            let ch = if press { 'M' } else { 'm' };
-            let _ = write!(master, "\x1b[<{};{};{}{}", button, col, row, ch);
-            let _ = master.flush();
-        }
-        _ => {
-            // Default / Utf8 X10-style encoding: \x1b[M Cb Cx Cy (all + 32)
-            if press {
-                let cb = (button + 32) as u8;
-                let cx = ((col as u8).min(223)) + 32;
-                let cy = ((row as u8).min(223)) + 32;
-                let _ = master.write_all(&[0x1b, b'[', b'M', cb, cx, cy]);
-                let _ = master.flush();
-            }
-            // X10-style has no release encoding for individual buttons
-        }
-    }
+/// Look up a copy-mode key binding for `key`, honouring `mode-keys`.
+///
+/// The table name selection matches tmux: `mode-keys vi` uses `copy-mode-vi`,
+/// anything else uses `copy-mode`.
+pub fn copy_mode_binding(app: &AppState, key: (KeyCode, KeyModifiers)) -> Option<crate::types::Action> {
+    let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
+    let key_tuple = normalize_key_for_binding(key);
+    app.key_tables
+        .get(table_name)?
+        .iter()
+        .find(|b| b.key == key_tuple)
+        .map(|b| b.action.clone())
 }
 
+/// Run a resolved copy-mode binding.
+///
+/// Returns `true` when the binding was handled and the caller must NOT fall
+/// through to the built-in copy-mode key handling.
+///
+/// `send-keys -X <cmd>` is by far the most common action in these tables (it is
+/// how tmux-yank and every copy-mode rebind is written), and its implementation
+/// lives in the server loop's own `CtrlReq::SendKeysX` arm. Since this function
+/// is itself called from the loop, it queues the request rather than trying to
+/// re-enter that arm — see `AppState::control_tx`. Everything else goes through
+/// the normal action executor.
+pub fn run_copy_mode_binding(app: &mut AppState, action: &crate::types::Action) -> bool {
+    use crate::types::Action;
+    if let Action::Command(cmd) = action {
+        let parts = crate::commands::parse_command_line(cmd);
+        if matches!(parts.first().map(|s| s.as_str()), Some("send-keys") | Some("send"))
+            && parts.iter().any(|p| p == "-X")
+        {
+            // Mirror the TCP dispatcher's `has_x` arm exactly: tokens with
+            // their quote grouping already stripped, flags dropped, joined
+            // with spaces. The `SendKeysX` arm hands everything after the
+            // copy-mode command name to `pwsh -Command` verbatim, so a quote
+            // character that survives to this point turns the pipe command
+            // into a string literal pwsh evaluates and discards.
+            let mut rest: Vec<&str> = Vec::new();
+            let mut skip_operand = false;
+            for p in parts.iter().skip(1) {
+                if skip_operand { skip_operand = false; continue; }
+                match p.as_str() {
+                    "-t" | "-N" => { skip_operand = true; }
+                    s if s.starts_with('-') => {}
+                    s => rest.push(s),
+                }
+            }
+            if !rest.is_empty() {
+                if let Some(tx) = app.control_tx.as_ref() {
+                    let _ = tx.send(crate::types::CtrlReq::SendKeysX(rest.join(" ")));
+                    return true;
+                }
+            }
+            // No sender (or nothing after -X): fall through to the built-ins
+            // rather than silently swallowing the key.
+            return false;
+        }
+    }
+    crate::commands::execute_action(app, action).is_ok()
+}
+
+/// **This function has no production callers.** Unit tests still invoke it
+/// directly to exercise legacy prompt and key semantics.
+///
+/// It is the input dispatcher from the pre-server, single-process architecture.
+/// The live path is client -> TCP -> `CtrlReq::SendText` / `SendKey` ->
+/// `send_text_to_active` / `send_key_to_active`; none of it comes through here.
+///
+/// Key-table lookups and `switch-client -T <table>` state below are test-only
+/// unless the same behavior exists in the live handlers.
+///
 pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
+    // Fold NUL onto C-Space up front, for the same reason as the client input
+    // loop: the raw `is_prefix` tuple comparisons below must see C-Space when
+    // the terminal delivered a NUL (issue #504).
+    let key = {
+        let folded = crate::config::fold_nul_to_ctrl_space((key.code, key.modifiers));
+        KeyEvent { code: folded.0, modifiers: folded.1, ..key }
+    };
     match app.mode {
         Mode::Passthrough => {
             // Check switch-client -T key table first
@@ -702,14 +758,15 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             Ok(false)
         }
         Mode::CopyMode => {
-            // Check copy-mode key table for user bindings first (used by plugins like tmux-yank)
-            let table_name = if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" };
-            let key_tuple = normalize_key_for_binding((key.code, key.modifiers));
-            if let Some(bind) = app.key_tables.get(table_name)
-                .and_then(|t| t.iter().find(|b| b.key == key_tuple))
-                .cloned()
-            {
-                return execute_action(app, &bind.action);
+            // Check copy-mode key table for user bindings first (used by plugins like tmux-yank).
+            // Shares its lookup with the LIVE dispatch path (send_key_to_active
+            // / handle_copy_mode_char) rather than keeping a second copy — the
+            // second copy is what let the live path go years without consulting
+            // these tables at all.
+            if let Some(action) = copy_mode_binding(app, (key.code, key.modifiers)) {
+                if run_copy_mode_binding(app, &action) {
+                    return Ok(false);
+                }
             }
             // Handle register pending state (waiting for a-z after ")
             if app.copy_register_pending {
@@ -773,6 +830,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     exit_copy_mode(app);
                 }
+                // Ctrl+Up / Ctrl+Down scroll the viewport by one line and leave the
+                // cursor where it is (tmux key-bindings.c:635/:636 for copy-mode and
+                // :727/:728 for copy-mode-vi). These must come BEFORE the plain
+                // Up/Down arms or the modifier would be ignored (#596).
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => { for _ in 0..copy_repeat { scroll_copy_up(app, 1); } }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => { for _ in 0..copy_repeat { scroll_copy_down(app, 1); } }
                 KeyCode::Left | KeyCode::Char('h') => { for _ in 0..copy_repeat { move_copy_cursor(app, -1, 0); } }
                 KeyCode::Right | KeyCode::Char('l') => { for _ in 0..copy_repeat { move_copy_cursor(app, 1, 0); } }
                 KeyCode::Up | KeyCode::Char('k') => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, -1); } }
@@ -801,11 +864,28 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         .map(|p| (p.last_rows / 2) as usize).unwrap_or(10);
                     scroll_copy_down(app, half);
                 }
-                // Emacs copy-mode keys (must be before unqualified char matches)
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_down(app, 1); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { scroll_copy_up(app, 1); }
+                // Emacs copy-mode keys (must be before unqualified char matches).
+                // tmux binds C-p/C-n in the copy-mode table to cursor-up/cursor-down,
+                // NOT to scrolling (key-bindings.c:571 and :572). The viewport only
+                // moves when the cursor is already at the top or bottom edge, which
+                // is what move_copy_cursor already does. This arm used to call
+                // scroll_copy_up/down here while the live named-key path called
+                // move_copy_cursor, so the two dispatchers disagreed (#596).
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { move_copy_cursor(app, 0, 1); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { move_copy_cursor(app, 0, -1); }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_start(app); }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => { crate::copy_mode::move_to_line_end(app); }
+                // C-e and C-y are the one place the two tmux tables really disagree:
+                // copy-mode binds C-e to end-of-line and leaves C-y unbound, while
+                // copy-mode-vi binds C-e to scroll-down and C-y to scroll-up
+                // (key-bindings.c:645 and :653). vi mode follows the vi table; `$`
+                // is the vi way to reach the end of the line (#596).
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys == "emacs" { crate::copy_mode::move_to_line_end(app); }
+                    else { for _ in 0..copy_repeat { scroll_copy_down(app, 1); } }
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.mode_keys != "emacs" { for _ in 0..copy_repeat { scroll_copy_up(app, 1); } }
+                }
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => { scroll_copy_up(app, 10); }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_forward(app); }
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::move_word_backward(app); }
@@ -831,6 +911,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('W') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_forward_big(app); } }
                 KeyCode::Char('B') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_backward_big(app); } }
                 KeyCode::Char('E') => { for _ in 0..copy_repeat { crate::copy_mode::move_word_end_big(app); } }
+                // Shift+J / Shift+K scroll one line, cursor untouched. tmux binds
+                // these only in copy-mode-vi (key-bindings.c:680 and :681), so they
+                // stay vi only here too (#596).
+                KeyCode::Char('J') if app.mode_keys != "emacs" => { for _ in 0..copy_repeat { scroll_copy_down(app, 1); } }
+                KeyCode::Char('K') if app.mode_keys != "emacs" => { for _ in 0..copy_repeat { scroll_copy_up(app, 1); } }
                 // Screen position: H = top, M = middle, L = bottom
                 KeyCode::Char('H') => { crate::copy_mode::move_to_screen_top(app); }
                 KeyCode::Char('M') => { crate::copy_mode::move_to_screen_middle(app); }
@@ -847,6 +932,16 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 // Paragraph jump: { = previous paragraph, } = next paragraph
                 KeyCode::Char('{') => { for _ in 0..copy_repeat { crate::copy_mode::move_prev_paragraph(app); } }
                 KeyCode::Char('}') => { for _ in 0..copy_repeat { crate::copy_mode::move_next_paragraph(app); } }
+                // Centre the cursor line in the pane: z = scroll-middle
+                KeyCode::Char('z') => { crate::copy_mode::scroll_middle(app); }
+                // Mark, jump repeat and live-refresh toggle (#498).
+                // M-x must stay above the bare Char('x') matches, like the
+                // other ALT-qualified arms in this table.
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::jump_to_mark(app); }
+                KeyCode::Char('X') => { crate::copy_mode::set_mark(app); }
+                KeyCode::Char(';') => { for _ in 0..copy_repeat { crate::copy_mode::jump_again(app); } }
+                KeyCode::Char(',') => { for _ in 0..copy_repeat { crate::copy_mode::jump_reverse(app); } }
+                KeyCode::Char('r') => { crate::copy_mode::toggle_refresh(app); }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
@@ -1986,6 +2081,45 @@ fn for_each_receiving_pane<F: FnMut(&mut Pane)>(app: &mut AppState, mut f: F) {
     }
 }
 
+/// Stamp the INTERACTIVE-route signals for input that arrived from an attached
+/// client rather than from `send-keys`.
+///
+/// The signals are recorded where `forward_key_to_active` runs, but an attached
+/// client does not run it: the client forwards its keystrokes to the server as
+/// `send-text` / `send-key` control commands, and the server writes them to the
+/// pty. So `#{pane_last_special_key}`, `_ms` and `#{pane_last_text_input}` were
+/// empty for every real user of an attached session, in every path that can read
+/// them, including the status bar the user is looking at.
+///
+/// The injected route stays unstamped, as documented: `send-keys` arrives as
+/// CtrlReq::SendKeys (plural), a different message that does not call these.
+pub fn stamp_interactive_text(app: &mut AppState) {
+    let now = Instant::now();
+    for_each_receiving_pane(app, |p| p.last_text_input = Some(now));
+}
+
+/// Same, for a non-text key forwarded by an attached client. `name` is the
+/// canonical bind-key spelling the client already sends (Escape, Enter, Up, F9,
+/// C-c, M-a, ...). A single-character payload is ordinary typing, so it is
+/// recorded as text input to match `is_text_input_key`.
+pub fn stamp_interactive_key(app: &mut AppState, name: &str) {
+    if name.chars().count() == 1 {
+        stamp_interactive_text(app);
+        return;
+    }
+    // Report the CANONICAL bind-key spelling, not the client's wire spelling.
+    // The client sends "esc" and "enter"; the documented value of
+    // #{pane_last_special_key} is the bind-key name, "Escape" and "Enter", which
+    // is what the local route produces via format_key_binding. Round-tripping the
+    // wire name through the product's own key tables keeps the two routes
+    // identical instead of hand-maintaining a second spelling.
+    let canonical = crate::config::parse_key_name(name)
+        .map(|(code, mods)| crate::config::format_key_binding(&(code, mods)))
+        .unwrap_or_else(|| name.to_string());
+    let now = Instant::now();
+    for_each_receiving_pane(app, |p| p.last_special_key = Some((now, canonical.clone())));
+}
+
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
     // Record use of the INTERACTIVE input route as read-only route signals:
     // `#{pane_last_text_input}` (printable text) and, for every other key,
@@ -2111,13 +2245,23 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                     fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8, is_ctrl_c: bool) {
                         match node {
                             Node::Leaf(p) if !p.dead => {
+                                // Ctrl+C: consult the interrupt router BEFORE writing the
+                                // byte — when it decides "raw 0x03 only" it may strip
+                                // PROCESSED_INPUT from the pane console so conhost hands
+                                // the byte over as input instead of converting it into a
+                                // console-wide CTRL_C_EVENT (which aborts a booting WSL
+                                // launch, issue #579). Writing first loses that race.
+                                #[cfg(windows)]
+                                if is_ctrl_c {
+                                    if let Some(pid) = p.child_pid {
+                                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                    }
+                                }
                                 let _ = p.writer.write_all(&[raw]);
                                 let _ = p.writer.flush();
                                 #[cfg(windows)]
-                                if let Some(pid) = p.child_pid {
-                                    if is_ctrl_c {
-                                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
-                                    } else {
+                                if !is_ctrl_c {
+                                    if let Some(pid) = p.child_pid {
                                         crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
                                     }
                                 }
@@ -2135,13 +2279,19 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                     let win = &mut app.windows[app.active_idx];
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                         if !active.dead {
+                            // Same ordering as the sync arm above: router (and its
+                            // possible PROCESSED_INPUT strip) before the byte (#579).
+                            #[cfg(windows)]
+                            if is_ctrl_c {
+                                if let Some(pid) = active.child_pid {
+                                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                }
+                            }
                             let _ = active.writer.write_all(&[ctrl_char]);
                             let _ = active.writer.flush();
                             #[cfg(windows)]
-                            if let Some(pid) = active.child_pid {
-                                if is_ctrl_c {
-                                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
-                                } else {
+                            if !is_ctrl_c {
+                                if let Some(pid) = active.child_pid {
                                     crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
                                 }
                             }
@@ -2181,548 +2331,6 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
 
             }
         }
-    }
-    Ok(())
-}
-
-fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
-    // Convert global terminal coordinates to 1-based pane-local coordinates.
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let inner_w = area.width.saturating_sub(2).max(1);
-    let inner_h = area.height.saturating_sub(2).max(1);
-
-    let col = x
-        .saturating_sub(inner_x)
-        .min(inner_w.saturating_sub(1))
-        .saturating_add(1);
-    let row = y
-        .saturating_sub(inner_y)
-        .min(inner_h.saturating_sub(1))
-        .saturating_add(1);
-    (col, row)
-}
-
-/// Paste the system clipboard content into the active pane.
-/// This is the Windows Terminal right-click-to-paste behavior.
-fn paste_clipboard_to_active(app: &mut AppState) -> io::Result<()> {
-    if let Some(text) = crate::clipboard::read_from_system_clipboard() {
-        if !text.is_empty() {
-            send_paste_to_active(app, &text)?;
-        }
-    }
-    Ok(())
-}
-
-/// Forward a mouse event to the child pane.
-///
-/// If the child has mouse protocol enabled (TUI app running), write VT mouse
-/// sequences directly to the ConPTY input pipe (pane.writer).  Modern TUI
-/// apps (crossterm, etc.) use VT input mode (ReadFile + ENABLE_VIRTUAL_TERMINAL_INPUT)
-/// and receive these directly through stdin.  If VT input mode is off, ConPTY
-/// parses the VT and converts to MOUSE_EVENT records for ReadConsoleInputW apps.
-///
-/// When mouse protocol is NOT enabled (shell prompt), use Win32 MOUSE_EVENT
-/// injection as a harmless fallback (most programs ignore it).
-fn forward_mouse_to_pane(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16, button_state: u32, event_flags: u32) {
-    forward_mouse_to_pane_ex(pane, area, abs_x, abs_y, button_state, event_flags, 0xff, false);
-}
-
-/// Forward a mouse event to a child pane by writing SGR mouse sequences
-/// to the ConPTY input pipe — the same mechanism Windows Terminal uses.
-///
-/// ConPTY/conhost automatically translates SGR mouse sequences into
-/// MOUSE_EVENT records for crossterm/ratatui apps (ReadConsoleInputW),
-/// and passes VT through for nvim/vim apps.  (fixes #60)
-fn forward_mouse_to_pane_ex(pane: &mut Pane, area: Rect, abs_x: u16, abs_y: u16,
-                             button_state: u32, event_flags: u32,
-                             vt_button: u8, press: bool) {
-    let col = abs_x as i16 - area.x as i16;
-    let row = abs_y as i16 - area.y as i16;
-    crate::window_ops::inject_mouse_combined(
-        pane, col, row, vt_button, press, button_state, event_flags, "client");
-}
-
-pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io::Result<()> {
-    use crossterm::event::{MouseEventKind, MouseButton};
-
-    // Track last mouse position for #{mouse_x}, #{mouse_y} format variables
-    app.last_mouse_x = me.column;
-    app.last_mouse_y = me.row;
-
-    // --- MenuMode: handle mouse clicks on menu items ---
-    if let Mode::MenuMode { ref mut menu } = app.mode {
-        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
-            // Recompute menu_area the same way as the renderer (app.rs).
-            let full_area = Rect {
-                x: 0, y: 0,
-                width: window_area.width,
-                height: window_area.height + app.status_lines as u16,
-            };
-            let item_count = menu.items.len();
-            let height = (item_count as u16 + 2).min(20);
-            let width = menu.items.iter().map(|i| i.name.len()).max().unwrap_or(10).max(menu.title.len()) as u16 + 8;
-            let menu_area = if let (Some(x), Some(y)) = (menu.x, menu.y) {
-                let x = if x < 0 { (full_area.width as i16 + x).max(0) as u16 } else { x as u16 };
-                let y = if y < 0 { (full_area.height as i16 + y).max(0) as u16 } else { y as u16 };
-                Rect { x: x.min(full_area.width.saturating_sub(width)), y: y.min(full_area.height.saturating_sub(height)), width, height }
-            } else {
-                crate::rendering::centered_rect((width * 100 / full_area.width.max(1)).max(30), height, full_area)
-            };
-            let pos = ratatui::layout::Position { x: me.column, y: me.row };
-            if menu_area.contains(pos) {
-                // Block border is 1 row top
-                let inner_y = me.row.saturating_sub(menu_area.y + 1);
-                let idx = inner_y as usize;
-                if idx < menu.items.len() && !menu.items[idx].is_separator && !menu.items[idx].command.is_empty() {
-                    let cmd = menu.items[idx].command.clone();
-                    app.mode = Mode::Passthrough;
-                    let _ = execute_command_string(app, &cmd);
-                } else {
-                    app.mode = Mode::Passthrough;
-                }
-            } else {
-                app.mode = Mode::Passthrough;
-            }
-            return Ok(());
-        }
-        if matches!(me.kind, MouseEventKind::ScrollUp) {
-            if menu.selected > 0 {
-                menu.selected -= 1;
-                while menu.selected > 0 && menu.items.get(menu.selected).map(|i| i.is_separator).unwrap_or(false) {
-                    menu.selected -= 1;
-                }
-            }
-            return Ok(());
-        }
-        if matches!(me.kind, MouseEventKind::ScrollDown) {
-            if menu.selected + 1 < menu.items.len() {
-                menu.selected += 1;
-                while menu.selected + 1 < menu.items.len() && menu.items.get(menu.selected).map(|i| i.is_separator).unwrap_or(false) {
-                    menu.selected += 1;
-                }
-            }
-            return Ok(());
-        }
-        return Ok(());
-    }
-
-    // Customize mode: absorb all mouse events
-    if matches!(app.mode, Mode::CustomizeMode { .. }) {
-        return Ok(());
-    }
-
-    // --- Tab click: check if click is on the status bar row ---
-    let status_row = window_area.y + window_area.height; // status bar is 1 row below window area
-    if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) && me.row == status_row {
-        for &(win_idx, x_start, x_end) in app.tab_positions.iter() {
-            if me.column >= x_start && me.column < x_end {
-                if win_idx < app.windows.len() {
-                    switch_with_copy_save(app, |app| {
-                        app.last_window_idx = app.active_idx;
-                        app.active_idx = win_idx;
-                    });
-                }
-                return Ok(());
-            }
-        }
-        // Click was on status bar but not on a tab — ignore
-        return Ok(());
-    }
-
-    // If a left-click lands on a different pane while in copy mode,
-    // exit copy mode entirely and switch to the clicked pane (tmux parity #62).
-    if matches!(me.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left))
-        && matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. })
-    {
-        let win = &app.windows[app.active_idx];
-        let mut rects_check: Vec<(Vec<usize>, Rect)> = Vec::new();
-        compute_rects(&win.root, window_area, &mut rects_check);
-        let mut clicked_new_path: Option<Vec<usize>> = None;
-        for (path, area) in rects_check.iter() {
-            if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
-                if *path != win.active_path {
-                    clicked_new_path = Some(path.clone());
-                }
-                break;
-            }
-        }
-        if let Some(np) = clicked_new_path {
-            // Exit copy mode cleanly (resets scroll, clears selection)
-            exit_copy_mode(app);
-            // Switch active pane path
-            {
-                let win = &mut app.windows[app.active_idx];
-                app.last_pane_path = win.active_path.clone();
-                win.active_path = np;
-            }
-        }
-    }
-
-    let win = &mut app.windows[app.active_idx];
-    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-    compute_rects(&win.root, window_area, &mut rects);
-    let mut borders: Vec<(Vec<usize>, LayoutKind, usize, u16, u16)> = Vec::new();
-    compute_split_borders(&win.root, window_area, &mut borders);
-    let mut active_area = rects
-        .iter()
-        .find(|(path, _)| *path == win.active_path)
-        .map(|(_, area)| *area);
-
-    // Helper: convert absolute screen coordinates to 0-based pane-local
-    // (row, col) for copy-mode cursor positioning.  Mirrors
-    // `copy_cell_for_area` in window_ops.rs.
-    fn copy_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
-        let col = abs_x.saturating_sub(area.x).min(area.width.saturating_sub(1));
-        let row = abs_y.saturating_sub(area.y).min(area.height.saturating_sub(1));
-        (row, col)
-    }
-
-    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
-
-    match me.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            // ── Copy-mode: left click positions cursor, clears selection ──
-            // tmux parity: single click moves cursor without starting a selection.
-            // Selection only starts when dragging (see Drag handler below).
-            if in_copy {
-                app.copy_anchor = None;
-                if let Some(area) = active_area {
-                    let (row, col) = copy_cell(area, me.column, me.row);
-                    app.copy_pos = Some((row, col));
-                    app.copy_mouse_down_cell = Some((row, col));
-                }
-                return Ok(());
-            }
-
-            // Check if click is on a split border (for dragging)
-            let mut on_border = false;
-            let tol = 1u16;
-            for (path, kind, idx, pos, total_px) in borders.iter() {
-                match kind {
-                    LayoutKind::Horizontal => {
-                        if me.column >= pos.saturating_sub(tol) && me.column <= pos + tol {
-                            if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: *pos, start_y: me.row, left_initial: left, _right_initial: right, total_pixels: *total_px });
-                            }
-                            on_border = true;
-                            break;
-                        }
-                    }
-                    LayoutKind::Vertical => {
-                        if me.row >= pos.saturating_sub(tol) && me.row <= pos + tol {
-                            if let Some((left,right)) = split_sizes_at(&win.root, path.clone(), *idx) {
-                                app.drag = Some(DragState { split_path: path.clone(), kind: *kind, index: *idx, start_x: me.column, start_y: *pos, left_initial: left, _right_initial: right, total_pixels: *total_px });
-                            }
-                            on_border = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Switch pane focus if clicking inside a pane
-            for (path, area) in rects.iter() {
-                if area.contains(ratatui::layout::Position { x: me.column, y: me.row }) {
-                    win.active_path = path.clone();
-                    // Update MRU for clicked pane
-                    if let Some(pid) = crate::tree::get_active_pane_id(&win.root, path) {
-                        crate::tree::touch_mru(&mut win.pane_mru, pid);
-                    }
-                    active_area = Some(*area);
-                }
-            }
-
-            // Forward left-click only when active pane wants mouse input.
-            if !on_border {
-                if let Some(area) = active_area {
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if crate::window_ops::pane_wants_mouse(active) {
-                            forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED, 0,
-                                0, true); // SGR button 0 = left, press
-                        }
-                    }
-                }
-            }
-
-        }
-        MouseEventKind::Down(MouseButton::Right) => {
-            // Windows Terminal behaviour: right-click = paste clipboard.
-            // When the child has mouse tracking enabled (TUI app), forward
-            // the right-click to the app instead.
-            if in_copy {
-                // In copy mode: paste clipboard (like Windows Terminal)
-                let _ = paste_clipboard_to_active(app);
-                return Ok(());
-            }
-            // Forward right-click only when active pane wants mouse input.
-            let wants_mouse = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
-            if wants_mouse {
-                if let Some(area) = active_area {
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if crate::window_ops::pane_wants_mouse(active) {
-                            forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                                crate::platform::mouse_inject::RIGHTMOST_BUTTON_PRESSED, 0,
-                                2, true); // SGR button 2 = right, press
-                        }
-                    }
-                }
-            } else {
-                // Shell prompt — paste clipboard (Windows Terminal parity)
-                let _ = paste_clipboard_to_active(app);
-                return Ok(());
-            }
-        }
-        MouseEventKind::Down(MouseButton::Middle) => {
-            // In copy mode, suppress — don't forward to child
-            if in_copy { return Ok(()); }
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_mouse(active) {
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                            crate::platform::mouse_inject::FROM_LEFT_2ND_BUTTON_PRESSED, 0,
-                            1, true); // SGR button 1 = middle, press
-                    }
-                }
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            // ── Copy-mode: left release finalises position, auto-yank if selection ──
-            if in_copy {
-                if let Some(area) = active_area {
-                    let (row, col) = copy_cell(area, me.column, me.row);
-                    app.copy_pos = Some((row, col));
-                }
-                // If mouse-up is within 1 cell of mouse-down, it was a plain click
-                // (any anchor set by jittery drag events is spurious). Clear it. (#199)
-                let click_origin = app.copy_mouse_down_cell.take();
-                if let (Some((dr, dc)), Some((ur, uc))) = (click_origin, app.copy_pos) {
-                    if (dr as i32 - ur as i32).unsigned_abs() <= 1
-                        && (dc as i32 - uc as i32).unsigned_abs() <= 1
-                    {
-                        app.copy_anchor = None;
-                        app.copy_pos = Some((dr, dc)); // snap to original click position
-                        return Ok(());
-                    }
-                }
-                // Auto-yank if there is a selection (anchor != pos) — tmux parity
-                if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-                    if a != p {
-                        let _ = yank_selection(app);
-                        // tmux parity #62: auto-exit copy mode after mouse yank
-                        exit_copy_mode(app);
-                    } else {
-                        // Click without real drag: clear stale anchor so scrolling
-                        // does not produce a phantom selection (#199).
-                        app.copy_anchor = None;
-                    }
-                }
-                return Ok(());
-            }
-
-            let was_dragging = app.drag.is_some();
-            app.drag = None;
-            if was_dragging {
-                resize_all_panes(app);
-            } else if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_mouse(active) {
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
-                            0, false); // SGR button 0 = left, release
-                    }
-                }
-            }
-        }
-        MouseEventKind::Up(MouseButton::Right) => {
-            if in_copy { return Ok(()); }
-            // Forward right-release only when active pane wants mouse input.
-            let wants_mouse = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
-            if wants_mouse {
-                if let Some(area) = active_area {
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if crate::window_ops::pane_wants_mouse(active) {
-                            forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
-                                2, false); // SGR button 2 = right, release
-                        }
-                    }
-                }
-            }
-        }
-        MouseEventKind::Up(MouseButton::Middle) => {
-            if in_copy { return Ok(()); }
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_mouse(active) {
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row, 0, 0,
-                            1, false); // SGR button 1 = middle, release
-                    }
-                }
-            }
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            // ── Copy-mode: drag extends the selection ──
-            if in_copy {
-                if let Some(area) = active_area {
-                    let (row, col) = copy_cell(area, me.column, me.row);
-                    if app.copy_anchor.is_none() {
-                        // Only start a selection when the mouse actually moves
-                        // to a different cell than the click position.  This
-                        // prevents micro-drags (sub-cell jitter) from setting a
-                        // stale anchor that produces phantom selections (#199).
-                        if app.copy_pos == Some((row, col)) {
-                            return Ok(());
-                        }
-                        app.copy_anchor = Some(app.copy_pos.unwrap_or((row, col)));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_selection_mode = crate::types::SelectionMode::Char;
-                    }
-                    app.copy_pos = Some((row, col));
-                    // tmux parity #62: auto-scroll when dragging at pane edges
-                    if me.row <= area.y {
-                        scroll_copy_up(app, 1);
-                    } else if me.row >= area.y + area.height.saturating_sub(1) {
-                        scroll_copy_down(app, 1);
-                    }
-                }
-                return Ok(());
-            }
-
-            if let Some(d) = &app.drag {
-                adjust_split_sizes(&mut win.root, d, me.column, me.row);
-            } else {
-                // tmux parity #62: drag from normal mode enters copy mode
-                // and starts selection (when child doesn't want mouse).
-                let wants_mouse = {
-                    let win2 = &app.windows[app.active_idx];
-                    active_pane(&win2.root, &win2.active_path)
-                        .map_or(false, |p| crate::window_ops::pane_wants_hover(p))
-                };
-                if wants_mouse {
-                    if let Some(area) = active_area {
-                        let win2 = &mut app.windows[app.active_idx];
-                        if let Some(active) = active_pane_mut(&mut win2.root, &win2.active_path) {
-                            forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                                crate::platform::mouse_inject::FROM_LEFT_1ST_BUTTON_PRESSED,
-                                crate::platform::mouse_inject::MOUSE_MOVED,
-                                32, true); // SGR button 32 = left-drag
-                        }
-                    }
-                } else {
-                    // Shell prompt: enter copy mode, start selection
-                    enter_copy_mode(app);
-                    if let Some(area) = active_area {
-                        let (row, col) = copy_cell(area, me.column, me.row);
-                        app.copy_anchor = Some((row, col));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_selection_mode = crate::types::SelectionMode::Char;
-                        app.copy_pos = Some((row, col));
-                    }
-                }
-            }
-        }
-        MouseEventKind::Moved => {
-            // Forward bare mouse motion (hover) only when the child has
-            // EXPLICITLY enabled mouse motion tracking (DECSET 1002/1003).
-            // Do NOT use the permissive pane_wants_mouse() heuristic here:
-            // sending unsolicited SGR motion sequences to alt-screen apps
-            // that haven't enabled mouse tracking (nvim without mouse=a,
-            // any TUI spawning a child editor) corrupts their input.
-            // (fixes #296: Claude Code → nvim hangs due to hover flooding)
-            if app.last_hover_pos == Some((me.column, me.row)) {
-                return Ok(());
-            }
-            app.last_hover_pos = Some((me.column, me.row));
-
-            if let Some(area) = active_area {
-                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_hover(active) {
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                            0, crate::platform::mouse_inject::MOUSE_MOVED,
-                            35, true);
-                    }
-                }
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            // Ignore scroll in popup mode — don't enter copy-mode (#110)
-            if matches!(app.mode, Mode::PopupMode { .. }) {
-                return Ok(());
-            }
-            if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-                scroll_copy_up(app, 3);
-                return Ok(());
-            }
-            if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x: me.column, y: me.row })) {
-                win.active_path = path.clone();
-                active_area = Some(*area);
-            }
-            // Forward scroll to child if pane wants mouse events (real TUI app
-            // like nvim/htop).  If not (shell prompt), auto-enter copy mode.
-            //
-            // Uses pane_wants_mouse() which includes heuristic fallback for
-            // older Windows 10 builds where ConPTY strips DECSET 1049h.
-            // (fixes #285)
-            let child_in_alt = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
-            if child_in_alt {
-                if let Some(area) = active_area {
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let wheel_delta: i16 = 120;
-                        let button_state = ((wheel_delta as i32) << 16) as u32;
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                            button_state, crate::platform::mouse_inject::MOUSE_WHEELED,
-                            64, true); // SGR button 64 = scroll-up
-                    }
-                }
-            } else if app.scroll_enter_copy_mode {
-                // Shell prompt — auto-enter copy mode and scroll (tmux parity)
-                enter_copy_mode(app);
-                scroll_copy_up(app, 3);
-                return Ok(());
-            } else {
-                scroll_pane_scrollback(app, 3, true);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            // Ignore scroll in popup mode — don't enter copy-mode (#110)
-            if matches!(app.mode, Mode::PopupMode { .. }) {
-                return Ok(());
-            }
-            if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
-                scroll_copy_down(app, 3);
-                // Auto-exit copy mode when scrolled back to live output
-                // (only when no active selection, to avoid losing a selection in progress)
-                if app.copy_scroll_offset == 0 && app.copy_anchor.is_none() {
-                    exit_copy_mode(app);
-                }
-                return Ok(());
-            }
-            if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x: me.column, y: me.row })) {
-                win.active_path = path.clone();
-                active_area = Some(*area);
-            }
-            // Forward scroll-down to child only if pane wants mouse events.
-            // Uses pane_wants_mouse() with heuristic fallback. (fixes #285)
-            let child_in_alt = active_pane(&win.root, &win.active_path)
-                .map_or(false, |p| crate::window_ops::pane_wants_mouse(p));
-            if child_in_alt {
-                if let Some(area) = active_area {
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        let wheel_delta: i16 = -120;
-                        let button_state = ((wheel_delta as i32) << 16) as u32;
-                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
-                            button_state, crate::platform::mouse_inject::MOUSE_WHEELED,
-                            65, true); // SGR button 65 = scroll-down
-                    }
-                }
-            } else if !app.scroll_enter_copy_mode {
-                scroll_pane_scrollback(app, 3, false);
-            }
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -2891,6 +2499,47 @@ pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Write raw bytes (decoded from `send-keys -H`) to whichever pane would
+/// receive input.
+///
+/// Valid UTF-8 is handed to `send_text_to_active` so every existing mode
+/// (copy, popup, confirm, menu, synchronized input) keeps its semantics.  A
+/// byte run that is not valid UTF-8 bypasses that and goes straight to the
+/// pane: callers that chunk their input can split a multi-byte character
+/// across two `send-keys` calls, and a lossy decode would corrupt it.
+pub fn send_bytes_to_active(app: &mut AppState, bytes: &[u8]) -> io::Result<()> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return send_text_to_active(app, text);
+    }
+    {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(fi) = win.floating_focus {
+            if let Some(fp) = win.floating.get_mut(fi) {
+                let _ = fp.pane.writer.write_all(bytes);
+                let _ = fp.pane.writer.flush();
+                return Ok(());
+            }
+        }
+    }
+    if app.sync_input {
+        let win = &mut app.windows[app.active_idx];
+        fn write_all_panes(node: &mut Node, data: &[u8]) {
+            match node {
+                Node::Leaf(p) => { let _ = p.writer.write_all(data); let _ = p.writer.flush(); }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
+            }
+        }
+        write_all_panes(&mut win.root, bytes);
+    } else {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            let _ = p.writer.write_all(bytes);
+            let _ = p.writer.flush();
+        }
+    }
+    Ok(())
+}
+
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     // In clock mode, any input exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {
@@ -3014,6 +2663,16 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
 
 /// Dispatch a single character as a copy-mode action.
 fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
+    // User bindings from `bind -T copy-mode-vi` / `-T copy-mode` win over the
+    // built-ins below.
+    //
+    // The live client/server path reaches copy mode here rather than through
+    // `handle_key`, so check the table before pending state and built-ins.
+    if let Some(action) = copy_mode_binding(app, (KeyCode::Char(c), KeyModifiers::NONE)) {
+        if run_copy_mode_binding(app, &action) {
+            return Ok(());
+        }
+    }
     // Handle text-object pending state (waiting for w/W after a/i)
     if let Some(prefix) = app.copy_text_object_pending.take() {
         match (prefix, c) {
@@ -3076,9 +2735,27 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         'W' => { for _ in 0..n { crate::copy_mode::move_word_forward_big(app); } }
         'B' => { for _ in 0..n { crate::copy_mode::move_word_backward_big(app); } }
         'E' => { for _ in 0..n { crate::copy_mode::move_word_end_big(app); } }
+        // Shift+J / Shift+K scroll one line and leave the cursor alone. tmux binds
+        // them only in copy-mode-vi (key-bindings.c:680 and :681), so they are vi
+        // only here too. This is the path a real printable keypress takes on
+        // Windows, so without an arm here the keys were dead (#596).
+        'J' if app.mode_keys != "emacs" => { for _ in 0..n { scroll_copy_down(app, 1); } }
+        'K' if app.mode_keys != "emacs" => { for _ in 0..n { scroll_copy_up(app, 1); } }
         'H' => { crate::copy_mode::move_to_screen_top(app); }
         'M' => { crate::copy_mode::move_to_screen_middle(app); }
         'L' => { crate::copy_mode::move_to_screen_bottom(app); }
+        // Paragraph jumps and bracket matching (#498). These reached the
+        // KeyCode table but not this one, and this is the path the client
+        // actually uses for plain printable keys, so they were dead keys.
+        '{' => { for _ in 0..n { crate::copy_mode::move_prev_paragraph(app); } }
+        '}' => { for _ in 0..n { crate::copy_mode::move_next_paragraph(app); } }
+        '%' => { crate::copy_mode::move_matching_bracket(app); }
+        'z' => { crate::copy_mode::scroll_middle(app); }
+        // Mark, jump repeat and live-refresh toggle (#498)
+        'X' => { crate::copy_mode::set_mark(app); }
+        ';' => { for _ in 0..n { crate::copy_mode::jump_again(app); } }
+        ',' => { for _ in 0..n { crate::copy_mode::jump_reverse(app); } }
+        'r' => { crate::copy_mode::toggle_refresh(app); }
         // Preserve the count so e.g. "3fx" finds the 3rd 'x' (consumed above).
         'f' => { app.copy_find_char_pending = Some(0); app.copy_count = Some(n); }
         'F' => { app.copy_find_char_pending = Some(1); app.copy_count = Some(n); }
@@ -3262,6 +2939,18 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
 
     // --- Copy mode: full vi-style key table ---
     if matches!(app.mode, Mode::CopyMode) {
+        // User `bind -T copy-mode-vi` / `-T copy-mode` bindings win over the
+        // built-in defaults below. See handle_copy_mode_char for why this was
+        // missing. `k` is a canonical key NAME here ("escape", "C-v", ...), so
+        // it goes back through the same parser the config used to produce the
+        // table's keys — that keeps one definition of what a key name means.
+        if let Some((code, mods)) = crate::config::parse_key_string(k) {
+            if let Some(action) = copy_mode_binding(app, (code, mods)) {
+                if run_copy_mode_binding(app, &action) {
+                    return Ok(());
+                }
+            }
+        }
         match k {
             "esc" | "q" => {
                 exit_copy_mode(app);
@@ -3298,15 +2987,39 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 if app.mode_keys == "emacs" { move_copy_cursor(app, 1, 0); }
                 else { scroll_copy_down(app, 10); }
             }
+            // tmux copy-mode C-p/C-n are cursor motions (key-bindings.c:571/:572),
+            // and copy-mode-vi does not bind them at all. psmux keeps them active in
+            // both mode-keys tables, but as CURSOR motion, matching tmux (#596).
             "C-n" | "c-n" => { move_copy_cursor(app, 0, 1); }
             "C-p" | "c-p" => { move_copy_cursor(app, 0, -1); }
+            // Ctrl+Up / Ctrl+Down scroll the viewport one line without moving the
+            // cursor. tmux binds these in BOTH copy-mode (key-bindings.c:635/:636)
+            // and copy-mode-vi (:727/:728); psmux had no arm at all, so a real
+            // Ctrl+Arrow in copy mode was silently swallowed (#596).
+            "C-Up" | "c-up" | "C-up" => { scroll_copy_up(app, 1); }
+            "C-Down" | "c-down" | "C-down" => { scroll_copy_down(app, 1); }
             "C-a" | "c-a" => { crate::copy_mode::move_to_line_start(app); }
-            "C-e" | "c-e" => { crate::copy_mode::move_to_line_end(app); }
+            // The one place the two tmux copy tables really disagree: copy-mode
+            // binds C-e to end-of-line and leaves C-y unbound, copy-mode-vi binds
+            // C-e to scroll-down and C-y to scroll-up (key-bindings.c:645 and
+            // :653). vi mode follows the vi table, and `$` is the vi way to reach
+            // the end of a line (#596).
+            "C-e" | "c-e" => {
+                if app.mode_keys == "emacs" { crate::copy_mode::move_to_line_end(app); }
+                else { scroll_copy_down(app, 1); }
+            }
+            "C-y" | "c-y" => {
+                if app.mode_keys != "emacs" { scroll_copy_up(app, 1); }
+            }
             "C-v" | "c-v" => { scroll_copy_down(app, 10); }
             "M-v" | "m-v" => { scroll_copy_up(app, 10); }
             "M-f" | "m-f" => { crate::copy_mode::move_word_forward(app); }
             "M-b" | "m-b" => { crate::copy_mode::move_word_backward(app); }
             "M-w" | "m-w" => { yank_selection(app)?; exit_copy_mode(app); }
+            // jump-to-mark (#498). Alt keys reach copy mode as named keys via
+            // `send-key M-x`, not through the char table, so this is the arm
+            // that actually runs when the user presses M-x.
+            "M-x" | "m-x" => { crate::copy_mode::jump_to_mark(app); }
             "C-s" | "c-s" => { app.mode = Mode::CopySearch { input: String::new(), forward: true }; refresh_search_prompt(app); }
             "C-r" | "c-r" => { app.mode = Mode::CopySearch { input: String::new(), forward: false }; refresh_search_prompt(app); }
             "C-c" | "c-c" => {
@@ -3472,16 +3185,21 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 // arrived as <C-w><C-w>, turning neovim's window command into a
                 // no-op and making `<C-w>s` behave like a bare `s`; PSReadLine's
                 // Ctrl+W likewise deleted two words instead of one).
-                let _ = p.writer.write_all(&[ctrl_char]);
-                let _ = p.writer.flush();
-                // Ctrl+C is the sole exception: a CTRL_C_EVENT must be raised so
-                // the child's console handler runs (SIGINT parity, issue #338).
+                // Ctrl+C is the sole exception: the interrupt router runs so the
+                // child's console handler can be signalled (SIGINT parity, #338)
+                // — BEFORE the byte, because when the router decides "raw 0x03
+                // only" it may strip PROCESSED_INPUT from the pane console so
+                // conhost delivers the byte as input instead of converting it
+                // into a console-wide CTRL_C_EVENT that aborts a booting WSL
+                // launch (#579). Writing first loses that race.
                 #[cfg(windows)]
                 if c.eq_ignore_ascii_case(&'c') {
                     if let Some(pid) = p.child_pid {
                         crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                     }
                 }
+                let _ = p.writer.write_all(&[ctrl_char]);
+                let _ = p.writer.flush();
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('a');
@@ -3624,3 +3342,11 @@ mod tests_pane_last_special_key;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue413_copy_count.rs"]
 mod tests_issue413_copy_count;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_copy_mode_key_tables.rs"]
+mod tests_copy_mode_key_tables;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue596_copy_scroll_keys.rs"]
+mod tests_issue596_copy_scroll_keys;

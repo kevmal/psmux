@@ -238,25 +238,34 @@ pub fn compute_rects(node: &Node, area: Rect, out: &mut Vec<(Vec<usize>, Rect)>)
     rec(node, area, &mut path, out);
 }
 
-/// Resize all panes in the current window to match their computed areas
-pub fn resize_all_panes(app: &mut AppState) {
-    if app.windows.is_empty() { return; }
-    let area = app.last_window_area;
-    if area.width == 0 || area.height == 0 { return; }
+/// Resize all panes in one window to match the supplied window area.
+pub fn resize_window_panes(app: &mut AppState, window_index: usize, area: Rect) {
+    if window_index >= app.windows.len() || area.width == 0 || area.height == 0 { return; }
     // Reserve 1 row per leaf pane when pane-border-status is enabled (#288)
     let border_status_rows: u16 = match app.user_options.get("pane-border-status").map(|s| s.as_str()) {
         Some("top") | Some("bottom") => 1,
         _ => 0,
     };
     
-    fn resize_node(node: &mut Node, rects: &[(Vec<usize>, Rect)], path: &mut Vec<usize>, border_rows: u16) {
+    fn resize_node(node: &mut Node, rects: &[(Vec<usize>, Rect)], path: &mut Vec<usize>, border_rows: u16, zoom_active_path: Option<&Vec<usize>>) {
         match node {
             Node::Leaf(pane) => {
+                // Skip resize for panes hidden by zoom. `split_with_gaps`'s
+                // minimum-1-cell steal (added for window-preview thumbnails)
+                // means a hidden sibling's computed rect is NOT reliably 0x0
+                // any more — it can be stolen up to 1-2 cells — so checking
+                // `rect.width == 0 || rect.height == 0` alone no longer
+                // detects every zoomed-out pane. Compare against the actual
+                // zoom invariant instead: any leaf whose path isn't exactly
+                // the zoomed window's active_path is on a hidden branch
+                // (fixes #44, #45 — resizing a hidden pane corrupts its
+                // terminal buffer: lines get reflowed to 1-2 column width
+                // and the cursor position is lost).
+                if let Some(ap) = zoom_active_path {
+                    if path != ap { return; }
+                }
                 if let Some((_, rect)) = rects.iter().find(|(p, _)| p == path) {
-                    // Skip resize for panes hidden by zoom (size 0 in either
-                    // dimension).  Resizing a hidden pane to 1x1 corrupts its
-                    // terminal buffer — lines get reflowed to 1-column width
-                    // and the cursor position is lost.  (fixes #44, #45)
+                    // Fallback/legacy guard: also skip on a literal 0x0 rect.
                     if rect.width == 0 || rect.height == 0 {
                         return;
                     }
@@ -283,35 +292,42 @@ pub fn resize_all_panes(app: &mut AppState) {
             Node::Split { children, .. } => {
                 for (i, child) in children.iter_mut().enumerate() {
                     path.push(i);
-                    resize_node(child, rects, path, border_rows);
+                    resize_node(child, rects, path, border_rows, zoom_active_path);
                     path.pop();
                 }
             }
         }
     }
     
-    // Only resize the active window immediately — background windows will be
-    // resized lazily when switched to.  This avoids O(total_panes) ConPTY
-    // resize syscalls on every structural change.
-    if app.active_idx < app.windows.len() {
-        let win = &mut app.windows[app.active_idx];
-        let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
-        compute_rects(&win.root, area, &mut rects);
-        // When the window is zoomed, split_with_gaps still subtracts the
-        // separator gap (1 px) AND the minimum-size steal (1 px) from the
-        // visible pane, making it 2 rows/cols shorter than the full viewport.
-        // The client renders the zoomed pane using the full area, so the PTY
-        // must also be sized to the full area — otherwise the bottom/right
-        // edge shows blank rows/columns.
-        if win.zoom_saved.is_some() {
-            let active_path = win.active_path.clone();
-            if let Some((_, rect)) = rects.iter_mut().find(|(p, _)| *p == active_path) {
-                *rect = area;
-            }
+    let win = &mut app.windows[window_index];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, area, &mut rects);
+    // When the window is zoomed, split_with_gaps still subtracts the
+    // separator gap (1 px) AND the minimum-size steal (1 px) from the
+    // visible pane, making it 2 rows/cols shorter than the full viewport.
+    // The client renders the zoomed pane using the full area, so the PTY
+    // must also be sized to the full area — otherwise the bottom/right
+    // edge shows blank rows/columns.
+    let zoom_active_path = if win.zoom_saved.is_some() {
+        let active_path = win.active_path.clone();
+        if let Some((_, rect)) = rects.iter_mut().find(|(p, _)| *p == active_path) {
+            *rect = area;
         }
-        let mut path = Vec::new();
-        resize_node(&mut win.root, &rects, &mut path, border_status_rows);
-    }
+        Some(active_path)
+    } else {
+        None
+    };
+    let mut path = Vec::new();
+    resize_node(&mut win.root, &rects, &mut path, border_status_rows, zoom_active_path.as_ref());
+}
+
+/// Resize the active window. Its stored geometry is authoritative, including
+/// when a previous `resize-window` put it in manual mode.
+pub fn resize_all_panes(app: &mut AppState) {
+    if app.active_idx >= app.windows.len() { return; }
+    let area = app.windows[app.active_idx].area;
+    app.last_window_area = area;
+    resize_window_panes(app, app.active_idx, area);
 }
 
 pub fn kill_all_children(node: &mut Node) {
@@ -418,8 +434,20 @@ pub fn prune_exited(n: Node, remain_on_exit: bool, kill_descendants: bool) -> (O
         Node::Leaf(mut p) => {
             if p.dead { return (Some(Node::Leaf(p)), 0); }
             match p.child.try_wait() {
-                Ok(Some(_)) => {
-                    if remain_on_exit {
+                Ok(Some(status)) => {
+                    // Pane-scoped remain-on-exit overrides the session global
+                    // (issue #580; tmux pane-option semantics): `on` keeps the
+                    // dead pane, `off` closes it, `failed` keeps it only when
+                    // the process exited nonzero — which is exactly what a
+                    // teammate supervisor wants: crashed panes stay visible
+                    // with their error, clean exits close.
+                    let keep = match p.pane_options.get("remain-on-exit").map(|s| s.as_str()) {
+                        Some("on") => true,
+                        Some("off") => false,
+                        Some("failed") => !status.success(),
+                        _ => remain_on_exit,
+                    };
+                    if keep {
                         p.dead = true;
                         (Some(Node::Leaf(p)), 1)
                     } else {
@@ -654,6 +682,16 @@ pub fn for_each_pane(node: &Node, f: &mut dyn FnMut(&Pane)) {
     }
 }
 
+/// Visit every pane in a tree node (DFS order), calling `f` on each, mutably.
+pub fn for_each_pane_mut(node: &mut Node, f: &mut dyn FnMut(&mut Pane)) {
+    match node {
+        Node::Leaf(p) => f(p),
+        Node::Split { children, .. } => {
+            for c in children { for_each_pane_mut(c, f); }
+        }
+    }
+}
+
 /// Collect all pane IDs from a tree node (DFS order).
 pub fn collect_pane_ids(node: &Node) -> Vec<usize> {
     let mut ids = Vec::new();
@@ -725,6 +763,27 @@ pub fn find_pane_by_id_global(app: &AppState, pane_id: usize) -> Option<(usize, 
         if let Some(pos) = get_pane_position_in_window(&w.root, pane_id) {
             return Some((wi, pos));
         }
+    }
+    None
+}
+
+/// Mutable access to a pane by its global pane ID across every window
+/// (issue #580: pane-scoped options must resolve `%N` regardless of the
+/// active window, like every other bare-%id target).
+pub fn find_pane_mut_by_id_global(app: &mut AppState, pane_id: usize) -> Option<&mut Pane> {
+    fn walk(node: &mut Node, pane_id: usize) -> Option<&mut Pane> {
+        match node {
+            Node::Leaf(p) => if p.id == pane_id { Some(p) } else { None },
+            Node::Split { children, .. } => {
+                for c in children {
+                    if let Some(p) = walk(c, pane_id) { return Some(p); }
+                }
+                None
+            }
+        }
+    }
+    for w in app.windows.iter_mut() {
+        if let Some(p) = walk(&mut w.root, pane_id) { return Some(p); }
     }
     None
 }

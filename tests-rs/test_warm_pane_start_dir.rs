@@ -15,7 +15,10 @@ use super::*;
 /// with a single CR so it submits as exactly one command line.
 #[test]
 fn rehome_command_wraps_dir_and_clears() {
-    let cmd = rehome_command(r"C:\code\project");
+    // Platform default dialect: PowerShell on Windows, POSIX elsewhere. Both
+    // pass a backslash path through untouched, so the `cd` assertion below
+    // holds either way.
+    let cmd = rehome_command(r"C:\code\project", rehome_syntax_for_shell(""));
     assert!(cmd.starts_with(' '), "must start with a space, got {cmd:?}");
     assert!(cmd.ends_with('\r'), "must end with CR, got {cmd:?}");
     assert!(
@@ -30,12 +33,14 @@ fn rehome_command_wraps_dir_and_clears() {
 /// A single quote in the path must be doubled so the single-quoted string stays
 /// well-formed — otherwise the `cd` breaks (or a crafted path could inject a
 /// second command). Precondition: the input actually contains a lone quote.
+/// Doubling is the PowerShell rule; the POSIX `'\''` rule is covered in
+/// tests-rs/test_issue600_bash_rehome.rs.
 #[test]
 fn rehome_command_escapes_single_quotes() {
     let input = r"C:\weird'dir";
     assert_eq!(input.matches('\'').count(), 1, "precondition: one lone quote");
 
-    let cmd = rehome_command(input);
+    let cmd = rehome_command(input, RehomeSyntax::PowerShell);
     assert!(
         cmd.contains(r"cd 'C:\weird''dir'"),
         "lone quote must be doubled, got {cmd:?}"
@@ -45,11 +50,37 @@ fn rehome_command_escapes_single_quotes() {
 }
 
 /// Full contract lock on Windows: documents the precise bytes injected so a
-/// future refactor can't silently change the wire format.
+/// future refactor can't silently change the wire format. Includes the
+/// `SetCurrentDirectory` sync (see `rehome_command` doc comment) — PowerShell's
+/// `cd` does not call Win32 `SetCurrentDirectory()`, so `#{pane_current_path}`
+/// (a PEB walk) would otherwise keep reporting the shell's original spawn
+/// directory after a warm-pane rehome, especially under `-NoProfile` where
+/// psmux's own CWD_SYNC profile hook is skipped.
 #[test]
 fn rehome_command_exact_windows_form() {
     if cfg!(windows) {
-        assert_eq!(rehome_command(r"C:\x"), " cd 'C:\\x'; cls\r");
+        assert_eq!(
+            rehome_command(r"C:\x", RehomeSyntax::PowerShell),
+            " cd 'C:\\x'; try { [System.IO.Directory]::SetCurrentDirectory($PWD.ProviderPath) } catch {}; cls\r"
+        );
+    }
+}
+
+/// The CurrentDirectory sync must apply to the *requested* dir, not stay
+/// hardcoded — precondition guard so `rehome_command_exact_windows_form`
+/// above isn't the only thing pinning this behaviour.
+#[test]
+fn rehome_command_includes_current_directory_sync_on_windows() {
+    if cfg!(windows) {
+        let cmd = rehome_command(r"C:\code\project", RehomeSyntax::PowerShell);
+        assert!(
+            cmd.contains("[System.IO.Directory]::SetCurrentDirectory"),
+            "must sync Win32 CurrentDirectory so a PEB-walk-based cwd query \
+             (#{{pane_current_path}}) reflects the rehomed dir, got {cmd:?}"
+        );
+        // Still exactly one submitted line — the sync must be chained with
+        // `;`, not its own Enter, or it would submit as a separate command.
+        assert_eq!(cmd.matches('\r').count(), 1, "got {cmd:?}");
     }
 }
 

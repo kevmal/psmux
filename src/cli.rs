@@ -1,4 +1,4 @@
-use crate::types::{ParsedTarget, VERSION};
+use crate::types::{ParsedTarget, VERSION, build_version_string};
 
 /// Normalize `-x=VALUE` short-flag forms into `["-x", "VALUE"]`.
 ///
@@ -32,6 +32,161 @@ pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
         out.push(arg);
     }
     out
+}
+
+/// Split tmux-style ATTACHED short-option arguments in the GLOBAL (pre
+/// subcommand) region of the command line: `-Lsockname` -> `-L sockname`
+/// (discussion #571).
+///
+/// tmux parses its program options with getopt(3) (tmux.c: spec string
+/// `2c:CDdf:hlL:NqS:T:uUvV`), and its bundled compat getopt treats
+/// characters left attached after a value-taking option letter as that
+/// option's argument (`optarg = place` in the "no white space" branch of
+/// compat/getopt_long.c), so `-L sockname` and `-Lsockname` are
+/// equivalent.  Tools that drive tmux emit the
+/// attached form (libtmux builds `-L{name}`), and psmux's exact-match
+/// scanners treated the whole token as an unknown flag and SILENTLY
+/// dropped it — a `-Lfoo new-session` landed in the DEFAULT namespace.
+///
+/// Rules:
+///   - Only the region BEFORE the subcommand is rewritten; the first token
+///     not starting with `-` ends the scan, so command flags such as
+///     `select-pane -L` (no value) are never touched.
+///   - Only the value-taking global option letters psmux's own scanners
+///     consume are split: L, f, S, and psmux's global `-t`.  Letters psmux
+///     does not handle globally (tmux's `-c`/`-T`) pass through unchanged —
+///     splitting those would leave a stray value token that the scanner
+///     mistakes for the subcommand.  `-C`/`-CC` and boolean flags pass
+///     through unchanged.
+///   - A detached form (`-L name`) passes through unchanged: the letter is
+///     followed by nothing, so there is no attached value to split.
+pub fn normalize_attached_global_args(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut in_globals = true;
+    let mut skip_value = false;
+    for (idx, arg) in args.into_iter().enumerate() {
+        // args[0] is the binary name, not the subcommand.
+        if idx > 0 && in_globals {
+            if skip_value {
+                // Previous token was a detached value-taking flag: this token
+                // is its value, not the subcommand.
+                skip_value = false;
+                out.push(arg);
+                continue;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                in_globals = false; // subcommand (or bare -): stop rewriting
+                out.push(arg);
+                continue;
+            }
+            let bytes = arg.as_bytes();
+            if bytes.len() >= 3
+                && !arg.starts_with("--")
+                && matches!(bytes[1], b'L' | b'f' | b'S' | b't')
+            {
+                out.push(format!("-{}", bytes[1] as char));
+                out.push(arg[2..].to_string());
+                continue;
+            }
+            if bytes.len() == 2 && matches!(bytes[1], b'L' | b'f' | b'S' | b't') {
+                skip_value = true; // detached form: the NEXT token is the value
+            }
+        }
+        out.push(arg);
+    }
+    out
+}
+
+/// Split tmux-style ATTACHED `-t` target arguments AFTER the subcommand:
+/// `kill-session -tname` -> `kill-session -t name` (discussion #571,
+/// command-level slice).
+///
+/// tmux's command parser (arguments.c args_parse_flag_argument: the
+/// `if (*string != '\0')` branch) treats characters left attached after a
+/// value-taking flag letter as that flag's argument, for EVERY command.
+/// psmux's exact-match command parsers ignored such tokens, and the global
+/// routing fallback then picked the most recent session — reproduced:
+/// `kill-session -tvictimA` killed victimB.  `-t` is value-taking in every
+/// tmux and psmux command, so it is the one letter that can be rewritten
+/// generically without a per-command flag table (`-L`, `-T`, `-s`, ... are
+/// boolean in some commands and value-taking in others).
+///
+/// Rules:
+///   - Only tokens after the first non-flag token (the subcommand) are
+///     candidates; the global region is `normalize_attached_global_args`'s
+///     job and is left alone here.
+///   - Rewriting stops at a literal `--`: everything after it is payload
+///     (send-keys literals, direct-exec argv), exactly like tmux.
+///   - Only `-t<value>` is split.  A bare `-t` (detached form) and every
+///     other flag pass through unchanged.
+///   - tmux parses a token like `-tfoo` as a target in every command, so
+///     this rewrite is parity even where the token was meant as text; the
+///     tmux-blessed way to pass literal `-t...` text is after `--`.
+pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut seen_subcommand = false;
+    let mut seen_dashdash = false;
+    for (idx, arg) in args.into_iter().enumerate() {
+        if idx == 0 {
+            out.push(arg); // binary name
+            continue;
+        }
+        if arg == "--" {
+            seen_dashdash = true;
+            out.push(arg);
+            continue;
+        }
+        if !seen_subcommand {
+            if !arg.starts_with('-') || arg == "-" {
+                seen_subcommand = true;
+            }
+            out.push(arg);
+            continue;
+        }
+        if !seen_dashdash && arg.len() > 2 && arg.starts_with("-t") && !arg.starts_with("--") {
+            out.push("-t".to_string());
+            out.push(arg[2..].to_string());
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
+pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Option<usize> {
+    let value_options: &[&str] = match command {
+        "bind-key" | "bind" => &["-T"],
+        "set-hook" => &["-t"],
+        "confirm-before" | "confirm" => &["-p", "-t"],
+        _ => return None,
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let token = args[i].as_ref();
+        if token == "--" {
+            i += 1;
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            break;
+        }
+        i += if value_options.contains(&token) { 2 } else { 1 };
+    }
+
+    match command {
+        "bind-key" | "bind" | "set-hook" => (i < args.len()).then_some(i + 1),
+        "confirm-before" | "confirm" => (i < args.len()).then_some(i),
+        _ => None,
+    }
+}
+
+pub fn outer_target_scan_end<S: AsRef<str>>(command: &str, args: &[S]) -> usize {
+    deferred_command_start(command, args)
+        .into_iter()
+        .chain(args.iter().position(|arg| arg.as_ref() == "--"))
+        .min()
+        .unwrap_or(args.len())
 }
 
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
@@ -425,9 +580,16 @@ For more information: https://github.com/psmux/psmux
 }
 
 pub fn print_version() {
-    // Always print "tmux <version>" for compatibility with tools like
-    // libtmux/tmuxp that parse the "tmux " prefix from `-V` output.
+    // First line MUST stay "tmux <version>" (and nothing else) for
+    // compatibility with tools like libtmux/tmuxp that read the first line of
+    // `-V` output and parse the version token right after the "tmux " prefix.
     println!("tmux {}", VERSION);
+    // Second line carries the exact build provenance for humans: the git commit
+    // the binary was built from (short hash + date, plus a "dirty" marker when
+    // built from a modified tree). Tools that parse only the first line ignore
+    // it, so this stays fully backward compatible. Example:
+    //   psmux 3.3.7 (a1b2c3d 2026-07-20)
+    println!("{}", build_version_string());
 }
 
 pub fn print_commands() {
@@ -512,12 +674,25 @@ pub fn print_commands() {
 "#);
 }
 
+/// Strip the tmux exact-match marker from a raw target specification.
+///
+/// tmux target grammar allows a leading '=' meaning "match this session name
+/// exactly, no fuzzy prefix matching". psmux only ever matches exactly, so
+/// the marker carries no information here, but any code that keeps the RAW
+/// -t string (for relative pane forms like :.+) and later compares it as a
+/// session name must see the plain name: `"name" == "=name"` silently
+/// matching nothing is issue #558 (kill-session -t =name burned its 5s
+/// settle deadline and exited 1 while the session survived).
+pub fn strip_exact_match_prefix(target: &str) -> &str {
+    target.strip_prefix('=').unwrap_or(target)
+}
+
 /// Parse a tmux-style target specification
 pub fn parse_target(target: &str) -> ParsedTarget {
     let mut result = ParsedTarget::default();
-    
+
     // Strip leading '=' prefix (tmux exact-match semantics)
-    let target = target.strip_prefix('=').unwrap_or(target);
+    let target = strip_exact_match_prefix(target);
     
     if target.starts_with('%') {
         if let Ok(pid) = target[1..].parse::<usize>() {
@@ -527,9 +702,22 @@ pub fn parse_target(target: &str) -> ParsedTarget {
         return result;
     }
     if target.starts_with('@') {
-        if let Ok(wid) = target[1..].parse::<usize>() {
+        // Allow a ".pane" suffix after the window id (e.g. "@2.0" or "@2.%3")
+        let (wid_part, pane_part) = match target.find('.') {
+            Some(dot) => (&target[1..dot], Some(&target[dot + 1..])),
+            None => (&target[1..], None),
+        };
+        if let Ok(wid) = wid_part.parse::<usize>() {
             result.window = Some(wid);
             result.window_is_id = true;
+            if let Some(pp) = pane_part {
+                if let Some(pid) = pp.strip_prefix('%').and_then(|s| s.parse::<usize>().ok()) {
+                    result.pane = Some(pid);
+                    result.pane_is_id = true;
+                } else if let Ok(p) = pp.parse::<usize>() {
+                    result.pane = Some(p);
+                }
+            }
         }
         return result;
     }
@@ -595,9 +783,22 @@ pub fn parse_target(target: &str) -> ParsedTarget {
                 result.pane_is_id = true;
             }
         } else if wp.starts_with('@') {
-            if let Ok(wid) = wp[1..].parse::<usize>() {
+            // Allow a ".pane" suffix after the window id (e.g. "ses:@2.0")
+            let (wid_part, pane_part) = match wp.find('.') {
+                Some(dot) => (&wp[1..dot], Some(&wp[dot + 1..])),
+                None => (&wp[1..], None),
+            };
+            if let Ok(wid) = wid_part.parse::<usize>() {
                 result.window = Some(wid);
                 result.window_is_id = true;
+                if let Some(pp) = pane_part {
+                    if let Some(pid) = pp.strip_prefix('%').and_then(|s| s.parse::<usize>().ok()) {
+                        result.pane = Some(pid);
+                        result.pane_is_id = true;
+                    } else if let Ok(p) = pp.parse::<usize>() {
+                        result.pane = Some(p);
+                    }
+                }
             }
         } else if let Some(dot_pos) = wp.find('.') {
             if dot_pos > 0 {
@@ -608,7 +809,17 @@ pub fn parse_target(target: &str) -> ParsedTarget {
                     result.window_name = Some(win_part.to_string());
                 }
             }
-            if let Ok(p) = wp[dot_pos + 1..].parse::<usize>() {
+            // The pane slot accepts a %id as well as an index, exactly as the
+            // "@window.pane" branch above already does. Parsing it with a bare
+            // parse::<usize>() silently failed on the '%', leaving pane = None,
+            // and the command then fell back to the ACTIVE pane. That is not a
+            // no-op: "kill-pane -t sess:.%4" killed the active pane %2 in a
+            // different window and still exited 0.
+            let pane_str = &wp[dot_pos + 1..];
+            if let Some(pid) = pane_str.strip_prefix('%').and_then(|s| s.parse::<usize>().ok()) {
+                result.pane = Some(pid);
+                result.pane_is_id = true;
+            } else if let Ok(p) = pane_str.parse::<usize>() {
                 result.pane = Some(p);
             }
         } else {
@@ -716,6 +927,47 @@ mod tests {
         assert_eq!(pt.pane, Some(1));
     }
 
+    // A %id is legal in the PANE slot of "session:window.pane". It used to be
+    // parsed with a bare parse::<usize>(), which fails on the '%', so pane came
+    // back None and every caller fell through to the ACTIVE pane. The observable
+    // damage was destructive rather than inert: "kill-pane -t sess:.%4" killed
+    // the active pane %2, in a different window, and exited 0.
+    #[test]
+    fn parse_target_pane_id_in_pane_slot_current_window() {
+        let pt = parse_target("mysession:.%4");
+        assert_eq!(pt.session, Some("mysession".to_string()));
+        assert_eq!(pt.window, None, "no window component means the current window");
+        assert_eq!(pt.pane, Some(4), "%4 must reach the pane slot, not be dropped");
+        assert!(pt.pane_is_id, "%4 is an id, not an index: indexes would resolve to a different pane");
+    }
+
+    #[test]
+    fn parse_target_pane_id_in_pane_slot_with_window_index() {
+        let pt = parse_target("mysession:1.%7");
+        assert_eq!(pt.session, Some("mysession".to_string()));
+        assert_eq!(pt.window, Some(1));
+        assert_eq!(pt.pane, Some(7));
+        assert!(pt.pane_is_id);
+    }
+
+    #[test]
+    fn parse_target_pane_id_in_pane_slot_with_window_name() {
+        let pt = parse_target("mysession:logs.%2");
+        assert_eq!(pt.window_name, Some("logs".to_string()));
+        assert_eq!(pt.pane, Some(2));
+        assert!(pt.pane_is_id);
+    }
+
+    // A numeric pane index in the same slot must stay an INDEX. If this flipped
+    // to pane_is_id the two syntaxes would silently mean the same thing and
+    // "sess:.1" would start resolving to pane %1 instead of the second pane.
+    #[test]
+    fn parse_target_pane_index_is_not_an_id() {
+        let pt = parse_target("mysession:.1");
+        assert_eq!(pt.pane, Some(1));
+        assert!(!pt.pane_is_id, "a bare index must not be treated as a %id");
+    }
+
     #[test]
     fn parse_target_bare_window_name() {
         // :mywindow (no session)
@@ -745,3 +997,15 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue196_flag_equals.rs"]
 mod tests_issue196_flag_equals;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue497_selectwindow_id.rs"]
+mod tests_issue497_selectwindow_id;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue558_eq_prefix.rs"]
+mod tests_issue558_eq_prefix;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_discussion571_attached_global_args.rs"]
+mod tests_discussion571_attached_global_args;

@@ -32,7 +32,7 @@ pub fn resolve_session(session_name: &str) -> io::Result<(u16, String)> {
 }
 
 /// Send a command to a specific session and return the full response.
-fn send_to_session(port: u16, key: &str, cmd: &str) -> io::Result<String> {
+pub(crate) fn send_to_session(port: u16, key: &str, cmd: &str) -> io::Result<String> {
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = TcpStream::connect_timeout(
         &addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?,
@@ -62,6 +62,97 @@ fn send_to_session(port: u16, key: &str, cmd: &str) -> io::Result<String> {
     }
     let r = String::from_utf8_lossy(&buf).to_string();
     Ok(if r.starts_with("OK\n") { r[3..].to_string() } else { r })
+}
+
+/// Issue #555: resolve a cross-session switch-client target's window/pane
+/// components on the DESTINATION server before the switch is signalled.
+/// Returns Err("can't find window/pane: X") when a component definitively
+/// does not resolve there. Conservative on query trouble: an unreachable or
+/// unparseable destination returns Ok so a transient failure never blocks a
+/// switch the old path would have performed (the destination session's own
+/// existence is the caller's check). One `list-panes -a` round trip carries
+/// every fact needed: window identity per row for index/@id/name matching,
+/// pane indexes scoped to their window, global pane ids, and the active
+/// window for pane-only targets.
+pub fn validate_switch_target(
+    port: u16,
+    key: &str,
+    pt: &crate::types::ParsedTarget,
+) -> Result<(), String> {
+    if pt.pane.is_none() && pt.window.is_none() && pt.window_name.is_none() {
+        return Ok(());
+    }
+    let resp = match send_to_session(
+        port,
+        key,
+        "list-panes -a -F #{window_active}|#{window_id}|#{window_index}|#{window_name}|#{pane_index}|#{pane_id}",
+    ) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    struct Row {
+        active: bool,
+        wid: String,
+        widx: String,
+        wname: String,
+        pidx: String,
+        pid: String,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for line in resp.lines() {
+        let parts: Vec<&str> = line.trim().splitn(6, '|').collect();
+        if parts.len() != 6 || !parts[1].starts_with('@') {
+            continue;
+        }
+        rows.push(Row {
+            active: parts[0] == "1",
+            wid: parts[1].to_string(),
+            widx: parts[2].to_string(),
+            wname: parts[3].to_string(),
+            pidx: parts[4].to_string(),
+            pid: parts[5].to_string(),
+        });
+    }
+    if rows.is_empty() {
+        return Ok(()); // nothing parseable; do not block
+    }
+    let win_match = |r: &Row| -> bool {
+        if let Some(w) = pt.window {
+            if pt.window_is_id {
+                r.wid == format!("@{}", w)
+            } else {
+                r.widx == w.to_string()
+            }
+        } else if let Some(ref n) = pt.window_name {
+            r.wname == *n
+        } else {
+            // Pane-only target: the pane index resolves against the
+            // destination's active window, matching select-pane semantics.
+            r.active
+        }
+    };
+    if (pt.window.is_some() || pt.window_name.is_some()) && !rows.iter().any(&win_match) {
+        let spec = if let Some(w) = pt.window {
+            if pt.window_is_id {
+                format!("@{}", w)
+            } else {
+                w.to_string()
+            }
+        } else {
+            pt.window_name.clone().unwrap_or_default()
+        };
+        return Err(format!("can't find window: {}", spec));
+    }
+    if let Some(p) = pt.pane {
+        if pt.pane_is_id {
+            if !rows.iter().any(|r| r.pid == format!("%{}", p)) {
+                return Err(format!("can't find pane: %{}", p));
+            }
+        } else if !rows.iter().any(|r| win_match(r) && r.pidx == p.to_string()) {
+            return Err(format!("can't find pane: {}", p));
+        }
+    }
+    Ok(())
 }
 
 /// Orchestrate a cross-session pane transfer.
@@ -94,7 +185,15 @@ pub fn orchestrate_cross_session_join(
             format!("extract failed: {}", extract_resp)));
     }
 
-    let parts: Vec<&str> = extract_resp.splitn(8, ' ').collect();
+    // The screen base64 payload follows the FORWARD line after a newline.
+    // Split it off FIRST: tokenizing the whole response would glue
+    // "<screen_b64_len>\n<payload>" into one token whose parse() fails and
+    // silently discards the screen snapshot (the pre-fix behavior).
+    let (forward_line, payload_after_nl) = match extract_resp.find('\n') {
+        Some(nl_pos) => (&extract_resp[..nl_pos], Some(&extract_resp[nl_pos + 1..])),
+        None => (extract_resp, None),
+    };
+    let parts: Vec<&str> = forward_line.trim_end().splitn(8, ' ').collect();
     if parts.len() < 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad FORWARD response"));
     }
@@ -106,21 +205,16 @@ pub fn orchestrate_cross_session_join(
     let cols: u16 = parts[6].parse().unwrap_or(80);
     let screen_b64_len: usize = parts[7].parse().unwrap_or(0);
 
-    // Read screen base64 data if present (may follow the FORWARD line)
-    let screen_b64 = if screen_b64_len > 0 {
-        // The screen data follows after the first newline in the response
-        if let Some(nl_pos) = extract_resp.find('\n') {
-            let data = &extract_resp[nl_pos + 1..];
-            if data.len() >= screen_b64_len {
-                Some(data[..screen_b64_len].to_string())
+    let screen_b64 = match (screen_b64_len, payload_after_nl) {
+        (0, _) | (_, None) => None,
+        (len, Some(data)) => {
+            let data = data.trim_end();
+            if data.len() >= len {
+                Some(data[..len].to_string())
             } else {
                 Some(data.to_string())
             }
-        } else {
-            None
         }
-    } else {
-        None
     };
 
     // 3. Build inject command for target
@@ -131,8 +225,18 @@ pub fn orchestrate_cross_session_join(
     };
     let h_flag = if horizontal { " -h" } else { "" };
     let screen_payload = screen_b64.as_deref().unwrap_or("");
+    // The server reads commands line by line, and its inject handler collects
+    // the payload from the remaining same-line tokens (connection.rs). Base64
+    // contains no spaces, so ship it as one trailing token on the command
+    // line; a "\n<payload>" continuation would be consumed as a bogus
+    // follow-up command and the snapshot silently dropped.
+    let payload_token = if screen_payload.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", screen_payload)
+    };
     let inject_cmd = format!(
-        "pane-forward-inject {} {} {} {} {} {} {} {} {} {}{}\n{}",
+        "pane-forward-inject {} {} {} {} {} {} {} {} {} {}{}{}",
         src_session,
         src_addr,
         src_key,
@@ -144,7 +248,7 @@ pub fn orchestrate_cross_session_join(
         cols,
         screen_payload.len(),
         h_flag,
-        screen_payload,
+        payload_token,
     );
 
     // 4. Tell target to create proxy pane

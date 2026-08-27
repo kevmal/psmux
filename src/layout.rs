@@ -12,6 +12,17 @@ use crate::tree::get_split_mut;
 /// overlay rendering.  Extracts cells from [0..rows) x [0..cols), merges
 /// adjacent cells with identical styling into runs, and returns the result
 /// as a `Vec<RowRunsJson>`.
+/// Extracts the extended underline style and the SGR 58 underline colour from
+/// a parsed cell, in the shape the run JSON carries them (#589).
+fn cell_underline(cell: &vt100::Cell) -> (u8, Option<String>) {
+    let ul = cell.underline_style().sgr_subparam();
+    let ulc = match cell.underline_color() {
+        vt100::Color::Default => None,
+        c => Some(crate::util::color_to_name(c).into_owned()),
+    };
+    (ul, ulc)
+}
+
 pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<RowRunsJson> {
     const FLAG_DIM: u8 = 1;
     const FLAG_BOLD: u8 = 2;
@@ -48,12 +59,14 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if cell.blink() { fl |= FLAG_BLINK; }
                 if cell.hidden() { fl |= FLAG_HIDDEN; }
                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
+                let (cell_ul, cell_ulc) = cell_underline(cell);
 
                 // A hyperlink change must also break the run so the client can
                 // wrap exactly the linked text in OSC 8 (#361).
                 let merged = if let Some(last) = runs.last_mut() {
                     if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
                         && prev_flags == fl && prev_link == Some(cell_link)
+                        && last.ul == cell_ul && last.ulc == cell_ulc
                     {
                         last.text.push_str(t);
                         last.width = last.width.saturating_add(w);
@@ -66,7 +79,7 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                     let link = if cell_link != 0 {
                         screen.hyperlink_uri(cell_link).map(|s| s.to_string())
                     } else { None };
-                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link });
+                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc });
                 }
 
                 (w, cell_fg, cell_bg, fl, cell_link)
@@ -81,7 +94,7 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                     } else { false }
                 } else { false };
                 if !merged {
-                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None });
+                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
                 }
                 (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
             };
@@ -125,6 +138,23 @@ pub struct CellRunJson {
     /// normal output. The client re-emits OSC 8 around runs that carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// Extended underline style for this run as the SGR 4 subparameter:
+    /// 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (#589).
+    /// `flags & FLAG_UNDERLINE` still says "underlined at all", so an older
+    /// client that does not know this field keeps drawing a plain underline.
+    /// Omitted from the JSON when 0 or 1, which is every ordinary run.
+    #[serde(default, skip_serializing_if = "crate::layout::ul_is_plain")]
+    pub ul: u8,
+    /// SGR 58 underline colour name for this run, if one was set (#589).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ulc: Option<String>,
+}
+
+/// Runs with no underline or a plain single underline need no `ul` field on
+/// the wire, which keeps the per-frame payload identical for normal output.
+#[must_use]
+pub fn ul_is_plain(ul: &u8) -> bool {
+    *ul <= 1
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -146,6 +176,13 @@ pub enum LayoutJson {
         cursor_col: u16,
         #[serde(default)]
         alternate_screen: bool,
+        /// True when the pane's app EXPLICITLY enabled a mouse protocol
+        /// (DECSET 1000/1002/1003).  Strict on purpose — no alt-screen or
+        /// fullscreen heuristic — so the client only yields its drag
+        /// selection to apps that really consume mouse events; alt-screen
+        /// apps without mouse support (e.g. `less`) keep psmux selection.
+        #[serde(default)]
+        wants_mouse: bool,
         #[serde(default)]
         hide_cursor: bool,
         #[serde(default)]
@@ -153,6 +190,13 @@ pub enum LayoutJson {
         active: bool,
         copy_mode: bool,
         scroll_offset: usize,
+        /// The pane parser's live scrollback offset.  Nonzero whenever the
+        /// view is scrolled back — including DIRECT scrollback with
+        /// scroll-enter-copy-mode off (#193), where copy_mode stays false.
+        /// The client uses it to decide whether a drag selection crossing a
+        /// pane edge has scrollback content to continue into.
+        #[serde(default)]
+        view_offset: usize,
         sel_start_row: Option<u16>,
         sel_start_col: Option<u16>,
         sel_end_row: Option<u16>,
@@ -197,8 +241,74 @@ pub fn dump_window_layout_json(app: &mut AppState, win_id: usize) -> io::Result<
     dump_layout_json_inner(app, Some(win_id))
 }
 
+/// Copy-mode screen freeze (issue #494, tmux parity): while the session is in
+/// copy mode, anchor the ACTIVE pane's parser (`Screen::set_frozen`) so new
+/// output bumps the scrollback offset instead of shifting the rendered view;
+/// release the anchor on every other pane so nothing is left permanently
+/// frozen after copy mode exits or focus moves.  Returns via
+/// `app.copy_scroll_offset` the (possibly auto-bumped) parser offset so
+/// selection math and the client-side scroll indicator stay consistent.
+fn sync_copy_freeze(app: &mut AppState, in_copy_mode: bool) {
+    // `r` (refresh-from-pane, #498) releases the anchor so the pane tracks
+    // live output while copy mode stays open.
+    let in_copy_mode = in_copy_mode && !app.copy_refresh_live;
+    fn walk(node: &mut Node, path: &mut Vec<usize>, target: Option<&[usize]>) -> Option<usize> {
+        let mut synced = None;
+        match node {
+            Node::Split { children, .. } => {
+                for (i, c) in children.iter_mut().enumerate() {
+                    path.push(i);
+                    if let Some(v) = walk(c, path, target) { synced = Some(v); }
+                    path.pop();
+                }
+            }
+            Node::Leaf(p) => {
+                let freeze = target.map_or(false, |t| t == path.as_slice());
+                if let Ok(mut parser) = p.term.lock() {
+                    if parser.screen().frozen() != freeze {
+                        parser.screen_mut().set_frozen(freeze);
+                        if !freeze {
+                            // Leaving the frozen state must return the pane
+                            // to the LIVE view: the freeze auto-bumped the
+                            // parser scrollback offset, and any offset > 0
+                            // keeps anchoring on its own, which would pin
+                            // the view at the copy-mode content forever.
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                    if freeze { synced = Some(parser.screen().scrollback()); }
+                }
+            }
+        }
+        synced
+    }
+    let active_idx = app.active_idx;
+    let mut new_offset = None;
+    for (wi, win) in app.windows.iter_mut().enumerate() {
+        // Floating panes render their own live view — never frozen.
+        let target_path = if in_copy_mode && wi == active_idx && win.floating_focus.is_none() {
+            Some(win.active_path.clone())
+        } else {
+            None
+        };
+        let mut path = Vec::new();
+        if let Some(v) = walk(&mut win.root, &mut path, target_path.as_deref()) {
+            new_offset = Some(v);
+        }
+        for fp in win.floating.iter_mut() {
+            if let Ok(mut parser) = fp.pane.term.lock() {
+                if parser.screen().frozen() { parser.screen_mut().set_frozen(false); }
+            }
+        }
+    }
+    if let Some(v) = new_offset { app.copy_scroll_offset = v; }
+}
+
 fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::Result<String> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    if win_id_override.is_none() {
+        sync_copy_freeze(app, in_copy_mode);
+    }
     let scroll_offset = app.copy_scroll_offset;
     
     fn build(node: &mut Node, cur_path: &mut Vec<usize>, active_path: &[usize], include_full_content: bool) -> LayoutJson {
@@ -241,10 +351,12 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                         return LayoutJson::Leaf {
                             id: p.id, rows: p.last_rows, cols: p.last_cols,
                             cursor_row: 0, cursor_col: 0, alternate_screen: false,
+                            wants_mouse: false,
                             hide_cursor: true,
                             cursor_shape: 0,
                             active: *cur_path == active_path, copy_mode: false,
                             scroll_offset: 0,
+                            view_offset: 0,
                             sel_start_row: None, sel_start_col: None,
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
@@ -261,10 +373,12 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     return LayoutJson::Leaf {
                         id: p.id, rows: p.last_rows, cols: p.last_cols,
                         cursor_row: 0, cursor_col: 0, alternate_screen: false,
+                        wants_mouse: false,
                         hide_cursor: false,
                         cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                         active: *cur_path == active_path, copy_mode: false,
                         scroll_offset: 0,
+                        view_offset: 0,
                         sel_start_row: None, sel_start_col: None,
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
@@ -292,6 +406,8 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     }
                     has_content
                 };
+                let wants_mouse =
+                    screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
                 let need_full_content = include_full_content && *cur_path == active_path;
                 let mut lines: Vec<Vec<CellJson>> = if need_full_content {
                     Vec::with_capacity(p.last_rows as usize)
@@ -335,6 +451,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             if cell.blink() { fl |= FLAG_BLINK; }
                             if cell.hidden() { fl |= FLAG_HIDDEN; }
                             if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
+                            let (cell_ul, cell_ulc) = cell_underline(cell);
 
                             // Run merging — push &str directly, no String allocation.
                             // Break on hyperlink change so OSC 8 wraps exactly the
@@ -342,6 +459,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             let merged = if let Some(last) = runs.last_mut() {
                                 if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
                                     && prev_flags == fl && prev_link == Some(cell_link)
+                                    && last.ul == cell_ul && last.ulc == cell_ulc
                                 {
                                     last.text.push_str(t);
                                     last.width = last.width.saturating_add(w);
@@ -354,7 +472,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                                 let link = if cell_link != 0 {
                                     screen.hyperlink_uri(cell_link).map(|s| s.to_string())
                                 } else { None };
-                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link });
+                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc.clone() });
                             }
 
                             if need_full_content {
@@ -389,7 +507,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                                 } else { false }
                             } else { false };
                             if !merged {
-                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None });
+                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
                             }
                             if need_full_content {
                                 row.push(CellJson {
@@ -433,11 +551,13 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     cursor_row: cr,
                     cursor_col: cc,
                     alternate_screen,
+                    wants_mouse,
                     hide_cursor: hide_cursor_flag,
                     cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                     active: false,
                     copy_mode: false,
                     scroll_offset: 0,
+                    view_offset: screen.scrollback(),
                     sel_start_row: None,
                     sel_start_col: None,
                     sel_end_row: None,
@@ -547,6 +667,7 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
 /// identical JSON format that the client deserialises into `LayoutJson`.
 pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    sync_copy_freeze(app, in_copy);
     let scroll_off = app.copy_scroll_offset;
     let anchor = app.copy_anchor;
     let anchor_scroll = app.copy_anchor_scroll_offset;
@@ -588,12 +709,33 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     }
 
     /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
-    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
+    #[allow(clippy::too_many_arguments)]
+    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, link: Option<&str>, ul: u8, ulc: vt100::Color, out: &mut String) {
         out.push_str("\",\"fg\":\"");
         push_color(fg, out);
         out.push_str("\",\"bg\":\"");
         push_color(bg, out);
-        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}}}", fl, w));
+        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}", fl, w));
+        // Extended underline style and SGR 58 colour (#589).  Both are omitted
+        // for ordinary runs so the per-frame payload is unchanged, and
+        // `flags & FLAG_UNDERLINE` still carries "underlined at all".
+        if ul > 1 {
+            let _ = std::fmt::Write::write_fmt(out, format_args!(",\"ul\":{}", ul));
+        }
+        if ulc != vt100::Color::Default {
+            out.push_str(",\"ulc\":\"");
+            push_color(ulc, out);
+            out.push('"');
+        }
+        // OSC 8 URI (#361).  The client re-emits hyperlinks only for runs that
+        // carry this field, and `CellRunJson::link` skips serialising when it is
+        // None, so omitting it here silently disabled hyperlinks in every pane.
+        if let Some(uri) = link {
+            out.push_str(",\"link\":\"");
+            json_esc(uri, out);
+            out.push('"');
+        }
+        out.push('}');
     }
 
     // ── recursive tree walker ────────────────────────────────────────
@@ -657,10 +799,12 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"rows\":{},\"cols\":{},",
                                 "\"cursor_row\":0,\"cursor_col\":0,",
                                 "\"alternate_screen\":false,",
+                                "\"wants_mouse\":false,",
                                 "\"hide_cursor\":true,",
                                 "\"cursor_shape\":0,",
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
+                                "\"view_offset\":0,",
                                 "\"rows_v2\":[],\"content\":[],\"title\":null}}"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
@@ -678,12 +822,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 // also holds p.term's mutex while processing ConPTY output).
                 // Without this, WSL echo gets starved because its output sits
                 // in the ConPTY pipe while we build the JSON string.
-                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
+                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16, link: Option<String>, ul: u8, ulc: vt100::Color }
                 struct RowSnap { runs: Vec<Run> }
                 struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, width: u16 }
                 struct LeafSnap {
                     cr: u16, cc: u16, alt: bool,
+                    wants_mouse: bool,
                     hide_cursor: bool,
+                    view_offset: usize,
                     rows_v2: Vec<RowSnap>,
                     content: Vec<Vec<CopyCell>>,
                 }
@@ -691,11 +837,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 let snap = 'snap: {
                     let parser = match p.term.lock() {
                         Ok(g) => g,
-                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, hide_cursor: false, rows_v2: vec![], content: vec![] },
+                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![] },
                     };
                     let screen = parser.screen();
                     let (cr, cc) = screen.cursor_position();
                     let hide_cursor = screen.hide_cursor();
+                    // Live scrollback offset — nonzero for a direct-scrolled
+                    // view (#193) even though copy_mode stays false.
+                    let view_offset = screen.scrollback();
 
                     // Alternate-screen heuristic
                     let alt = screen.alternate_screen() || {
@@ -707,6 +856,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                             })
                         })
                     };
+                    // Strict — explicit mouse protocol only (see Leaf field doc).
+                    let wants_mouse =
+                        screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
 
                     // Snapshot rows_v2 (run-merged)
                     let mut snap_rows: Vec<RowSnap> = Vec::with_capacity(p.last_rows as usize);
@@ -716,6 +868,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         let mut prev_fg: Option<vt100::Color> = None;
                         let mut prev_bg: Option<vt100::Color> = None;
                         let mut prev_fl: u8 = 0;
+                        let mut prev_link: Option<u32> = None;
+                        let mut prev_ul: u8 = 0;
+                        let mut prev_ulc = vt100::Color::Default;
 
                         while c < p.last_cols {
                             if let Some(cell) = screen.cell(r, c) {
@@ -735,33 +890,53 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 if cell.hidden()    { fl |= FLAG_HIDDEN; }
                                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
 
-                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                // A hyperlink change must also break the run, so the
+                                // client wraps exactly the linked text in OSC 8 (#361).
+                                let clink = cell.hyperlink_id();
+                                let cul = cell.underline_style().sgr_subparam();
+                                let culc = cell.underline_color();
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
+                                    && prev_link == Some(clink)
+                                    && prev_ul == cul && prev_ulc == culc
+                                {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push_str(t);
                                         last.width += w;
                                     }
                                 } else {
-                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w });
+                                    let link = if clink != 0 {
+                                        screen.hyperlink_uri(clink).map(|s| s.to_string())
+                                    } else { None };
+                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w, link, ul: cul, ulc: culc });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
                                 prev_fl = fl;
+                                prev_link = Some(clink);
+                                prev_ul = cul;
+                                prev_ulc = culc;
                                 c += w.max(1);
                             } else {
                                 let cfg = vt100::Color::Default;
                                 let cbg = vt100::Color::Default;
                                 let fl  = 0u8;
-                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
+                                    && prev_link == Some(0)
+                                    && prev_ul == 0 && prev_ulc == vt100::Color::Default
+                                {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push(' ');
                                         last.width += 1;
                                     }
                                 } else {
-                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1 });
+                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1, link: None, ul: 0, ulc: vt100::Color::Default });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
                                 prev_fl = fl;
+                                prev_link = Some(0);
+                                prev_ul = 0;
+                                prev_ulc = vt100::Color::Default;
                                 c += 1;
                             }
                         }
@@ -797,7 +972,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                     }
 
-                    LeafSnap { cr, cc, alt, hide_cursor, rows_v2: snap_rows, content: snap_content }
+                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content }
                 };
                 // ── Parser mutex is now RELEASED ──
                 // All JSON string building below happens without holding the lock,
@@ -812,14 +987,16 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         "\"rows\":{},\"cols\":{},",
                         "\"cursor_row\":{},\"cursor_col\":{},",
                         "\"alternate_screen\":{},",
+                        "\"wants_mouse\":{},",
                         "\"hide_cursor\":{},",
                         "\"cursor_shape\":{},",
                         "\"active\":{},\"copy_mode\":{},",
-                        "\"scroll_offset\":{},"),
+                        "\"scroll_offset\":{},",
+                        "\"view_offset\":{},"),
                     p.id, p.last_rows, p.last_cols,
-                    snap.cr, snap.cc, snap.alt, snap.hide_cursor,
+                    snap.cr, snap.cc, snap.alt, snap.wants_mouse, snap.hide_cursor,
                     cs,
-                    is_active, need_content, so,
+                    is_active, need_content, so, snap.view_offset,
                 ));
 
                 // selection bounds + copy cursor position
@@ -930,7 +1107,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         if i > 0 { out.push(','); }
                         out.push_str("{\"text\":\"");
                         json_esc(&run.text, out);
-                        close_run(run.fg, run.bg, run.flags, run.width, out);
+                        close_run(run.fg, run.bg, run.flags, run.width, run.link.as_deref(), run.ul, run.ulc, out);
                     }
                     out.push_str("]}");
                 }
@@ -1288,3 +1465,7 @@ mod test_layout;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_serialize_hyperlink.rs"]
 mod test_issue361_serialize_hyperlink;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue361_fastdump_hyperlink.rs"]
+mod test_issue361_fastdump_hyperlink;

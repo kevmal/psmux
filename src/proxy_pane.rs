@@ -99,6 +99,18 @@ impl MasterPty for ProxyMasterPty {
             .map(|s| -> Box<dyn Write + Send> { Box::new(s) })
             .ok_or_else(|| anyhow::anyhow!("writer already taken"))
     }
+
+    // The proxied PTY lives in another process; there is no local fd or
+    // termios to expose. `pid_t` is `i32` on every unix target, so the
+    // plain alias is written out to avoid a `libc` dependency here.
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<i32> { None }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> { None }
+
+    #[cfg(unix)]
+    fn tty_name(&self) -> Option<std::path::PathBuf> { None }
 }
 
 // ── ProxyChild ──────────────────────────────────────────────────────────
@@ -250,7 +262,7 @@ pub fn create_proxy_pane(
     let epoch = Instant::now() - Duration::from_secs(2);
     Ok(crate::types::Pane {
         master: Box::new(proxy_master),
-        writer: Box::new(writer),
+        writer: crate::pane::spawn_pane_write_queue(Box::new(writer)),
         child: Box::new(proxy_child),
         term,
         last_rows: rows,
@@ -268,6 +280,7 @@ pub fn create_proxy_pane(
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
+        scroll_fg_cache: None, mouse_proto_owner: None,
         cursor_shape: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         bell_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // CPR responses written via this field are TCP-forwarded to the source
@@ -276,6 +289,7 @@ pub fn create_proxy_pane(
         color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         copy_state: None,
         pane_style: None,
+        pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         // Proxy panes mirror a remote pane's ConPTY; respawning a local shell
