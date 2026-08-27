@@ -336,6 +336,14 @@ fn cli_validate_window_pane_target(ns: Option<&str>) {
                     (rest, None)
                 }
             }
+            // "<session>:%<id>" names a PANE, not a window. tmux accepts this form
+            // because its pane ids are unique per server, and callers lean on it to
+            // address a pane in a NAMED session (psmux's per-session %N counters make
+            // the bare "%N" ambiguous, so qualifying is the documented cure). Reading
+            // the "%1" as a window name made every such target die right here with
+            // "can't find window: %1" without a byte reaching the server, which
+            // resolves the form correctly.
+            None if rest.starts_with('%') => ("", Some(rest)),
             None => (rest, None),
         };
         if !win_part.is_empty() && !special(win_part) && cli_window_exists(win_part) == Some(false) {

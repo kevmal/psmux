@@ -148,6 +148,33 @@ $out = & $PSMUX list-panes -t "${S}:7" -F '#{window_name}' 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Pass "C4: nonexistent numeric index rc=$LASTEXITCODE" }
 else { Write-Fail "C4: nonexistent numeric index rc=0 ($out)" }
 
+# C5: "<session>:%<id>" is a PANE target, not a window named "%N".
+#     Regression: the validator split a pane component off only at a '.', so the
+#     "%1" of "sess:%1" landed in the WINDOW slot and the target died in the
+#     client with "can't find window: %1" without reaching the server.
+$paneId = (& $PSMUX list-panes -t "${S}:0" -F '#{pane_id}' 2>&1 | Select-Object -First 1 | Out-String).Trim()
+$cap = & $PSMUX capture-pane -p -t "${S}:$paneId" 2>&1
+$rcC5 = $LASTEXITCODE
+if ($rcC5 -eq 0 -and ($cap -join "`n") -notmatch "can't find window") {
+    Write-Pass "C5: session-qualified pane id capture-pane rc=0 ($paneId)"
+} else {
+    Write-Fail "C5: session-qualified pane id capture-pane rc=$rcC5 out=$($cap -join ' ')"
+}
+
+# C6: and it reaches the PANE, not just the client validator
+& $PSMUX send-keys -t "${S}:$paneId" 'echo QUALIFIED_PANE_OK' Enter 2>&1 | Out-Null
+$rcC6 = $LASTEXITCODE
+Start-Sleep -Seconds 2
+$cap = (& $PSMUX capture-pane -p -t "${S}:0" 2>&1) -join "`n"
+if ($rcC6 -eq 0 -and $cap -match "QUALIFIED_PANE_OK") { Write-Pass "C6: session-qualified pane id send-keys executes" }
+else { Write-Fail "C6: session-qualified pane id send-keys rc=$rcC6 executed=$($cap -match 'QUALIFIED_PANE_OK')" }
+
+# C7: a session-qualified pane id that does NOT exist is still refused
+$out = & $PSMUX capture-pane -p -t "${S}:%999" 2>&1
+if ($LASTEXITCODE -ne 0 -and ($out -join "") -match "can't find pane") { Write-Pass "C7: nonexistent qualified pane id refused" }
+else { Write-Fail "C7: nonexistent qualified pane id rc=$LASTEXITCODE out=$out" }
+
+
 # --- Part D: Win32 TUI proof (Strategy A) ---
 Write-Host "`n[Part D] Win32 TUI visual verification" -ForegroundColor Yellow
 $STUI = "t545tui"
