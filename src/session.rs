@@ -1974,10 +1974,34 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     }
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
-    // Half-close so the server sees EOF after our request and closes the socket
-    // once the reply is complete — giving a definitive Ok(0) end-of-response
-    // instead of relying on an idle-gap timeout to guess the reply is done.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // NO half-close here — deliberately, and unlike `send_control` above.
+    //
+    // This used to `shutdown(Shutdown::Write)` so the server saw EOF straight
+    // after the request. That made the CLIENT the active closer of every
+    // one-shot command, so its ephemeral port sat in TIME_WAIT for the Windows
+    // `TcpTimedWaitDelay` (2 min). At ~90 connections/sec that parks ~10k ports
+    // against a 16,384-port dynamic range, and `connect` starts failing with
+    // WSAEADDRINUSE ("Only one usage of each socket address..."). Letting the
+    // server close first moves TIME_WAIT onto its fixed listening port, which
+    // costs no ephemeral port, and frees ours immediately via a passive close.
+    //
+    // The end-of-response contract is unchanged: the read loop below still ends
+    // on a definitive `Ok(0)`. Only the side that sends FIN first changes. The
+    // server closes a non-persistent connection on its own — every reply-
+    // producing handler ends with `if !persistent { break; }` (39 sites in
+    // server/connection.rs; capture-pane, list-panes, list-windows,
+    // list-sessions and show-buffer all take that path), which returns from
+    // `handle_connection` and drops the socket. A command that instead falls
+    // through to the loop tail closes one batch-read timeout later
+    // (`server/connection.rs`, 10 ms), so the worst case is +10 ms and the hot
+    // path is unchanged.
+    //
+    // Crucially this is NOT the case #464 fixed. That bug was in
+    // `send_control` — fire-and-forget, which closed with data still unread by
+    // the server, so a Windows loopback RST could discard the command before it
+    // was dispatched (`kill-session` no-opping at exit 0). Its half-close stays.
+    // Here we read the reply to EOF before closing at all, so there is never
+    // unread data pending at close and the RST window is never opened.
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut timed_out = false;
@@ -2018,10 +2042,14 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
             trimmed.trim_start_matches("ERROR:").trim().to_string(),
         ));
     }
-    // A read timeout means the reply is INCOMPLETE. The half-close above makes a
-    // complete reply end in a definitive server-side EOF (Ok(0)), so landing in
-    // the timeout branch at all means we did not get the whole answer, whatever
-    // is already in `buf`. The old guard also required `buf.is_empty()`, which
+    // A read timeout means the reply is INCOMPLETE. The server closes a
+    // non-persistent connection once it has answered, so a complete reply ends
+    // in a definitive server-side EOF (Ok(0)); landing in the timeout branch at
+    // all means we did not get the whole answer, whatever is already in `buf`.
+    // (This used to be guaranteed by a client-side half-close; it is now the
+    // server's own close, which is what produced the EOF in either case — see
+    // the note at the request write above.) The old guard also required
+    // `buf.is_empty()`, which
     // the OK ack made permanently false on any authenticated connection, so a
     // stall returned Ok("") and a truncation returned Ok(partial) at exit 0 —
     // indistinguishable from an empty result set and from a complete one
