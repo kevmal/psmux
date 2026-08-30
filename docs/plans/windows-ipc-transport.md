@@ -39,9 +39,12 @@ measurement.*
 command — but the durable fix is a **Windows named-pipe transport (Option 2)**,
 not AF_UNIX, and not connection pooling. Ship it behind a **dual-listen
 migration** so live sessions are never broken. If something is needed sooner
-than that lands, **Option 6** (stop the client-side half-close so the *server*
-becomes the active closer) is a small, correct change that removes the
-client-side TIME_WAIT accumulation on its own. Full reasoning in §5–§7.
+than that lands, **Option 6** (drop the half-close in
+`send_control_with_response` *only*, so the *server* becomes the active closer)
+is a small, correct change that removes the client-side TIME_WAIT accumulation on
+its own. It must **not** be applied to `send_control` — that fire-and-forget path
+is where PR #464's unread-data RST bug actually lived, and its half-close has to
+stay. Full reasoning in §5–§7.
 
 ---
 
@@ -494,54 +497,90 @@ port-reuse identity hazard (§2.6a) stays.
 **Risk:** zero, immediately; unbounded recurrence risk later.
 **Ships without breaking live sessions?** Trivially.
 
-### Option 6 — stop half-closing; let the *server* be the active closer *(not in the original brief; found while reading)*
+### Option 6 — stop half-closing in the *with-response* path only; let the server be the active closer *(not in the original brief; found while reading)*
 
-**How it works.** Delete the client's `shutdown(Shutdown::Write)` in
-`send_control` / `send_control_with_response`. The client writes its command and
-just reads. The server already ends a one-shot connection on its own — after the
-command it sets a 10 ms read timeout (`src/server/connection.rs:926`), the next
-`read_line` times out, the loop breaks, `handle_connection` returns and the
-stream drops. **The server sends FIN first**, so the server becomes the active
-closer, its TIME_WAIT sits on its **fixed listening port** (which consumes no
-ephemeral port), and the client's ephemeral port is released at once through a
-passive close.
+**This option applies to exactly one of the two client functions.** Conflating
+them is the mistake that makes Option 6 look dangerous, so state the split
+first:
 
-**What it costs and what it risks — honestly:**
+| | `send_control` (`src/session.rs:1888`) | `send_control_with_response` (`src/session.rs:1946`) |
+|---|---|---|
+| Shape | fire-and-forget + a `session-info` barrier | request → read reply to `Ok(0)` |
+| Reads the reply? | no (drains and discards) | **yes, to EOF, before closing** |
+| Unread data pending at close? | **yes — this is #464's RST window** | **no** |
+| Half-close | **must stay** | **safe to remove** |
 
-- **+~10 ms latency per CLI command**, because the client no longer signals EOF
-  and the server waits out its batch-drain window. Fixable by having the client
-  declare a one-shot request explicitly (a `ONESHOT\n` line after `AUTH`, or a
-  length-prefixed request) so the server can close immediately — that is a small,
-  additive, backwards-compatible protocol change, and it is the **same framing
-  work Option 2 needs**.
-- **It must not reintroduce #464.** The RST that #464 fixed came from the client
-  closing *with unread data pending*. Here the client stops closing early
-  altogether and reads until the server closes, so the RST window is not
-  reopened — **but this is precisely the claim that must be proven by
-  `tests/test_command_reliability.ps1` before it ships**, and I have not run it.
-- **A second-order collision risk remains.** TIME_WAIT moves to the server, keyed
-  on the 4-tuple *(server port, client ephemeral port)*. If the client's allocator
-  later reuses the same ephemeral port toward the same server within the window,
-  the connect can still fail with 10048. *Rough arithmetic, flagged as inference:*
-  ~900 connections per 2-minute window per busy server over 16,384 ports gives on
-  the order of tens of potential tuple repeats per window — much better than 87%
-  exhaustion, but **not zero**. This is why Option 6 is a strong mitigation and
-  not the destination.
+**PR #464's bug lived in `send_control`,** in its own words: *"`send_control` is
+fire-and-forget with no ack — the client closes the socket ~immediately after
+writing, so on Windows loopback an unread-data RST can make the server drop the
+command before it is dispatched"* — `kill-session` silently no-opping while still
+exiting 0. Removing that half-close reintroduces that bug directly. **It stays.**
 
-**Code changes.** Two `shutdown` calls removed in `src/session.rs` (~1976 and the
-`send_control` equivalent ~1930), plus — to avoid the 10 ms tax — an additive
-`ONESHOT` handshake in `src/server/connection.rs` and the two client helpers.
-`src/cross_session.rs:35` gets the same treatment.
+`send_control_with_response` cannot reproduce that failure mode: it reads the
+reply to a definitive `Ok(0)` *before* the socket is closed at all, so there is
+never unread data pending at close and the RST condition cannot arise. **Only
+this function should change.**
 
-**Effort:** ~0.5 day for the bare change; ~2 days with the `ONESHOT` framing and
-tests.
-**Risk:** low–medium. It touches the exact code path PR #464 fixed, so it lives
-or dies on that PR's regression test.
+**How it works.** Delete the `shutdown(Shutdown::Write)` in
+`send_control_with_response`. The client writes its command and just reads. The
+server sends FIN first, so it becomes the active closer, its TIME_WAIT sits on
+its **fixed listening port** (consuming no ephemeral port), and the client's port
+is released immediately via a passive close.
+
+**The half-close's second job, and what replaces it.** The in-code comment
+claimed it gave *"a definitive `Ok(0)` end-of-response instead of relying on an
+idle-gap timeout to guess the reply is done."* That framing guarantee is
+preserved, because **the server closes a non-persistent connection on its own** —
+this was verified in the source, not assumed:
+
+- Every reply-producing handler ends with `if !persistent { break; }` — **39 such
+  sites** in `src/server/connection.rs`. `capture-pane` (`:1212`), `list-panes`
+  (`:1694`), `list-windows` (`:1424`), `list-sessions` (`:3476`) and
+  `show-buffer` (`:2008`) all write their reply, flush, and break immediately.
+  The loop exits, `handle_connection` returns, the socket drops, the client gets
+  `Ok(0)`. **For these — the entire hot path — there is no added latency at all.**
+- A command that instead falls through to the loop tail hits the batch-read at
+  `src/server/connection.rs:3786`. Confirmed: `Err(TimedOut)` fails the
+  `if persistent && is_persistent_read_pending(&e)` guard (`:3797`) and reaches
+  `break; // Non-persistent timeout or real error` (`:3803`). The 10 ms timeout
+  is set at `:926` and nothing resets it on the non-persistent path. So the
+  connection closes ~10 ms later.
+
+So the cost is **0 ms on the hot path, +10 ms worst case**, not the flat +10 ms
+per command I first wrote.
+
+**If the server's batch-read timeout does *not* fire as expected,** the client
+does not hang: it still has its own 3 s read timeout
+(`set_read_timeout(3000)` at `src/session.rs:1970`), and the existing `timed_out`
+guard converts that into `Err(TimedOut, "no response from server (timed out)")`
+rather than a silent truncation at exit 0 — the #561 behaviour, unchanged. The
+failure mode is therefore a slow, loud, retryable error, not data loss. The
+degradation to watch for is a command that previously returned in ~2 ms taking
+3 s and erroring.
+
+**Residual risk — a second-order collision remains.** TIME_WAIT moves to the
+server, keyed on the 4-tuple *(server port, client ephemeral port)*. If the
+client's allocator reuses the same ephemeral port toward the same server inside
+the window, connect can still fail with 10048. *Rough arithmetic, flagged as
+inference:* ~900 connections per 2-minute window per busy server across 16,384
+ports gives on the order of tens of potential tuple repeats per window — far
+better than 87% exhaustion, but **not zero**. This is why Option 6 is a strong
+mitigation and Option 2 is still the destination.
+
+**Code changes.** One `shutdown` call removed in `send_control_with_response`.
+`send_control` untouched. Optionally, later, an additive `ONESHOT` handshake to
+close even the 10 ms tail — the same framing work Option 2 needs.
+`src/cross_session.rs:35` reads to EOF like the with-response path and could take
+the same treatment, but it is low-volume and out of scope.
+
+**Effort:** ~0.5 day for the change; ~2 days if the `ONESHOT` framing is included.
+**Risk:** low. It touches the neighbourhood of PR #464 but not the function #464
+fixed, and it lives or dies on that PR's regression test
+(`tests/test_command_reliability.ps1`).
 **Ships without breaking live sessions?** **Yes, and uniquely well** — it is
-purely client-side if shipped without `ONESHOT`, so a new client talks to the
-*existing running servers* with no server restart at all. That makes it the only
-option that improves the situation for Kevin's 12 currently-live sessions
-without restarting them.
+purely client-side, so a patched client talks to the *existing running servers*
+with no server restart at all. That makes it the only option that improves the
+situation for the 12 currently-live sessions without restarting them.
 
 ---
 
@@ -694,9 +733,12 @@ here.
 
 **Ship Option 6 now, and Option 2 as the destination.**
 
-Option 6 — stop the client half-close so the server becomes the active closer —
-is the only change that helps the 12 sessions that are live *today*, because in
-its minimal form it is purely client-side and needs no server restart. It removes
+Option 6 — drop the half-close in `send_control_with_response` only, so the
+server becomes the active closer — is the only change that helps the 12 sessions
+that are live *today*, because it is purely client-side and needs no server
+restart. `send_control` keeps its half-close: that fire-and-forget path is where
+PR #464's unread-data RST actually was, and removing it there would reintroduce
+the bug. It removes
 the client-side TIME_WAIT accumulation that is causing the 87% exhaustion, it is
 half a day of work plus PR #464's regression test as the gate, and its `ONESHOT`
 framing refinement is the same protocol work Option 2 needs anyway — so it is not
@@ -722,17 +764,28 @@ refactor from §2.5, which is a prerequisite for everything and reviewable on it
 own; (d) Option 6 with `ONESHOT` framing; (e) Option 2 behind dual-listen.
 Steps (c)–(e) are roughly 11–15 engineer-days total.
 
-## 9. The biggest open question I could not resolve
+## 9. The biggest open question
 
-**Does removing the client's half-close actually stay clear of the RST that PR
-#464 fixed?** My reasoning in §5/Option 6 is that #464's RST came from the client
-closing *with unread data pending*, and that a client which never closes early
-cannot reproduce it — but that is a code-reading argument, and I deliberately did
-not build or run anything on this machine. The claim is exactly the kind that
-Windows loopback semantics punish for being plausible. It needs
-`tests/test_command_reliability.ps1` (the test PR #464 shipped) run against a
-patched client in a disposable namespace per `AGENTS.md`, and until it passes,
-the whole recommended sequencing rests on an unverified premise.
+**Originally:** *"does removing the client's half-close stay clear of the RST that
+PR #464 fixed?"* That question is now largely answered by scoping, not by
+argument. #464's RST was in **`send_control`** — fire-and-forget, closing with
+data the server had not yet read. Option 6 does not touch `send_control`; it
+changes only `send_control_with_response`, which reads the reply to `Ok(0)`
+before closing at all, so no unread data is ever pending. The two functions are
+separated explicitly in §5/Option 6.
+
+**What remains open** is narrower but still real: **whether the server reliably
+closes a non-persistent connection in every case, now that the client no longer
+supplies the EOF.** The two mechanisms were both read in the source — the 39
+`if !persistent { break; }` sites, and the batch-read timeout falling through to
+`break` at `src/server/connection.rs:3803` — so the argument is no longer purely
+inferential. But "every reply-producing command reaches one of those two paths"
+is a claim about ~39 hand-written match arms, and a handler that returns a reply
+*without* breaking and *without* reaching the loop tail would now stall the
+client for its full 3 s read timeout instead of returning instantly. That is a
+loud, retryable error rather than data loss (§5/Option 6), but it would be a
+regression. The gate is `tests/test_command_reliability.ps1` — the test PR #464
+shipped — run against a patched client in a disposable namespace per `AGENTS.md`.
 
 Two smaller unknowns, both flagged inline: the true rate of 4-tuple collisions
 after Option 6 (my arithmetic is order-of-magnitude only), and whether the
