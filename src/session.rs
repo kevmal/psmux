@@ -1972,6 +1972,13 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
+    // The server frames a command by the newline, and without a half-close it
+    // has no other end-of-request signal: a `line` that does not end in `\n`
+    // would leave `read_line` blocking until the auth-phase timeout, after
+    // which the server returns WITHOUT dispatching and this call yields Ok("")
+    // at exit 0. Every in-tree caller already terminates the line; normalize
+    // anyway, because this is a `pub fn` and the failure is silent.
+    let line = if line.ends_with('\n') { line } else { format!("{}\n", line) };
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
     // NO half-close here — deliberately, and unlike `send_control` above.
@@ -1979,29 +1986,33 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     // This used to `shutdown(Shutdown::Write)` so the server saw EOF straight
     // after the request. That made the CLIENT the active closer of every
     // one-shot command, so its ephemeral port sat in TIME_WAIT for the Windows
-    // `TcpTimedWaitDelay` (2 min). At ~90 connections/sec that parks ~10k ports
-    // against a 16,384-port dynamic range, and `connect` starts failing with
-    // WSAEADDRINUSE ("Only one usage of each socket address..."). Letting the
-    // server close first moves TIME_WAIT onto its fixed listening port, which
-    // costs no ephemeral port, and frees ours immediately via a passive close.
+    // `TcpTimedWaitDelay` (2 min) — enough, at a few tens of commands a second,
+    // to exhaust the machine's ephemeral range and fail `connect` with
+    // WSAEADDRINUSE. Letting the server close first moves TIME_WAIT onto its
+    // fixed listening port, which costs no ephemeral port, and frees ours
+    // immediately via a passive close.
     //
-    // The end-of-response contract is unchanged: the read loop below still ends
-    // on a definitive `Ok(0)`. Only the side that sends FIN first changes. The
-    // server closes a non-persistent connection on its own — every reply-
-    // producing handler ends with `if !persistent { break; }` (39 sites in
-    // server/connection.rs; capture-pane, list-panes, list-windows,
-    // list-sessions and show-buffer all take that path), which returns from
-    // `handle_connection` and drops the socket. A command that instead falls
-    // through to the loop tail closes one batch-read timeout later
-    // (`server/connection.rs`, 10 ms), so the worst case is +10 ms and the hot
-    // path is unchanged.
+    // The end-of-response contract is unchanged — the read loop below still
+    // ends on a definitive `Ok(0)`; only the side that sends FIN first changes.
+    // What supplies that `Ok(0)` is now the server's own close, by one of two
+    // paths: most reply-producing handlers break out of the command loop as
+    // soon as they have answered, and anything that instead falls through to
+    // the loop tail closes one batch-read timeout later. So the cost is nil on
+    // the paths that break and one batch-read timeout on the paths that do not
+    // — `refresh-client`, `run-shell`, `paste-buffer`, `kill-window` and
+    // `wait-for` among them. Both paths are in `server::connection`, and both
+    // are load-bearing for this function: a handler that answers and then
+    // blocks before doing either turns a fast command into a read-timeout
+    // error here.
     //
     // Crucially this is NOT the case #464 fixed. That bug was in
     // `send_control` — fire-and-forget, which closed with data still unread by
     // the server, so a Windows loopback RST could discard the command before it
-    // was dispatched (`kill-session` no-opping at exit 0). Its half-close stays.
-    // Here we read the reply to EOF before closing at all, so there is never
-    // unread data pending at close and the RST window is never opened.
+    // was dispatched (`kill-session` no-opping at exit 0). Its half-close
+    // stays, and those paths still spend an ephemeral port per call. Here we
+    // read the reply to EOF before closing at all, so this side never closes
+    // with data pending. (The server closing on a refusal still can; that is
+    // unchanged by this and is what the refusal classification below is for.)
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut timed_out = false;
@@ -2029,7 +2040,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     // simply printed the reply, so `list-windows` put "ERROR: Authentication
     // required" on STDOUT at exit 0 and a machine consumer ingested it as a
     // window record (issue #561). Classified here, at the single chokepoint,
-    // rather than at the 22 call sites that print the reply.
+    // rather than at every call site that prints the reply.
     //
     // Matched as exact whole-payload strings on purpose, NOT as an "ERROR:"
     // prefix: capture-pane and show-buffer return arbitrary pane content, which
@@ -2049,8 +2060,8 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     // (This used to be guaranteed by a client-side half-close; it is now the
     // server's own close, which is what produced the EOF in either case — see
     // the note at the request write above.) The old guard also required
-    // `buf.is_empty()`, which
-    // the OK ack made permanently false on any authenticated connection, so a
+    // `buf.is_empty()`, which the OK ack made permanently false on any
+    // authenticated connection, so a
     // stall returned Ok("") and a truncation returned Ok(partial) at exit 0 —
     // indistinguishable from an empty result set and from a complete one
     // (issue #561, cases B and C).
