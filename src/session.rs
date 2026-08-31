@@ -1913,6 +1913,13 @@ pub fn send_control(line: String) -> io::Result<()> {
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
+    // Normalize the terminator before the barrier is appended. The two writes
+    // are adjacent, so a `line` without a trailing newline fuses with it into a
+    // single garbage command (`display-message hisession-info`): the caller's
+    // command never runs, the barrier is eaten as payload, and this returns
+    // Ok(()) regardless. Pre-dates the half-close removal, but it is silent and
+    // this is a `pub fn`. Mirrors the same guard in send_control_with_response.
+    let line = if line.ends_with('\n') { line } else { format!("{}\n", line) };
     let _ = write!(stream, "{}", line);
     // Tier 2 — confirmed EXECUTION (not just delivery): append a `session-info`
     // barrier. It round-trips through the server's single FIFO event loop, so its

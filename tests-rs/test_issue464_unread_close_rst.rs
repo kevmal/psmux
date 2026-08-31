@@ -1,59 +1,70 @@
-// Regression tests for the #464 property that `send_control` must preserve:
-// a one-shot command must reach a BUSY server, not be discarded in flight.
+// Tests for the two properties `send_control` must hold simultaneously:
 //
-// #464's bug, in its own words: "`send_control` is fire-and-forget with no ack
-// — the client closes the socket ~immediately after writing, so on Windows
-// loopback an unread-data RST can make the server drop the command before it is
-// dispatched", leaving `kill-session` a no-op at exit 0.
+//   1. DELIVERY (#464). A one-shot command must reach a BUSY server — one that
+//      has not yet read it when the client finishes writing — rather than being
+//      discarded in flight.
+//   2. PASSIVE CLOSE. The client must not be the side that closes first, or it
+//      parks an ephemeral port in TIME_WAIT on every call.
 //
-// The mechanism is specific and worth stating, because it is what these tests
-// pin. `closesocket` sends RST instead of FIN when the CLOSING side still has
-// unread bytes in its own receive buffer. The server writes `OK\n` the moment it
-// accepts the AUTH line, so a client that writes its command and closes without
-// ever reading that ack closes with unread data — RST — and the RST discards
-// whatever the client sent that the server has not yet read. A server slow
-// enough not to have read the command yet therefore never sees it.
+// They pull in opposite directions, which is why both are pinned here. #464's
+// fix bought (1) with a client-side half-close, which cost (2). The half-close
+// is gone; (1) now rests on the drain-to-EOF below the write, and (2) follows.
 //
-// #464 fixed this with a half-close. Reading the reply to EOF fixes it too, and
-// is what the code does now: draining to EOF means there is nothing unread at
-// close, so the close is a graceful FIN either way. These tests assert the
-// PROPERTY (the command arrives at a server that has not read it yet) rather
-// than the mechanism, so they stay valid across that change and would fail if
-// both safeguards were dropped.
+// #464's mechanism, since it is what these tests are about: `closesocket` sends
+// RST instead of FIN when the CLOSING side still has unread bytes in its own
+// receive buffer. The server acks `OK\n` the moment it reads the AUTH line, so
+// a client that writes its command and closes without reading that ack closes
+// with unread data, and the RST discards whatever the server has not yet read —
+// including the command. Draining to EOF means nothing is unread at close, so
+// the close is a graceful FIN whether or not a FIN was sent earlier. The command
+// is delimited by its newline, not by EOF, so the server never needed the FIN in
+// order to dispatch.
 //
-// HONEST LIMIT, stated up front: the abortive close #464 describes could NOT be
-// reproduced here. A client that writes the command and closes with the `OK`
-// ack still unread — the exact pre-#464 shape — against a server stalled 300 ms
-// before its first read still delivered the command intact on this stack.
-// `set_linger(0)`, which would force the RST unconditionally, is unstable
-// (`tcp_linger`, rust#88494) and unavailable on the pinned toolchain. So these
-// are GUARDS, not discriminators: they pin the property end to end through the
-// real `send_control`, and `the_guard_exercises_a_server_that_is_still_busy`
-// pins that they do so against a genuinely unread socket — but they cannot
-// demonstrate that they would catch the original RST, because nothing here can
-// produce it. Treat a green run as "the property holds", not as "the hazard is
-// impossible".
+// HONEST LIMIT — read before trusting a green run. The abortive close #464
+// describes could NOT be reproduced here. A client in the exact pre-#464 shape
+// (write, then close with the ack unread, no half-close) against a server
+// stalled 300 ms before its first read still delivered the command intact on
+// this loopback. `set_linger(0)`, which would force the RST unconditionally, is
+// unstable (`tcp_linger`, rust#88494) and unavailable on the pinned toolchain.
 //
-// `tests/test_command_reliability.ps1`, the suite #464 shipped, covers less
-// than this: it drives real sessions on a fast loopback and stays green even
-// with the half-close removed entirely.
+// So `send_control_reaches_a_server_that_has_not_read_the_command_yet` is a
+// GUARD for the delivery property, not a reproduction of the hazard. It cannot
+// be claimed to catch every way of losing (1): in particular these tests would
+// very likely stay green even if the drain were removed, because the hazard that
+// would then bite does not fire on this stack. Do not read a green run as
+// licence to remove the drain.
+//
+// `send_control_does_not_close_the_connection_first` is different in kind: it is
+// a true discriminator and fails if the half-close is restored.
+//
+// `tests/test_command_reliability.ps1`, the suite #464 shipped, covers less than
+// any of this — it drives real sessions on a fast loopback and stays green with
+// the half-close removed entirely.
 
 use super::*;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the fake server stalls after acking AUTH, standing in for a server
-/// busy enough that the command is still sitting in its receive queue when the
-/// client closes. Long enough to make the race deterministic rather than
-/// timing-dependent.
+/// busy enough that the command is still unread when the client stops writing.
 const BUSY_STALL: Duration = Duration::from_millis(300);
 
-/// Restores a mutated env var on drop (same shape as the guard in
-/// `test_data_dir_override.rs`), so a failure mid-test cannot leak into
-/// other tests.
+/// How long the server waits, after answering the barrier, to see whether the
+/// client closes its write side. A client that half-closes shows up as a clean
+/// EOF well inside this window; one that waits for the server shows nothing.
+const FIN_PROBE: Duration = Duration::from_millis(250);
+
+/// Restores a mutated env var on drop, so a failure mid-test cannot leak the
+/// value into other tests.
+///
+/// NOTE: this is the fourth copy of this shape in `tests-rs` (see
+/// `test_data_dir_override.rs`, `test_config_plugin_paths.rs`,
+/// `test_issue599_data_root_mutex.rs`). Hoisting one copy next to
+/// `crate::util::lock_test_env` is a worthwhile follow-up; duplicated here
+/// rather than refactoring four call sites inside an unrelated fix.
 struct EnvGuard {
     var: &'static str,
     prev: Option<std::ffi::OsString>,
@@ -81,25 +92,40 @@ impl Drop for EnvGuard {
     }
 }
 
+/// What the fake server actually observed. Server-side instrumentation, so the
+/// assertions rest on what the server saw rather than on a client-side proxy.
+struct Observed {
+    /// Every non-empty command line read, in order.
+    seen: Vec<String>,
+    /// Delay between acking AUTH and successfully reading the first command
+    /// line. Proves the command really was still unread during the stall.
+    first_read_after_ack: Option<Duration>,
+    /// True when the client closed its write side before the server closed —
+    /// i.e. the client was the active closer. This is what a half-close looks
+    /// like from the far end.
+    client_closed_first: bool,
+}
+
 /// A stand-in for a busy psmux server.
 ///
-/// Accepts one connection, reads the AUTH line, acks `OK\n` exactly as
-/// `handle_connection` does, then STALLS before reading the command — so a
-/// client that closes abortively in the meantime destroys it. Reports every
-/// command line it managed to read.
-///
-/// Answers `session-info` (the barrier `send_control` appends) and then closes,
-/// mirroring the real server's `if !persistent { break; }` on that arm.
-fn spawn_busy_server(listener: TcpListener) -> mpsc::Receiver<Vec<String>> {
-    let (tx, rx) = mpsc::channel::<Vec<String>>();
+/// Accepts one connection, reads AUTH, acks `OK\n` exactly as
+/// `handle_connection` does, then STALLS before its first read. Answers the
+/// `session-info` barrier (mirroring the real server's `if !persistent
+/// { break; }` on that arm), then probes for a client FIN before closing.
+fn spawn_busy_server(listener: TcpListener) -> mpsc::Receiver<Observed> {
+    let (tx, rx) = mpsc::channel::<Observed>();
     std::thread::spawn(move || {
-        let mut seen: Vec<String> = Vec::new();
+        let mut obs = Observed {
+            seen: Vec::new(),
+            first_read_after_ack: None,
+            client_closed_first: false,
+        };
         if let Ok((stream, _)) = listener.accept() {
             let _ = stream.set_nodelay(true);
             let mut write_half = match stream.try_clone() {
                 Ok(s) => s,
                 Err(_) => {
-                    let _ = tx.send(seen);
+                    let _ = tx.send(obs);
                     return;
                 }
             };
@@ -109,46 +135,57 @@ fn spawn_busy_server(listener: TcpListener) -> mpsc::Receiver<Vec<String>> {
 
             let mut auth = String::new();
             if reader.read_line(&mut auth).is_err() || !auth.starts_with("AUTH ") {
-                let _ = tx.send(seen);
+                let _ = tx.send(obs);
                 return;
             }
-            // The ack that a non-reading client leaves unread — the RST trigger.
+            // The ack a non-reading client would leave unread — the RST trigger.
             let _ = write_half.write_all(b"OK\n");
             let _ = write_half.flush();
+            let acked_at = Instant::now();
 
-            // Be busy. A client that closes without draining kills the
-            // connection during this window and its command never arrives.
+            // Be busy: the command sits unread in the receive queue throughout.
             std::thread::sleep(BUSY_STALL);
 
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) => break,                    // clean EOF
-                    Err(_) => break,                   // RST or timeout
+                    Ok(0) => break,  // clean EOF
+                    Err(_) => break, // reset or timeout
                     Ok(_) => {
+                        if obs.first_read_after_ack.is_none() {
+                            obs.first_read_after_ack = Some(acked_at.elapsed());
+                        }
                         let trimmed = line.trim().to_string();
                         if trimmed.is_empty() {
                             continue;
                         }
                         let is_barrier = trimmed == "session-info";
-                        seen.push(trimmed);
+                        obs.seen.push(trimmed);
                         if is_barrier {
-                            // Real server: answers, then breaks and closes.
                             let _ = write_half.write_all(b"fake-session-info\n");
                             let _ = write_half.flush();
+                            // The real server breaks here and closes. Before
+                            // closing, look for a client FIN: if the client
+                            // half-closed, its EOF is already queued and this
+                            // read returns Ok(0) immediately. If the client is
+                            // waiting on us instead, this read times out.
+                            let _ = reader.get_ref().set_read_timeout(Some(FIN_PROBE));
+                            let mut probe = String::new();
+                            obs.client_closed_first =
+                                matches!(reader.read_line(&mut probe), Ok(0));
                             break;
                         }
                     }
                 }
             }
         }
-        let _ = tx.send(seen);
+        let _ = tx.send(obs);
     });
     rx
 }
 
 /// Point the session registry at a throwaway dir holding a `.port`/`.key` pair
-/// for `session`, so `send_control` resolves to `listener`.
+/// for `session`, so `send_control` resolves to our fake listener.
 fn stage_registry(dir: &std::path::Path, session: &str, port: u16) {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join(format!("{session}.port")), port.to_string()).expect("write .port");
@@ -167,116 +204,119 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     p
 }
 
-/// THE GUARD. `send_control` must deliver its command to a server that has not
-/// read it yet at the moment the client is done writing.
-///
-/// This is the #464 property. It held via the half-close and it holds via the
-/// read-to-EOF drain; it must not be lost to a future change that removes both.
+/// Run `send_control(line)` against a busy fake server and report what the
+/// server saw. Serializes on the crate-wide env lock because it mutates
+/// process-global env.
+fn send_control_against_busy_server(tag: &str, session: &str, line: &str) -> Observed {
+    let _lock = crate::util::lock_test_env();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let rx = spawn_busy_server(listener);
+
+    let dir = temp_dir(tag);
+    stage_registry(&dir, session, port);
+
+    let _data = EnvGuard::set("PSMUX_DATA_DIR", dir.to_str().expect("utf8 dir"));
+    let _target = EnvGuard::set("PSMUX_TARGET_SESSION", session);
+    let _full = EnvGuard::remove("PSMUX_TARGET_FULL");
+
+    send_control(line.to_string()).expect("send_control");
+
+    let obs = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server thread reported");
+    let _ = std::fs::remove_dir_all(&dir);
+    obs
+}
+
+/// DELIVERY GUARD (#464). The command must reach a server that had not read it
+/// when the client finished writing — and the server-side timing must confirm
+/// the test really exercised that window, or the guard proves nothing.
 #[test]
 fn send_control_reaches_a_server_that_has_not_read_the_command_yet() {
-    let _lock = crate::util::lock_test_env();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let seen_rx = spawn_busy_server(listener);
-
-    let dir = temp_dir("guard");
-    stage_registry(&dir, "i464", port);
-
-    let _data = EnvGuard::set("PSMUX_DATA_DIR", dir.to_str().expect("utf8 dir"));
-    let _target = EnvGuard::set("PSMUX_TARGET_SESSION", "i464");
-    let _full = EnvGuard::remove("PSMUX_TARGET_FULL");
-
-    send_control("kill-session -t i464\n".to_string()).expect("send_control");
-
-    let seen = seen_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("server thread reported");
-    let _ = std::fs::remove_dir_all(&dir);
+    let obs = send_control_against_busy_server("guard", "i464", "kill-session -t i464\n");
 
     assert!(
-        seen.iter().any(|l| l.starts_with("kill-session")),
-        "a busy server must still receive the command; saw {seen:?}"
+        obs.seen.iter().any(|l| l.starts_with("kill-session")),
+        "a busy server must still receive the command; saw {:?}",
+        obs.seen
+    );
+    // Non-vacuity, measured server-side: the first successful read happened only
+    // after the stall, so the command genuinely sat unread meanwhile.
+    let first = obs
+        .first_read_after_ack
+        .expect("server must have read at least one line");
+    assert!(
+        first >= BUSY_STALL,
+        "the guard must exercise a server that had NOT drained the socket; first \
+         read came {first:?} after the ack, before the {BUSY_STALL:?} stall"
     );
 }
 
-/// NON-VACUITY. The guard above is only meaningful if the fake server really
-/// has NOT read the command when the client finishes writing. Assert that
-/// precondition directly: the server records how long after the AUTH ack it
-/// first managed to read a command line, and it must be at least the stall.
+/// THE DISCRIMINATOR for this change. The client must not be the side that
+/// closes first.
 ///
-/// This replaces what was meant to be a "reproduce the RST" test. See the
-/// module comment: the abortive-close failure #464 describes could not be
-/// reproduced on this loopback, so proving the harness detects data loss was
-/// not possible. Proving the harness exercises the busy-server path is.
+/// Unlike the delivery guard, this test genuinely fails if the fix is reverted:
+/// restoring `shutdown(Shutdown::Write)` in `send_control` makes the client's
+/// EOF arrive before the server closes, which the server sees as `Ok(0)` on the
+/// probe read. That is what keeps the ephemeral-port fix from regressing
+/// silently, detectable only by re-running a manual netstat measurement.
 #[test]
-fn the_guard_exercises_a_server_that_is_still_busy() {
-    let _lock = crate::util::lock_test_env();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let seen_rx = spawn_busy_server(listener);
-
-    let dir = temp_dir("busy");
-    stage_registry(&dir, "i464c", port);
-
-    let _data = EnvGuard::set("PSMUX_DATA_DIR", dir.to_str().expect("utf8 dir"));
-    let _target = EnvGuard::set("PSMUX_TARGET_SESSION", "i464c");
-    let _full = EnvGuard::remove("PSMUX_TARGET_FULL");
-
-    let started = std::time::Instant::now();
-    send_control("kill-session -t i464c
-".to_string()).expect("send_control");
-    let round_trip = started.elapsed();
-
-    let seen = seen_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("server thread reported");
-    let _ = std::fs::remove_dir_all(&dir);
+fn send_control_does_not_close_the_connection_first() {
+    let obs = send_control_against_busy_server("fin", "i464fin", "display-message hi\n");
 
     assert!(
-        seen.iter().any(|l| l.starts_with("kill-session")),
-        "command must arrive; saw {seen:?}"
+        obs.seen.iter().any(|l| l.starts_with("display-message")),
+        "precondition: the command must arrive; saw {:?}",
+        obs.seen
     );
     assert!(
-        round_trip >= BUSY_STALL,
-        "the call must actually span the server's busy window, otherwise the          guard is testing a server that had already drained the socket          (round trip {round_trip:?} < stall {BUSY_STALL:?})"
+        !obs.client_closed_first,
+        "send_control must let the SERVER close first — a client-side FIN makes \
+         the client the active closer and parks one ephemeral port in TIME_WAIT \
+         per call, which is the leak this exists to prevent"
     );
 }
 
-/// The drain is what makes the close graceful now, so assert it directly:
-/// after `send_control` returns, nothing it sent is left unacknowledged and the
-/// barrier reply was consumed. A client that stopped draining would leave the
-/// ack unread and regress to the case above.
+/// The execution barrier must arrive too: it is what makes `send_control`
+/// synchronous, and answering it is what prompts the server to close.
 #[test]
-fn send_control_consumes_the_reply_so_its_close_is_graceful() {
-    let _lock = crate::util::lock_test_env();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let seen_rx = spawn_busy_server(listener);
-
-    let dir = temp_dir("drain");
-    stage_registry(&dir, "i464b", port);
-
-    let _data = EnvGuard::set("PSMUX_DATA_DIR", dir.to_str().expect("utf8 dir"));
-    let _target = EnvGuard::set("PSMUX_TARGET_SESSION", "i464b");
-    let _full = EnvGuard::remove("PSMUX_TARGET_FULL");
-
-    send_control("display-message hello\n".to_string()).expect("send_control");
-
-    let seen = seen_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("server thread reported");
-    let _ = std::fs::remove_dir_all(&dir);
+fn send_control_delivers_the_execution_barrier() {
+    let obs = send_control_against_busy_server("barrier", "i464b", "display-message hello\n");
 
     assert!(
-        seen.iter().any(|l| l.starts_with("display-message")),
-        "the command must arrive; saw {seen:?}"
+        obs.seen.iter().any(|l| l.starts_with("display-message")),
+        "the command must arrive; saw {:?}",
+        obs.seen
     );
     assert!(
-        seen.iter().any(|l| l == "session-info"),
-        "the execution barrier must arrive too — it is what makes send_control \
-         synchronous, and answering it is what closes the connection; saw {seen:?}"
+        obs.seen.iter().any(|l| l == "session-info"),
+        "the execution barrier must arrive as its own command; saw {:?}",
+        obs.seen
+    );
+}
+
+/// A caller that omits the trailing newline must not have its command fused
+/// with the appended `session-info` barrier.
+///
+/// Without normalization the wire carries `display-message hisession-info\n`:
+/// one corrupted command, the barrier eaten as payload, and `Ok(())` returned
+/// while nothing the caller asked for ran. This pre-dates the half-close removal
+/// — the two writes were always adjacent — but it is silent, and this is a
+/// `pub fn`.
+#[test]
+fn send_control_normalizes_a_missing_trailing_newline() {
+    let obs = send_control_against_busy_server("nl", "i464nl", "display-message hi");
+
+    assert!(
+        obs.seen.iter().any(|l| l == "display-message hi"),
+        "the command must arrive intact, not fused with the barrier; saw {:?}",
+        obs.seen
+    );
+    assert!(
+        obs.seen.iter().any(|l| l == "session-info"),
+        "the barrier must survive as its own command; saw {:?}",
+        obs.seen
     );
 }
