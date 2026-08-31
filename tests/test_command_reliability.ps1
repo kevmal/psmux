@@ -90,7 +90,15 @@ try {
 }
 finally {
     # Best-effort cleanup: kill any servers this test spawned, then the temp home.
-    foreach ($s in @('rel1','burst')) { & $PSMUX kill-session -t $s 2>$null | Out-Null }
+    # Best-effort: both sessions are normally already gone by here, and since
+    # upstream's tmux-parity change `kill-session` on a missing name exits 1 and
+    # writes to stderr. Under this script's $ErrorActionPreference='Stop' that
+    # native error is terminating, which aborted the whole run inside `finally`
+    # -- every assertion passing, no summary printed, exit 1. Swallow it: this is
+    # teardown, and a missing session is the outcome it wants anyway.
+    foreach ($s in @('rel1','burst')) {
+        try { & $PSMUX kill-session -t $s 2>$null | Out-Null } catch {}
+    }
     Start-Sleep -Milliseconds 300
     Remove-Item -Recurse -Force $tmpHome -ErrorAction SilentlyContinue
 }

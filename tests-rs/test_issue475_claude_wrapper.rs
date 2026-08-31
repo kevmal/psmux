@@ -14,9 +14,19 @@ fn shim_does_not_hardcode_claude_exe_invocation() {
         !ENV_SHIM_PS.contains("& claude.exe"),
         "BUG #475 REGRESSED: wrapper hardcodes `& claude.exe`, breaking npm installs"
     );
+    // Asserted on the CommandType filter rather than on the literal
+    // `Get-Command claude ...` spelling, because this fork resolves a list of
+    // candidate names in a loop (`foreach($n in 'claude.exe','claude.cmd',
+    // 'claude.ps1'){ $c=Get-Command $n -CommandType ... }`) so it can report
+    // "claude not found on PATH" instead of falling back to the literal
+    // 'claude.exe' and surfacing PowerShell's misleading "term is not
+    // recognized". That is a superset of what #475 asked for, and pinning the
+    // exact upstream spelling failed the test for a wrapper that satisfies the
+    // issue more completely than the original fix did.
     assert!(
-        ENV_SHIM_PS.contains("Get-Command claude -CommandType Application,ExternalScript"),
-        "wrapper must resolve the real claude command via Get-Command"
+        ENV_SHIM_PS.contains("-CommandType Application,ExternalScript"),
+        "wrapper must resolve the real claude command via Get-Command with the \
+         CommandType filter, not by hardcoding an executable name"
     );
     // The CommandType filter is what prevents the wrapper from resolving to
     // itself (a Function) and recursing forever.
