@@ -35,7 +35,14 @@
 // licence to remove the drain.
 //
 // `send_control_does_not_close_the_connection_first` is different in kind: it is
-// a true discriminator and fails if the half-close is restored.
+// a true discriminator and fails if the half-close is restored — verified by
+// re-adding it and watching only that test go red.
+//
+// Its FIN probe treats a reset as client-closed-first, not just a graceful FIN,
+// so an abortive-close regression is classified correctly rather than passing as
+// "the client is still waiting". That arm is DEFENSIVE AND UNVERIFIED here: for
+// the same reason the HONEST LIMIT above records, nothing on this stack produces
+// the reset, so the arm is correct by construction but never exercised.
 //
 // `tests/test_command_reliability.ps1`, the suite #464 shipped, covers less than
 // any of this — it drives real sessions on a fast loopback and stays green with
@@ -171,8 +178,23 @@ fn spawn_busy_server(listener: TcpListener) -> mpsc::Receiver<Observed> {
                             // waiting on us instead, this read times out.
                             let _ = reader.get_ref().set_read_timeout(Some(FIN_PROBE));
                             let mut probe = String::new();
-                            obs.client_closed_first =
-                                matches!(reader.read_line(&mut probe), Ok(0));
+                            // Classify the probe. Only a timeout means "the
+                            // client is still waiting on us"; BOTH ways of
+                            // closing count as the client going first:
+                            //   Ok(0)   graceful FIN already queued (half-close)
+                            //   Err(_)  reset — the abortive pre-#464 shape
+                            // Conflating a reset with "still waiting" would let
+                            // exactly the regression this file exists to catch
+                            // slip through, since the delivery guard stays green
+                            // for that shape on this loopback too.
+                            obs.client_closed_first = match reader.read_line(&mut probe) {
+                                Ok(0) => true,
+                                Ok(_) => false, // unexpected payload, not a close
+                                Err(e) => !matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) && e.raw_os_error() != Some(997),
+                            };
                             break;
                         }
                     }
