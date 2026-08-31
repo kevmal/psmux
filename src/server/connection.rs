@@ -2853,8 +2853,10 @@ match cmd {
             // pipe-pane can sit in the middle of a chained line
             // (`pipe-pane -o ... \; display-message ...`); breaking with
             // queued sub-commands would silently drop the rest of the
-            // chain. With no chain pending, the client's half-close ends
-            // the loop on the next read anyway.
+            // chain. With a chain still pending, end-of-reply therefore
+            // rests on the loop-tail batch read timing out and closing:
+            // one-shot clients no longer half-close, so there is no client
+            // FIN to end the loop early (see `send_control_with_response`).
             if pending_chain.is_empty() { break; }
         }
     }

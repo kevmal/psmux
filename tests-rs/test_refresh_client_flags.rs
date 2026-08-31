@@ -12,11 +12,20 @@
 // connection handler. These tests drive it over real loopback sockets and
 // assert the exact wire text for every control-only flag, plus that a
 // flag-free refresh-client is still forwarded to the server loop.
+//
+// They deliberately do NOT half-close the write side, because the real
+// one-shot client no longer does either (see
+// `session::send_control_with_response`): end-of-reply is the server's own
+// close. refresh-client is a handler that answers without breaking out of the
+// command loop, so it reaches that close only via the loop-tail batch read
+// timing out — exactly the path these tests need to cover. Half-closing here
+// would end the read through the retired client-FIN path, and the assertions
+// would still pass even if the loop-tail close regressed.
 
 use super::*;
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -60,7 +69,6 @@ fn control_only_flags_are_rejected_with_the_tmux_error_text() {
 
         let mut client = connect_authenticated(listener.local_addr().unwrap());
         write!(client, "refresh-client {flag}\n").unwrap();
-        client.shutdown(Shutdown::Write).unwrap();
 
         let mut resp = String::new();
         client.read_to_string(&mut resp).expect("read response");
@@ -84,7 +92,6 @@ fn flag_free_refresh_client_is_forwarded_to_the_server() {
 
     let mut client = connect_authenticated(listener.local_addr().unwrap());
     write!(client, "refresh-client\n").unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
 
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read response");
@@ -110,7 +117,6 @@ fn non_control_flags_are_not_rejected() {
 
     let mut client = connect_authenticated(listener.local_addr().unwrap());
     write!(client, "refresh-client -S\n").unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
 
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read response");
