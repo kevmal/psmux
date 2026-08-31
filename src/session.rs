@@ -1923,12 +1923,32 @@ pub fn send_control(line: String) -> io::Result<()> {
     // simply never answered — that path is covered by the caller's verify-retry.
     let _ = write!(stream, "session-info\n");
     let _ = stream.flush();
-    // Half-close the write side so the server observes EOF *after* our bytes.
-    // TCP guarantees all sent data is delivered before the FIN, so the server's
-    // read_line always sees the full command before its loop ends — eliminating
-    // the RST-on-close race that used to silently drop fire-and-forget commands
-    // (the old 50ms "drain" read was only a partial mitigation).
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // NO half-close, for the same reason as `send_control_with_response`: it
+    // made the CLIENT the active closer, parking an ephemeral port in TIME_WAIT
+    // per call. Measured before this change: 100 `send-keys` calls left exactly
+    // 100 client-side TIME_WAIT entries, i.e. one per call, against a 16,384
+    // port range. Letting the server close first moves TIME_WAIT to its fixed
+    // listening port, which costs no ephemeral port.
+    //
+    // Why this is safe HERE, which is the delicate part — #464 was this very
+    // function. Its RST came from closing with the server's `OK` ack still
+    // unread, which discards whatever the server has not yet read, including
+    // the command. The half-close was one way to avoid that. Draining to EOF
+    // below is another, and it is what this function already does: by the time
+    // the socket closes there is nothing unread, so the close is a graceful FIN
+    // whether or not a FIN was sent earlier. The command itself is delimited by
+    // its newline, not by EOF, so the server never needed the FIN to dispatch.
+    //
+    // The `session-info` barrier appended above ends with `if !persistent
+    // { break; }` in the server (`server::connection`), so the server closes
+    // immediately after answering it — this path pays no batch-read tail.
+    //
+    // Guarded by tests-rs/test_issue464_unread_close_rst.rs, which drives this
+    // function against a server that stalls before its first read. Read that
+    // file's header before trusting a green run: the original abortive-close
+    // failure could NOT be reproduced on this loopback, so those tests are
+    // guards for the property, not proof that the hazard is unreachable.
+    //
     // Read to EOF (bounded by the read timeout): blocks until the server has
     // processed the barrier — i.e. the command has executed — or the connection
     // closes / times out.
@@ -2514,6 +2534,10 @@ mod tests_session_id_alloc_race;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue448_orphan_reaper.rs"]
 mod tests_issue448_orphan_reaper;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue464_unread_close_rst.rs"]
+mod tests_issue464_unread_close_rst;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_startup_stale_port_tax.rs"]
