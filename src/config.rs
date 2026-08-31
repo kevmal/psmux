@@ -117,6 +117,40 @@ pub fn is_warm_disabled_by_config() -> bool {
     false
 }
 
+/// The `priority` option as written in the user's config file, if it is there
+/// and usable.
+///
+/// The attach client never runs load_config: it asks the server for the options
+/// it renders with. But its own scheduling class has to be decided before it
+/// has spoken to anybody, so it peeks at the file the same lightweight way
+/// is_warm_disabled_by_config does (#608). Anything unparseable is simply
+/// absent here; the server's full config pass is what reports it.
+pub fn priority_from_config() -> Option<String> {
+    let content = read_user_config_content()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        if parts[0] != "set" && parts[0] != "set-option" {
+            continue;
+        }
+        let mut i = 1;
+        while i < parts.len() && parts[i].starts_with('-') {
+            i += 1;
+        }
+        if i + 1 < parts.len() && parts[i] == "priority" {
+            let val = parts[i + 1].trim_matches('"').trim_matches('\'');
+            return crate::platform::normalize_priority(val).map(|v| v.to_string());
+        }
+    }
+    None
+}
+
 /// Populate key_tables with PREFIX_DEFAULTS and ROOT_DEFAULTS from help.rs.
 /// This ensures default bindings live in key_tables (like tmux)
 /// so that unbind-key <key> can actually remove them.
@@ -891,18 +925,29 @@ fn parse_set_option(app: &mut AppState, line: &str) {
     let mut only_if_unset = false;  // -o: only set if not already set
     let mut append_mode = false;    // -a: append to current value
     let mut unset_mode = false;     // -u: unset (reset to default)
+    let mut quiet = false;          // -q: suppress the "already set" error
 
     while i < toks.len() {
         let p = toks[i].1.as_str();
         if p.starts_with('-') {
             if p.contains('g') { is_global = true; }
+            // -s is tmux's server scope (#618). psmux keeps a single option
+            // store, so it resolves to the global one, exactly like -g. A
+            // config carrying `set -s default-terminal xterm-256color` (or the
+            // very common `set -sg escape-time 0`) must land the value, not
+            // drop the scope on the floor.
+            if p.contains('s') { is_global = true; }
             if p.contains('F') { format_expand = true; }
             if p.contains('o') { only_if_unset = true; }
             if p.contains('a') { append_mode = true; }
             // -U is an unset alias of -u (tmux parity, #553); the contains
             // check is case-sensitive so both must be tested.
             if p.contains('u') || p.contains('U') { unset_mode = true; }
-            // -q (quiet): no-op — we don't produce errors for unknown options
+            // -q (quiet) suppresses the `-o` "already set" refusal below, which
+            // is the one error tmux's cmd-set-option.c lets `-q` swallow at
+            // exit 0 (`if (args_has(args, 'q')) goto out;`). Unknown options
+            // are still reported.
+            if p.contains('q') { quiet = true; }
             // -w: window option — treat same as global for our single-server model
             i += 1;
             if p.contains('t') && i < toks.len() { i += 1; }
@@ -922,9 +967,26 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         None => String::new(),
     };
 
-    // Handle -u (unset): reset option to empty
+    // Handle -u (unset): restore the option's table default.
+    //
+    // Issue #619: the `user_set_options` erase used to be reachable only for
+    // window-style and window-active-style (the two options #617 repaired), so
+    // for every other non `@` option the key survived the unset and the `-o`
+    // guard below still read it as set. `set -gu escape-time` followed by
+    // `set -go escape-time 77` therefore left escape-time at its default and
+    // dropped the 77 on the floor. tmux clears the option at the scope on `-u`
+    // (cmd-set-option.c calls options_remove_or_default) and then `-o` finds
+    // nothing set (`already = (o != NULL)` in the same file), so it applies.
+    //
+    // #619 follow up: this branch also wrote an EMPTY value where tmux writes
+    // the TABLE DEFAULT, so `set -gu escape-time` in a config file left the old
+    // number in place while the CLI route restored 500, and `set -gu
+    // status-style` produced a styleless status bar rather than the stock
+    // green one. Both the value restore and the explicit-set erase now live in
+    // one shared helper that the server request loop and the plugin drain loop
+    // call too, so all three unset routes land on the same value.
     if unset_mode {
-        parse_option_value(app, key, "", is_global);
+        crate::server::options::reset_option_to_default(app, key);
         return;
     }
 
@@ -937,7 +999,26 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         }
     }
 
-    // Handle -o (only set if not currently set)
+    // Handle -o (only set if not currently set).
+    //
+    // Refusing is not enough: tmux REPORTS the refusal. cmd-set-option.c ends
+    // its `-o` guard with
+    //
+    //     if (already) {
+    //             if (args_has(args, 'q'))
+    //                     goto out;
+    //             cmdq_error(item, "already set: %s", argument);
+    //             goto fail;
+    //     }
+    //
+    // so without `-q` the command FAILS and names the option. psmux dropped the
+    // write in silence on every route, which made `-o` useless for its one job:
+    // a plugin that seeds a default it does not want to clobber could not tell
+    // "I set it" from "the user already had it" (#619 follow up). The config
+    // route records it as a config warning, exactly like "unknown option", so
+    // it reaches ~/.psmux/config-warnings.log and the attach-time summary; the
+    // in-TUI command prompt runs through this same parser, so it also gets a
+    // status message the way a failed command should.
     if only_if_unset {
         // For @-prefixed user options, check if key exists
         // For built-in options, check the user_set_options tracker
@@ -946,7 +1027,19 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         } else {
             app.user_set_options.contains(key)
         };
-        if already_set { return; }
+        if already_set {
+            if !quiet {
+                warn_config(app, format!("already set: {}", key));
+                if !in_startup_load() {
+                    app.status_message = Some((
+                        format!("already set: {}", key),
+                        std::time::Instant::now(),
+                        None,
+                    ));
+                }
+            }
+            return;
+        }
     }
 
     // Expand format strings in the value if -F flag is set. No quote trimming
@@ -1027,6 +1120,23 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         "mouse-selection-force" => app.mouse_selection_force = matches!(value, "on" | "true" | "1" | "yes"),
         "paste-detection" => app.paste_detection = matches!(value, "on" | "true" | "1" | "yes"),
         "choose-tree-preview" => app.choose_tree_preview = matches!(value, "on" | "true" | "1" | "yes"),
+        // The config-file path is a SEPARATE match from apply_set_option, so an
+        // option that has to do something (rather than just store a field)
+        // needs an arm in both. Same as bold-is-bright just below.
+        // The generic catalog check above validates only "number" and
+        // "boolean", so the restricted value set is enforced here by hand and
+        // a bad one warns instead of silently falling back (#608).
+        "priority" => match crate::platform::normalize_priority(value) {
+            Some(_) => {
+                app.priority = crate::platform::resolve_priority(Some(value), false);
+                crate::platform::set_process_priority(&app.priority);
+            }
+            None => warn_config(app, format!(
+                "invalid value '{}' for option 'priority' (expected {})",
+                value.trim(),
+                crate::platform::PRIORITY_VALUES.join(", ")
+            )),
+        },
         "bold-is-bright" => {
             app.bold_is_bright = matches!(value, "on" | "true" | "1" | "yes");
             crate::platform::set_bold_is_bright(app.bold_is_bright);
@@ -1534,6 +1644,17 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
         let table = app.key_tables.entry(_key_table).or_default();
         table.retain(|b| b.key != key);
         table.push(Bind { key, action, repeat: _repeatable });
+    } else {
+        // Silence is what made issue #616 so hard to see: a key name the parser
+        // did not understand vanished with no boot warning, nothing in
+        // list-keys and no clue in config-warnings.log. tmux reports
+        // `unknown key: <name>` (cmd-bind-key.c), so say the same thing --
+        // except for the names tmux knows and psmux simply does not model
+        // (mouse events and friends), which have always been accepted quietly
+        // and must not start warning in every ported config.
+        if !is_unmodelled_tmux_key_name(key_str) {
+            warn_config(app, format!("unknown key: {}", key_str));
+        }
     }
 }
 
@@ -1582,6 +1703,13 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
             let target = table.unwrap_or_else(|| "prefix".to_string());
             if let Some(binds) = app.key_tables.get_mut(&target) {
                 binds.retain(|b| b.key != key);
+            }
+        } else {
+            // Same reasoning as parse_bind_key: tmux's cmd-unbind-key.c reports
+            // `unknown key: <name>` rather than quietly doing nothing, and the
+            // names psmux does not model are excused the same way.
+            if !is_unmodelled_tmux_key_name(parts[i]) {
+                warn_config(app, format!("unknown key: {}", parts[i]));
             }
         }
     }
@@ -1748,12 +1876,18 @@ pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
         if let Some(kc) = named_key(rest) {
             return Some((kc, mods));
         }
-        if rest.len() == 1 {
+        // A key is one CHARACTER, not one BYTE. `M-<U+0444>` leaves two bytes
+        // of UTF-8 in `rest`, so the old byte-length gate failed and every
+        // non-ASCII modifier binding was dropped without a word (issue #616).
+        // tmux takes the same shape in key-string.c: the ASCII fast path is
+        // `string[1] == '\0' && string[0] <= 127`, and anything else is decoded
+        // as UTF-8 and OR'd with the modifiers.
+        if rest.chars().count() == 1 {
             if let Some(c) = rest.chars().next() {
                 if mods.contains(KeyModifiers::SHIFT) {
-                    return Some((KeyCode::Char(c.to_ascii_uppercase()), mods.difference(KeyModifiers::SHIFT)));
+                    return Some((KeyCode::Char(map_key_case(c, true)), mods.difference(KeyModifiers::SHIFT)));
                 }
-                return Some((KeyCode::Char(c.to_ascii_lowercase()), mods));
+                return Some((KeyCode::Char(map_key_case(c, false)), mods));
             }
         }
         // Unrecognized key after modifiers — fall through
@@ -1791,13 +1925,104 @@ pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
         _ => {}
     }
     
-    if name.len() == 1 {
+    // One character, not one byte (issue #616): `bind <U+044B>` is a 2 byte
+    // key name and used to fall straight through to None.
+    if name.chars().count() == 1 {
         if let Some(c) = name.chars().next() {
             return Some((KeyCode::Char(c), KeyModifiers::NONE));
         }
     }
-    
+
     None
+}
+
+/// True when `name` is a key name tmux's `key_string_lookup_string` accepts but
+/// psmux has no KeyCode for: the mouse event family, the terminal-report
+/// pseudo keys and `UserN`.
+///
+/// These are NOT parse errors. `bind -n WheelUpPane ...` is a normal line in a
+/// ported tmux config (psmux's own FAQ quotes tmux's default binding), and
+/// psmux has always accepted the command and simply not acted on it. The
+/// unknown-key diagnostic added for issue #616 must catch typos, not start
+/// failing every config that carries a mouse binding, so those names are
+/// excused here and stay silent exactly as before.
+///
+/// tmux builds the mouse names from KEYC_MOUSE_STRING in tmux.h: an event name
+/// (MouseDown1, MouseDragEnd3, WheelUp, DoubleClick1 ...) followed by a
+/// location suffix (Pane, Status, StatusLeft, Border, ScrollbarSlider ...).
+pub fn is_unmodelled_tmux_key_name(name: &str) -> bool {
+    // Strip the same modifier prefixes tmux strips before its table lookup.
+    let mut rest = name;
+    loop {
+        let lower_two: String = rest.chars().take(2).collect::<String>().to_lowercase();
+        if matches!(lower_two.as_str(), "c-" | "m-" | "s-") {
+            rest = &rest[2..];
+        } else {
+            break;
+        }
+    }
+
+    const SPECIAL: &[&str] = &[
+        "any", "none", "mouse", "dragging", "focusin", "focusout",
+        "pastestart", "pasteend", "reportdarktheme", "reportlighttheme",
+        "mousemovepane", "mousemovestatus", "mousemovestatusleft",
+        "mousemovestatusright", "mousemoveborder",
+    ];
+    let lower = rest.to_lowercase();
+    if SPECIAL.contains(&lower.as_str()) {
+        return true;
+    }
+    // UserN
+    if let Some(n) = lower.strip_prefix("user") {
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+
+    const LOCATIONS: &[&str] = &[
+        "pane", "status", "statusleft", "statusright", "statusdefault",
+        "scrollbarup", "scrollbarslider", "scrollbardown", "empty", "border",
+    ];
+    let Some(head) = LOCATIONS
+        .iter()
+        .filter_map(|loc| lower.strip_suffix(loc))
+        .max_by_key(|h| h.len())
+    else {
+        return false;
+    };
+    // The event name: a prefix plus an optional button number.
+    const EVENTS: &[&str] = &[
+        "mousedown", "mouseup", "mousedrag", "mousedragend",
+        "secondclick", "doubleclick", "tripleclick",
+    ];
+    if head == "wheelup" || head == "wheeldown" {
+        return true;
+    }
+    EVENTS.iter().any(|e| {
+        head.strip_prefix(e)
+            .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+    })
+}
+
+/// Unicode aware single character case mapping for the modifier forms of a key
+/// name: `S-x` names the SHIFTED character and `C-A` normalises to `C-a`, which
+/// is what psmux has always done for ASCII via `to_ascii_uppercase` /
+/// `to_ascii_lowercase`. Those are no-ops outside ASCII, so a Cyrillic `S-` form
+/// would have silently collapsed onto the unshifted key once #616 let it parse
+/// at all, and `normalize_key_for_binding` drops SHIFT from every Char, so the
+/// two bindings would have overwritten each other.
+///
+/// Falls back to the original character when the mapping is not one to one
+/// (U+00DF uppercases to "SS", U+0130 lowercases to two scalars) so a key name
+/// stays exactly one character in every case.
+fn map_key_case(c: char, upper: bool) -> char {
+    let mut mapped: Vec<char> = if upper {
+        c.to_uppercase().collect()
+    } else {
+        c.to_lowercase().collect()
+    };
+    if mapped.len() == 1 { mapped.remove(0) } else { c }
 }
 
 thread_local! {
@@ -1926,7 +2151,11 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
     let mut mods = KeyModifiers::empty();
     let mut key_part = key;
     
-    while key_part.len() > 2 {
+    // Characters, not bytes (issue #616). `M-<U+0444>` is 3 characters but 4
+    // bytes; more importantly the single-character arm below used byte length,
+    // so the CLI / server route dropped every non-ASCII key exactly the way the
+    // config route did.
+    while key_part.chars().count() > 2 {
         if key_part.starts_with("C-") || key_part.starts_with("c-") {
             mods |= KeyModifiers::CONTROL;
             key_part = &key_part[2..];
@@ -1944,7 +2173,7 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
     let keycode = match key_part.to_lowercase().as_str() {
         // Single character keys: preserve the ORIGINAL case from key_part, not the lowercased version.
         // This is critical for case-sensitive bind-key (issue #157): bind-key T != bind-key t.
-        _ if key_part.len() == 1 => {
+        _ if key_part.chars().count() == 1 => {
             KeyCode::Char(key_part.chars().next().unwrap())
         }
         "space" => KeyCode::Char(' '),
@@ -2425,3 +2654,15 @@ mod tests_issue536_config_quoted_whitespace;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue606_repeat_time.rs"]
 mod tests_issue606_repeat_time;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue616_unicode_bind.rs"]
+mod tests_issue616_unicode_bind;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue619_set_option_unset_only.rs"]
+mod tests_issue619_set_option_unset_only;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue619_set_option_already_set.rs"]
+mod tests_issue619_set_option_already_set;

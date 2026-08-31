@@ -381,6 +381,13 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
 /// process only, after the session environment, so `-e` wins over
 /// `set-environment`.
 pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>, start_dir: Option<&str>, empty: bool, extra_env: &[(String, String)]) -> io::Result<()> {
+    // #607: the new window's pane becomes the active one, so hand the pane
+    // that is losing focus its own copy mode back before that happens and let
+    // the new pane adopt its own (a fresh pane has none) afterwards.  Without
+    // this the global `Mode::CopyMode` just stayed put and the brand new
+    // window opened in copy mode.
+    let prev_pane = crate::copy_mode::active_pane_id(app);
+    crate::copy_mode::park_mode_on_active_pane(app);
     // ── Empty window (tmux new-window -E): a new window whose single pane has
     // no command/process. It renders blank until respawn-pane gives it one. ──
     if empty {
@@ -395,6 +402,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             app.active_idx = app.windows.len() - 1;
             app.on_window_appended();
         }
+        crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
         return Ok(());
     }
     // ── Fast path: use pre-spawned warm pane when creating a default shell ──
@@ -450,7 +458,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             // The snippet has to be written in the dialect of the shell the
             // warm pane is actually running, which is whatever `default-shell`
@@ -465,6 +473,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             app.next_win_id += 1;
             app.active_idx = app.windows.len() - 1;
             app.on_window_appended();
+            crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
             return Ok(());
         }
         // Dead spare: make sure the corpse is fully gone, then cold-spawn.
@@ -545,13 +554,14 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
     app.next_win_id += 1;
     app.active_idx = app.windows.len() - 1;
     app.on_window_appended();
+    crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
     Ok(())
 }
 
@@ -629,6 +639,9 @@ pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
 
 /// Create a new window with a raw command (program + args, no shell wrapping)
 pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, raw_args: &[String]) -> io::Result<()> {
+    // #607: same copy-mode ownership handover as create_window_with_env.
+    let prev_pane = crate::copy_mode::active_pane_id(app);
+    crate::copy_mode::park_mode_on_active_pane(app);
     let area = app.client_area;
     let rows = if area.height > 1 { area.height } else { 30 };
     let cols = if area.width > 1 { area.width } else { 120 };
@@ -677,13 +690,14 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![raw_pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
     app.next_win_id += 1;
     app.active_idx = app.windows.len() - 1;
     app.on_window_appended();
+    crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
     Ok(())
 }
 
@@ -704,6 +718,12 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
 /// `split_active_with_command` plus per-pane environment from
 /// `split-window -e KEY=VALUE` (tmux parity, issue #489).
 pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Option<&str>, pty_system_ref: Option<&dyn portable_pty::PtySystem>, start_dir: Option<&str>, extra_env: &[(String, String)]) -> io::Result<()> {
+    // #607: the split's new pane becomes the active one.  Park the copy mode
+    // on the pane it was entered in first, then let the new pane adopt its
+    // own (none), so the split does not open in copy mode and the pane the
+    // user was reading does not silently leave it.
+    let prev_pane = crate::copy_mode::active_pane_id(app);
+    crate::copy_mode::park_mode_on_active_pane(app);
     // ── Guard: refuse split if the active pane is too small ──────────
     // After splitting, each half gets roughly (dim / 2) - 1 (for the divider).
     // If that would be below MIN_PANE_DIM, deny the split to avoid crashing
@@ -799,7 +819,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
-            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell,
             // in the dialect that shell speaks (#600).
             if let Some(dir) = start_dir {
@@ -814,6 +834,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
             win.active_path = new_path;
             // Add new pane to MRU (most recent)
             crate::tree::touch_mru(&mut win.pane_mru, new_pane_id);
+            crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
             return Ok(());
         }
         // Dead spare: make sure the corpse is fully gone, then cold-spawn.
@@ -873,7 +894,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -882,6 +903,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     win.active_path = new_path;
     // Add new pane to MRU (most recent)
     crate::tree::touch_mru(&mut win.pane_mru, split_pane_id);
+    crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
     Ok(())
 }
 
@@ -928,13 +950,20 @@ fn kill_pane_at_path(win: &mut Window, path: &Vec<usize>) {
 }
 
 pub fn kill_active_pane(app: &mut AppState) -> io::Result<()> {
+    // #607: the survivor must land in ITS OWN mode, not in the dead pane's.
+    let prev_pane = crate::copy_mode::active_pane_id(app);
     let win = &mut app.windows[app.active_idx];
     let active_path = win.active_path.clone();
     kill_pane_at_path(win, &active_path);
+    crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
     Ok(())
 }
 
 pub fn kill_pane_by_id(app: &mut AppState, pane_id: usize) -> io::Result<()> {
+    // #607: same as kill_active_pane.  `retarget` is a no-op when the active
+    // pane did not move (killing a pane in another window), so the live copy
+    // cursor of a pane that keeps focus is never clobbered by its parked copy.
+    let prev_pane = crate::copy_mode::active_pane_id(app);
     let restore_idx = app.active_idx;
     let restore_path = app.windows[restore_idx].active_path.clone();
     let restore_pane_id = crate::tree::get_active_pane_id(&app.windows[restore_idx].root, &restore_path);
@@ -966,6 +995,7 @@ pub fn kill_pane_by_id(app: &mut AppState, pane_id: usize) -> io::Result<()> {
         restore_win.active_path = resolved_restore_path;
     }
 
+    crate::copy_mode::retarget_mode_to_active_pane(app, prev_pane);
     Ok(())
 }
 
@@ -2748,3 +2778,7 @@ mod tests_dashdash_window_name;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue600_bash_rehome.rs"]
 mod tests_issue600_bash_rehome;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue607_copy_mode_inherit.rs"]
+mod tests_issue607_copy_mode_inherit;

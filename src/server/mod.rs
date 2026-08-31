@@ -452,14 +452,24 @@ fn drain_plugin_req(
                     "status-left" => app.status_left.push_str(&value),
                     "status-right" => app.status_right.push_str(&value),
                     "status-style" => app.status_style.push_str(&value),
+                    "window-style" | "window-active-style" => {
+                        app.user_options
+                            .entry(option.clone())
+                            .or_default()
+                            .push_str(&value);
+                        app.user_set_options.insert(option);
+                    }
                     _ => {}
                 }
             }
         }
         CtrlReq::SetOptionUnset(option) => {
-            if option.starts_with('@') {
-                app.user_options.remove(&option);
-            }
+            // The same shared restore the main request loop and the config
+            // parser use: the catalog default for a table option, removal for
+            // a `@user` option, and the explicit-set mark erased either way so
+            // a following `set -o` applies (#619). This arm used to touch only
+            // the mark and leave the VALUE exactly where the user had put it.
+            crate::server::options::reset_option_to_default(app, &option);
         }
         CtrlReq::SetOptionToggle(option) => {
             // `set -g <bool-option>` with no value flips it (#535). The client
@@ -469,7 +479,7 @@ fn drain_plugin_req(
                 app.user_set_options.insert(option.clone());
             }
         }
-        CtrlReq::SetOptionOnlyIfUnset(option, value) => {
+        CtrlReq::SetOptionOnlyIfUnset(option, value, resp) => {
             // Only set if the option hasn't been explicitly set by user/config.
             // For @-prefixed user options, check if the key exists.
             // For built-in options, check the user_set_options tracker.
@@ -478,13 +488,22 @@ fn drain_plugin_req(
             } else {
                 app.user_set_options.contains(&option)
             };
-            if !already_set {
+            if already_set {
+                // `already set: <name>`, tmux's cmd-set-option.c refusal, sent
+                // back so the CLI can exit 1 with it (#619 follow up).
+                if let Some(r) = resp {
+                    let _ = r.send(format!("ERROR: already set: {}", option));
+                }
+            } else {
                 apply_set_option(app, &option, &value, false);
                 app.user_set_options.insert(option.clone());
                 if option == "command-alias" {
                     if let Ok(mut map) = shared_aliases.write() {
                         *map = app.command_aliases.clone();
                     }
+                }
+                if let Some(r) = resp {
+                    let _ = r.send(String::new());
                 }
             }
         }
@@ -861,6 +880,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let pty_system = native_pty_system();
 
     let mut app = AppState::new(session_name);
+    // Claim a scheduling class before anything else runs (#608). A windowless
+    // server never receives the foreground boost Windows reserves for the
+    // process owning the active window, so on an oversubscribed box its reader
+    // and writer threads queue behind every compute job on the machine and
+    // typing lags. load_config below re-applies this from the `priority`
+    // option if the user set one; PSMUX_PRIORITY outranks both.
+    app.priority = crate::platform::resolve_priority(None, true);
+    crate::platform::set_process_priority(&app.priority);
     // Preinitialize the async #(command) format-job channel (see the
     // format_job_rx doc in types.rs).
     {
@@ -2255,8 +2282,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.scroll_enter_copy_mode,
                         app.bold_is_bright,
                     ));
-                    // #451: append status-bar style options dropped in the
-                    // app.rs->client.rs modularization.
                     helpers::append_extra_style_json(&mut combined_buf, &app);
                     // Issue #7 batch D: dump-state's JSON never identified which
                     // session it belonged to (no consumer could tell two
@@ -2911,15 +2936,33 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         "scroll-up" => { scroll_copy_up(&mut app, 1); }
                         "scroll-down" => { scroll_copy_down(&mut app, 1); }
                         "scroll-middle" => { crate::copy_mode::scroll_middle(&mut app); }
-                        "search-forward" | "search-forward-incremental" => {
-                            app.mode = Mode::CopySearch { input: String::new(), forward: true };
-                            let prompt = "(search down) ".to_string();
-                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
-                        }
-                        "search-backward" | "search-backward-incremental" => {
-                            app.mode = Mode::CopySearch { input: String::new(), forward: false };
-                            let prompt = "(search up) ".to_string();
-                            app.status_message = Some((prompt, std::time::Instant::now(), Some(0)));
+                        // tmux takes an optional search term argument on all
+                        // four verbs (cmd-queue "send-keys -X search-backward
+                        // foo"). Without the argument the interactive prompt
+                        // opens, exactly as pressing `/` or `?` does.
+                        s if s == "search-forward" || s == "search-backward"
+                            || s == "search-forward-incremental"
+                            || s == "search-backward-incremental"
+                            || s.starts_with("search-forward ")
+                            || s.starts_with("search-backward ")
+                            || s.starts_with("search-forward-incremental ")
+                            || s.starts_with("search-backward-incremental ") =>
+                        {
+                            let fwd = s.starts_with("search-forward");
+                            let term = match s.find(' ') {
+                                Some(i) => s[i + 1..].trim().to_string(),
+                                None => String::new(),
+                            };
+                            if term.is_empty() {
+                                app.mode = Mode::CopySearch { input: String::new(), forward: fwd };
+                                let prompt = if fwd { "(search down) " } else { "(search up) " };
+                                app.status_message = Some((prompt.to_string(), std::time::Instant::now(), Some(0)));
+                            } else {
+                                app.copy_search_query = term.clone();
+                                app.copy_search_forward = fwd;
+                                crate::copy_mode::search_copy_mode(&mut app, &term, fwd);
+                                app.mode = Mode::CopyMode;
+                            }
                         }
                         "search-again" => { crate::copy_mode::search_next(&mut app); }
                         "search-reverse" => { crate::copy_mode::search_prev(&mut app); }
@@ -3365,7 +3408,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
                     hook_event = Some("after-rename-session");
                 }
-                CtrlReq::ClaimSession(name, client_cwd, resp) => {
+                CtrlReq::ClaimSession(name, client_cwd, client_priority, resp) => {
                     // Guard against clobbering an already-claimed session. Under
                     // rapid `new-session`, a stale __warm__.port (or OS ephemeral
                     // port reuse) can route a claim to a server that has ALREADY
@@ -3484,6 +3527,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Update shared aliases after config reload
                     if let Ok(mut w) = shared_aliases_main.write() {
                         *w = app.command_aliases.clone();
+                    }
+                    // Adopt the claiming client's scheduling class (#608).
+                    //
+                    // MUST be after load_config above, not before: that reload
+                    // re-applies the `priority` option out of the config file
+                    // and would clobber anything set earlier in this arm.
+                    //
+                    // This is what makes the documented escape hatch work on
+                    // the path most users actually take. A warm standby set its
+                    // class at its OWN startup, from the environment of
+                    // whichever server generation spawned it, which predates
+                    // the user's shell entirely. Claiming it used to leave that
+                    // stale class in place, so `PSMUX_PRIORITY=normal psmux`
+                    // silently kept the above-normal default whenever a standby
+                    // happened to be waiting, and cold spawned correctly
+                    // whenever one did not. The value arrives already resolved
+                    // by the client under the documented precedence (env, then
+                    // option, then default), so applying it here simply
+                    // finishes that resolution on the right process.
+                    if let Some(ref want) = client_priority {
+                        if crate::platform::normalize_priority(want).is_some() {
+                            app.priority = crate::platform::resolve_priority(Some(want), false);
+                            crate::platform::set_process_priority(&app.priority);
+                            warm_debug(&format!("CLAIM: priority -> {}", app.priority));
+                        }
                     }
                     // Fire client-attached/session-created for the now-real session:
                     // the startup path skips these while warm, so this is where a
@@ -3949,11 +4017,28 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                     format!("ERROR: set-option -p remain-on-exit: bad value '{}' (want on, off or failed)", value)
                                 }
                             }
+                            // #613: authorize the wheel for THIS pane even when
+                            // its application asked through neither signal the
+                            // #598 gate accepts.  Pane scoped on purpose: the
+                            // damage the gate prevents (htop typing the report
+                            // into its search prompt) is decided per pane, so
+                            // the escape hatch is too.
+                            "@mouse-force" => {
+                                if value.is_empty() {
+                                    p.pane_options.remove("@mouse-force");
+                                    String::new()
+                                } else if matches!(value.as_str(), "on" | "off" | "1" | "0" | "true" | "false" | "yes" | "no") {
+                                    p.pane_options.insert("@mouse-force".to_string(), value.clone());
+                                    String::new()
+                                } else {
+                                    format!("ERROR: set-option -p @mouse-force: bad value '{}' (want on or off)", value)
+                                }
+                            }
                             // Loud refusal, never a silent stored no-op: the
                             // Claude Code teammate backend checked nothing but
                             // exit codes and a swallowed pane option looked
                             // exactly like success (#580).
-                            other => format!("ERROR: pane-scoped option '{}' is not supported (supported: remain-on-exit)", other),
+                            other => format!("ERROR: pane-scoped option '{}' is not supported (supported: remain-on-exit, @mouse-force)", other),
                         },
                     };
                     let _ = resp.send(reply);
@@ -4102,46 +4187,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                 }
                 CtrlReq::SetOptionUnset(option) => {
-                    // Reset option to default or remove @user-option
-                    if option.starts_with('@') {
-                        app.user_options.remove(&option);
-                    } else {
-                        match option.as_str() {
-                            "status-left" => { app.status_left = "psmux:#I".to_string(); }
-                            "status-right" => { app.status_right = "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(); }
-                            "mouse" => { app.mouse_enabled = true; }
-                            "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = true; }
-                            "pwsh-mouse-selection" => { app.pwsh_mouse_selection = false; }
-                            "mouse-selection" => { app.mouse_selection = true; }
-                            "mouse-selection-force" => { app.mouse_selection_force = false; }
-                            "paste-detection" => { app.paste_detection = true; }
-                            "choose-tree-preview" => { app.choose_tree_preview = false; }
-                            "escape-time" => { app.escape_time_ms = 500; }
-                            // #606: tmux restores the table default on -u.
-                            "repeat-time" => { app.repeat_time_ms = 500; }
-                            "history-limit" => { app.history_limit = 2000; }
-                            "alternate-screen" => { app.allow_alternate_screen = true; }
-                            "display-time" => { app.display_time_ms = 750; }
-                            "mode-keys" => { app.mode_keys = "emacs".to_string(); }
-                            "status" => { app.status_visible = true; }
-                            "status-position" => { app.status_position = "bottom".to_string(); }
-                            "status-style" => { app.status_style = String::new(); }
-                            "renumber-windows" => { app.renumber_windows = false; }
-                            "remain-on-exit" => { app.remain_on_exit = false; }
-                            "destroy-unattached" => { app.destroy_unattached = false; }
-                            "exit-empty" => { app.exit_empty = true; }
-                            "automatic-rename" => { app.automatic_rename = true; }
-                            "pane-border-style" => { app.pane_border_style = String::new(); }
-                            "pane-active-border-style" => { app.pane_active_border_style = "fg=green".to_string(); }
-                            "pane-border-hover-style" => { app.pane_border_hover_style = "fg=yellow".to_string(); }
-                            "window-status-format" => { app.window_status_format = "#I:#W#{?window_flags,#{window_flags}, }".to_string(); }
-                            "window-status-current-format" => { app.window_status_current_format = "#I:#W#{?window_flags,#{window_flags}, }".to_string(); }
-                            "window-status-separator" => { app.window_status_separator = " ".to_string(); }
-                            "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", "bar"); }
-                            "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", "1"); }
-                            _ => {}
+                    // Restore the table default, or remove an @user-option.
+                    //
+                    // This arm used to carry a hand written restore table of
+                    // about thirty options with a `_ => {}` catch all, so an
+                    // option it had never heard of kept its value: `set -s
+                    // default-terminal xterm-256color` then `set -su
+                    // default-terminal` still read xterm-256color, and every
+                    // -u on status-left restored `psmux:#I` where a fresh
+                    // server reports `[#S] `. The one restore table now lives
+                    // in OPTION_CATALOG, which
+                    // tests-rs/test_option_default_parity.rs already pins to a
+                    // freshly constructed AppState (#619 follow up).
+                    crate::server::options::reset_option_to_default(&mut app, &option);
+                    // The value moved, so reconcile the warm pane the same way
+                    // a plain set does (default-shell, history-limit and the
+                    // claude-code-* options all matter here).
+                    let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    if option == "command-alias" {
+                        if let Ok(mut map) = shared_aliases_main.write() {
+                            *map = app.command_aliases.clone();
                         }
                     }
+                    meta_dirty = true;
+                    state_dirty = true;
                 }
                 CtrlReq::SetOptionAppend(option, value) => {
                     // Append to existing option value
@@ -4156,6 +4226,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "pane-border-style" => { app.pane_border_style.push_str(&value); }
                             "pane-active-border-style" => { app.pane_active_border_style.push_str(&value); }
                             "pane-border-hover-style" => { app.pane_border_hover_style.push_str(&value); }
+                            "window-style" | "window-active-style" => {
+                                app.user_options
+                                    .entry(option.clone())
+                                    .or_default()
+                                    .push_str(&value);
+                                app.user_set_options.insert(option.clone());
+                                state_dirty = true;
+                            }
                             "window-status-format" => { app.window_status_format.push_str(&value); }
                             "window-status-current-format" => { app.window_status_current_format.push_str(&value); }
                             _ => {}
@@ -4174,13 +4252,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::SetOptionOnlyIfUnset(option, value) => {
+                CtrlReq::SetOptionOnlyIfUnset(option, value, resp) => {
                     let already_set = if option.starts_with('@') {
                         app.user_options.contains_key(&option)
                     } else {
                         app.user_set_options.contains(&option)
                     };
-                    if !already_set {
+                    if already_set {
+                        // tmux does not merely skip the write, it FAILS:
+                        // cmd-set-option.c prints `already set: <name>` through
+                        // cmdq_error and returns CMD_RETURN_ERROR unless -q.
+                        // psmux swallowed the refusal on every route, so `-o`
+                        // could not answer the only question it exists to ask
+                        // (#619 follow up). A -q caller passes no channel and
+                        // still gets the silent exit 0 tmux gives it.
+                        if let Some(r) = resp {
+                            let _ = r.send(format!("ERROR: already set: {}", option));
+                        }
+                    } else {
                         apply_set_option(&mut app, &option, &value, false);
                         app.user_set_options.insert(option.clone());
                         if option == "command-alias" {
@@ -4190,6 +4279,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         meta_dirty = true;
                         state_dirty = true;
+                        if let Some(r) = resp {
+                            let _ = r.send(String::new());
+                        }
                     }
                 }
                 CtrlReq::ShowOptions(resp) => {
@@ -4221,6 +4313,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // option did not exist. Same shape as #559 for
                     // monitor-silence.
                     output.push_str(&format!("repeat-time {}\n", app.repeat_time_ms));
+                    // #608: this dump is hand written, so a new option is
+                    // invisible to a bare `show-options -g` unless it is listed
+                    // here as well as in get_option_value. Same trap as #606.
+                    output.push_str(&format!("priority {}\n", app.priority));
                     output.push_str(&format!("mode-keys {}\n", app.mode_keys));
                     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
                     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
@@ -6300,8 +6396,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 app.scroll_enter_copy_mode,
                 app.bold_is_bright,
             ));
-            // #451: append status-bar style options dropped in the
-            // app.rs->client.rs modularization.
             helpers::append_extra_style_json(&mut combined_buf, &app);
             // Inject overlay state (popup, menu, confirm, display_panes)
             {

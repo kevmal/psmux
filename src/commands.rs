@@ -360,6 +360,7 @@ fn generate_show_options(app: &AppState) -> String {
     output.push_str(&format!("status-right \"{}\"\n", app.status_right));
     output.push_str(&format!("history-limit {}\n", app.history_limit));
     output.push_str(&format!("display-time {}\n", app.display_time_ms));
+    output.push_str(&format!("priority {}\n", app.priority));
     output.push_str(&format!("mode-keys {}\n", app.mode_keys));
     output.push_str(&format!("focus-events {}\n", if app.focus_events { "on" } else { "off" }));
     output.push_str(&format!("renumber-windows {}\n", if app.renumber_windows { "on" } else { "off" }));
@@ -2286,7 +2287,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             ).is_ok() {
                                 let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
                                 if !warm_key.is_empty() {
-                                    let claim_cmd = format!("claim-session {}\n", crate::util::quote_arg(&name));
+                                    // In-TUI new-session runs inside psmux, so the
+                                    // resolve reads this server's own environment and
+                                    // config rather than a user shell. Sending it is
+                                    // still right: a session created from the TUI
+                                    // should land on the same class as the psmux the
+                                    // user is sitting in, not on the standby's stale
+                                    // one (#608).
+                                    let claim_prio = crate::platform::claim_priority_arg();
+                                    let claim_cmd = format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio));
                                     match crate::session::send_auth_cmd_response(
                                         &warm_addr, &warm_key,
                                         claim_cmd.as_bytes(),
@@ -2630,6 +2639,10 @@ mod tests_mega_unit_coverage;
 #[cfg(test)]
 #[path = "../tests-rs/test_flag_parity.rs"]
 mod tests_flag_parity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue618_set_option_server_scope.rs"]
+mod tests_issue618_set_option_server_scope;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue227_remain_on_exit_hooks.rs"]

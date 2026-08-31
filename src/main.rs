@@ -36,6 +36,7 @@ mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
 mod paths;
+mod wsl_path;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -57,6 +58,23 @@ use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_sessi
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
+
+/// Boolean flags the CLI accepts for set-option / set / set-window-option /
+/// setw. -t carries a value and never reaches this set; every other character
+/// is refused with "unknown flag" and exit 1 (#553).
+///
+/// tmux 3.4 spells set-option's as "aFgopqst:uUw" (cmd-set-option.c). psmux
+/// omits -F there because the CLI forwards the value verbatim and the server
+/// expands it, and accepts -s on setw as well, where tmux's own
+/// set-window-option table ("aFgoqt:u") has no -s: psmux shares one flag guard
+/// across all four spellings, and refusing -s on just the setw alias would be a
+/// second, differently shaped hard failure for the tools this change exists to
+/// unbreak (#618).
+pub(crate) const SET_OPTION_CLI_FLAGS: &str = "agopqstuUw";
+
+/// Boolean flags the CLI accepts for show-options and friends. tmux 3.4 uses
+/// "AgHpqst:vw" (cmd-show-options.c); psmux has no -H (hooks-only listing).
+pub(crate) const SHOW_OPTIONS_CLI_FLAGS: &str = "Agpqsvw";
 use crate::ssh_input::{send_mouse_enable, InputSource};
 
 /// Convert a ratatui Color to an ANSI SGR escape sequence.
@@ -452,6 +470,50 @@ fn probe_session_alive_inner(session_name: &str, connect_failure_means_alive: bo
     }
 }
 
+/// Pick the key-name positional out of a `bind-key` / `unbind-key` argument
+/// list, skipping the subcommand itself and the flags that take a value.
+/// Returns None when there is no positional yet (the caller then leaves the
+/// usage complaint to the server, as before).
+fn bind_key_name_arg(cmd_args: &[&String]) -> Option<String> {
+    let mut i = 1; // cmd_args[0] is the subcommand
+    while i < cmd_args.len() {
+        let a = cmd_args[i].as_str();
+        match a {
+            // Flags that consume the next argument.
+            "-T" | "-N" | "-t" => { i += 2; continue; }
+            // A bare "-" is a legal key name, not a flag.
+            _ if a.starts_with('-') && a.chars().count() > 1 => { i += 1; continue; }
+            _ => return Some(cmd_args[i].to_string()),
+        }
+    }
+    None
+}
+
+/// tmux refuses a key name it cannot parse: cmd-bind-key.c and cmd-unbind-key.c
+/// both call `cmdq_error(item, "unknown key: %s", ...)` and exit non-zero.
+/// psmux used to forward anything at all to the server, which dropped it in
+/// silence -- so a Cyrillic key name (issue #616) and an outright typo were
+/// indistinguishable from success. Validate before the command goes on the wire.
+fn reject_unknown_key_name(cmd_args: &[&String], _verb: &str) {
+    let Some(key) = bind_key_name_arg(cmd_args) else { return };
+    // Names tmux accepts and psmux does not model (WheelUpPane and the rest of
+    // the mouse family) are NOT typos: those lines are normal in a ported
+    // config and psmux has always taken them without complaint. Failing them
+    // here would be a regression, not parity.
+    if crate::config::is_unmodelled_tmux_key_name(&key) {
+        return;
+    }
+    // Either parser accepting the name is enough: the config route uses
+    // parse_key_name and the server route uses parse_key_string, and they
+    // recognise slightly different spellings.
+    if crate::config::parse_key_name(&key).is_none()
+        && crate::config::parse_key_string(&key).is_none()
+    {
+        eprintln!("unknown key: {}", key);
+        std::process::exit(1);
+    }
+}
+
 fn build_send_paste_control(cmd_args: &[&str]) -> io::Result<String> {
     let mut payload: Option<&str> = None;
     let mut i = 1;
@@ -695,11 +757,15 @@ fn run_main() -> io::Result<()> {
                 target.to_string()
             };
             env::set_var("PSMUX_TARGET_FULL", &resolved_full);
-            // Apply -L namespace prefix for port file lookup
-            let port_file_base = if let Some(ref l) = l_socket_name {
-                format!("{}__{}", l, session)
-            } else {
-                session.clone()
+            // Apply -L namespace prefix for port file lookup. A `$N` id has
+            // already been resolved to the on disk name, which carries the
+            // prefix, so do not add it a second time: `-L ns cmd -t $N` used
+            // to route to `ns__ns__name`, a server that does not exist.
+            let port_file_base = match l_socket_name {
+                Some(ref l) if !session.starts_with(&format!("{}__", l)) => {
+                    format!("{}__{}", l, session)
+                }
+                _ => session.clone(),
             };
             // If the -t target includes an explicit session name, use it
             // directly. Otherwise (e.g. -t %2, -t :1.0) fall through to
@@ -838,6 +904,7 @@ fn run_main() -> io::Result<()> {
                     total_panes,
                     crate::border_lines::border_chars(crate::border_lines::DEFAULT),
                     None,
+                    crate::client::WindowContentStyles::default(),
                 );
                 let border_mask = crate::client::border_mask_from_layout(&layout, area, f.buffer_mut().area, false);
                 crate::rendering::fix_border_intersections(f.buffer_mut(), crate::border_lines::border_chars(crate::border_lines::DEFAULT), &border_mask);
@@ -995,6 +1062,12 @@ fn run_main() -> io::Result<()> {
                 let dir = crate::paths::psmux_dir();
                 // Compute namespace prefix for -L filtering
                 let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
+                // Servers that answered in this namespace, counted BEFORE the
+                // -f filter is applied. tmux exits 1 with `no server running`
+                // when there is nothing to list at all, but a filter that
+                // matches nothing on a live server is an empty listing at
+                // exit 0, and the two must stay distinguishable to scripts.
+                let mut live_servers: usize = 0;
                 if let Ok(entries) = std::fs::read_dir(&dir) {
                     for e in entries.flatten() {
                         if let Some(name) = e.file_name().to_str() {
@@ -1062,6 +1135,7 @@ fn run_main() -> io::Result<()> {
                                                     // Auth failed, skip this session
                                                     continue;
                                                 }
+                                                live_servers += 1;
                                                 // When -F format is provided, the server already
                                                 // expanded it; use the result even if empty (tmux
                                                 // prints an empty line for unknown format vars).
@@ -1123,6 +1197,18 @@ fn run_main() -> io::Result<()> {
                             }
                         }
                     }
+                }
+                if live_servers == 0 {
+                    // Nothing answered: no user session in this namespace (a
+                    // `__warm__` standby is not a session). tmux prints
+                    // `no server running on <socket>` and exits 1 here, and
+                    // scripts lean on that code (`tmux ls || start`), so an
+                    // empty listing at exit 0 was a portability trap.
+                    match l_socket_name.as_deref() {
+                        Some(l) => eprintln!("psmux: no server running on {} (-L {})", dir, l),
+                        None => eprintln!("psmux: no server running on {}", dir),
+                    }
+                    std::process::exit(1);
                 }
                 return Ok(());
             }
@@ -1502,10 +1588,14 @@ fn run_main() -> io::Result<()> {
                                     let client_cwd = std::env::current_dir()
                                         .ok()
                                         .and_then(|p| p.to_str().map(|s| s.to_string()));
+                                    // -p carries this shell's PSMUX_PRIORITY (or the
+                                    // config value) onto the standby, which set its
+                                    // own class before this shell existed (#608).
+                                    let claim_prio = crate::platform::claim_priority_arg();
                                     let claim_cmd = if let Some(ref cwd) = client_cwd {
-                                        format!("claim-session {} {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(cwd))
+                                        format!("claim-session {} {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(cwd), crate::util::quote_arg(&claim_prio))
                                     } else {
-                                        format!("claim-session {}\n", crate::util::quote_arg(&name))
+                                        format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio))
                                     };
                                     match crate::session::send_auth_cmd_response(
                                         &warm_addr, &warm_key,
@@ -2608,11 +2698,16 @@ fn run_main() -> io::Result<()> {
                                 let resolved = crate::cli::parse_target(t)
                                     .session
                                     .unwrap_or_else(|| t.to_string());
-                                // Apply -L namespace prefix for port file lookup
-                                let namespaced = if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, resolved)
-                                } else {
-                                    resolved
+                                // Apply -L namespace prefix for port file lookup.
+                                // A `$N` id resolves to the on disk name, which
+                                // already carries the prefix, so do not add it
+                                // twice: `-L ns kill-session -t $N` used to look
+                                // for `ns__ns__name`, find nothing, and exit 0.
+                                let namespaced = match l_socket_name {
+                                    Some(ref l) if !resolved.starts_with(&format!("{}__", l)) => {
+                                        format!("{}__{}", l, resolved)
+                                    }
+                                    _ => resolved,
                                 };
                                 target = Some(namespaced);
                                 i += 1;
@@ -2642,8 +2737,32 @@ fn run_main() -> io::Result<()> {
                 // "server dead" — that used to delete a live-but-busy server's
                 // port file, orphaning it and triggering relaunch storms.
                 let port_path = crate::paths::port_file(&session_name);
+                // tmux: `kill-session -t NAME` on a name that is not a session
+                // is `can't find session: NAME` at exit 1. This arm used to read
+                // "no port file" as "already gone" and return success, so a
+                // misspelt name, or a script killing a session it never
+                // created, reported OK for a kill that did nothing.
+                let shown = l_socket_name
+                    .as_deref()
+                    .and_then(|l| session_name.strip_prefix(&format!("{}__", l)))
+                    .unwrap_or(&session_name)
+                    .to_string();
+                if !std::path::Path::new(&port_path).exists() {
+                    eprintln!("psmux: can't find session: {}", shown);
+                    std::process::exit(1);
+                }
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                let mut gone = !probe_session_alive(&session_name);
+                let was_alive = probe_session_alive(&session_name);
+                if !was_alive && crate::session::registry_pid_anchor_alive(&session_name) != Some(true) {
+                    // A registry with nobody behind it: the server went away and
+                    // left its files. Reap them so the next `ls` does not stall
+                    // on them, and tell the caller the truth, which is that
+                    // there was no such session to kill.
+                    crate::session::remove_session_registry(&session_name);
+                    eprintln!("psmux: can't find session: {}", shown);
+                    std::process::exit(1);
+                }
+                let mut gone = !was_alive;
                 let mut refused = false;
                 while !gone {
                     match send_control("kill-session\n".to_string()) {
@@ -3428,6 +3547,7 @@ fn run_main() -> io::Result<()> {
             }
             // bind-key - Bind a key to a command
             "bind-key" | "bind" => {
+                reject_unknown_key_name(&cmd_args, "bind-key");
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
                 match send_control(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
@@ -3440,6 +3560,7 @@ fn run_main() -> io::Result<()> {
             }
             // unbind-key - Unbind a key
             "unbind-key" | "unbind" => {
+                reject_unknown_key_name(&cmd_args, "unbind-key");
                 let cmd_str: String = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
                 match send_control(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
@@ -3454,7 +3575,7 @@ fn run_main() -> io::Result<()> {
             "set-option" | "set" | "set-window-option" | "setw" => {
                 // Validate that known integer-valued options receive a numeric value,
                 // erroring (nonzero exit) like tmux instead of silently accepting junk.
-                let cli_pane_scope = {
+                let (cli_pane_scope, cli_only_if_unset) = {
                     // NOTE: "lock-after-time" is intentionally excluded. Unlike the
                     // options below, psmux has no real numeric business logic for it
                     // anywhere server-side -- config.rs stores it as an opaque
@@ -3511,8 +3632,19 @@ fn run_main() -> io::Result<()> {
                     // principle as dd84b97 for refresh-client. -t/-p never
                     // reach `flags` (skipped with their values above); -U is
                     // the unset alias, -w a scope flag.
+                    //
+                    // Issue #618: -s is the SERVER scope flag. tmux 3.2 moved
+                    // default-terminal, extended-keys and friends onto the
+                    // server option table and tools write them the documented
+                    // way (`set-option -s default-terminal xterm-256color`).
+                    // Rejecting it turned every such bootstrap into a hard
+                    // failure. psmux runs one server per session and keeps a
+                    // single option store, so -s selects the same store as -g
+                    // rather than a genuinely cross-session one; the write
+                    // lands where the caller expects it, but it is not true
+                    // cross-session server-option storage.
                     for ch in flags.chars() {
-                        if !"agopqtuUw".contains(ch) {
+                        if !SET_OPTION_CLI_FLAGS.contains(ch) {
                             eprintln!("psmux: set-option: unknown flag -{}", ch);
                             std::process::exit(1);
                         }
@@ -3553,6 +3685,21 @@ fn run_main() -> io::Result<()> {
                         // alike: the first installed a 33 minute repeat
                         // window, the second was dropped server-side at exit
                         // 0 so a typo looked like it had been applied.
+                        // #608: `priority` takes a fixed set of three values.
+                        // The generic catalog check only validates numbers and
+                        // booleans, so without this a typo returned 0 and was
+                        // dropped server-side, leaving the class unchanged and
+                        // the mistake invisible.
+                        if *name == "priority"
+                            && crate::platform::normalize_priority(val).is_none()
+                        {
+                            eprintln!(
+                                "psmux: set-option: value for 'priority' must be one of {}, got '{}'",
+                                crate::platform::PRIORITY_VALUES.join(", "),
+                                val
+                            );
+                            std::process::exit(1);
+                        }
                         if *name == "repeat-time" {
                             if let Ok(ms) = val.parse::<i64>() {
                                 if ms < 0 {
@@ -3566,7 +3713,15 @@ fn run_main() -> io::Result<()> {
                             }
                         }
                     }
-                    flags.contains('p')
+                    // `-o` on an option that is already set is an error in tmux
+                    // (`already set: <name>`, exit 1) and silent at exit 0 only
+                    // under `-q`, so the no-q case has to read the server's
+                    // answer instead of firing and forgetting (#619 follow up).
+                    // `-u` disarms the guard entirely: tmux skips it whenever
+                    // `-u` is present, so that stays a plain unset.
+                    let only_if_unset =
+                        flags.contains('o') && !has_unset && !flags.contains('q');
+                    (flags.contains('p'), only_if_unset)
                 };
                 let cmd_str: String = cmd_args.iter().map(|s| {
                     let s = s.as_str();
@@ -3611,6 +3766,30 @@ fn run_main() -> io::Result<()> {
                     }
                     return Ok(());
                 }
+                // `set-option -o` without `-q`: the server answers "" when the
+                // write landed and "ERROR: already set: <name>" when it
+                // refused, which tmux reports on stderr at exit 1. Without
+                // this the refusal was a silent exit 0 with empty output, so a
+                // script seeding defaults could not tell "I set it" from "the
+                // user already had it" (#619 follow up).
+                if cli_only_if_unset {
+                    match send_control_with_response(format!("{}\n", cmd_str)) {
+                        Ok(resp) => {
+                            let t = resp.trim();
+                            if t.starts_with("ERROR") {
+                                // tmux prints the bare cmdq_error text.
+                                eprintln!("{}", t.trim_start_matches("ERROR:").trim());
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) if e.to_string().contains("no session")
+                            || e.to_string().contains("no server running") => {
+                            eprintln!("warning: no active session; option will take effect when set inside a session or via config file");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    return Ok(());
+                }
                 match send_control(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
                     Err(e) if e.to_string().contains("no session") => {
@@ -3644,7 +3823,9 @@ fn run_main() -> io::Result<()> {
                         if a.starts_with('-') && a.len() > 1 {
                             for ch in a[1..].chars() {
                                 // 'p' = pane scope (#580), forwarded as-is.
-                                if !"Agpqsvw".contains(ch) {
+                                // 's' = server scope (#618); the server narrows
+                                // a bare listing to the server options.
+                                if !SHOW_OPTIONS_CLI_FLAGS.contains(ch) {
                                     eprintln!("psmux: show-options: unknown flag -{}", ch);
                                     std::process::exit(1);
                                 }
@@ -4629,10 +4810,14 @@ fn run_main() -> io::Result<()> {
                         let client_cwd = std::env::current_dir()
                             .ok()
                             .and_then(|p| p.to_str().map(|s| s.to_string()));
+                        // See the new-session claim above: -p is what lets a bare
+                        // `psmux` in a shell with PSMUX_PRIORITY set reach a standby
+                        // that was spawned long before that shell (#608).
+                        let claim_prio = crate::platform::claim_priority_arg();
                         if let Some(ref cwd) = client_cwd {
-                            let _ = write!(stream, "claim-session {} {}\n", crate::util::quote_arg(&session_name), crate::util::quote_arg(cwd));
+                            let _ = write!(stream, "claim-session {} {} -p {}\n", crate::util::quote_arg(&session_name), crate::util::quote_arg(cwd), crate::util::quote_arg(&claim_prio));
                         } else {
-                            let _ = write!(stream, "claim-session {}\n", crate::util::quote_arg(&session_name));
+                            let _ = write!(stream, "claim-session {} -p {}\n", crate::util::quote_arg(&session_name), crate::util::quote_arg(&claim_prio));
                         }
                         let _ = stream.flush();
                         // Committed: we atomically own this warm (won the .port
@@ -4760,6 +4945,18 @@ fn run_main() -> io::Result<()> {
         return Ok(());
     }
     env::set_var("PSMUX_ACTIVE", "1");
+
+    // Same reasoning as the server (#608), for the other half of the keystroke
+    // path: this process reads the console input buffer and writes the frames,
+    // and the console window belongs to the terminal host, not to us, so we
+    // never inherit its foreground boost. Placed after the non-terminal bail so
+    // a scripted `psmux` that only prints its version does not touch its class.
+    // Fail open: a refused SetPriorityClass is ignored.
+    let client_priority = crate::platform::resolve_priority(
+        crate::config::priority_from_config().as_deref(),
+        true,
+    );
+    crate::platform::set_process_priority(&client_priority);
 
     let mut stdout = crate::platform::create_writer();
     enable_virtual_terminal_processing();

@@ -124,6 +124,26 @@ pub struct ClientInfo {
     pub last_session: Option<String>,
 }
 
+/// A pane's standing authorization to receive wheel reports (issue #613).
+///
+/// tmux keeps this on `struct screen` as `s->mode & ALL_MOUSE_MODES`: it is set
+/// by the application's own DECSET (input.c:2053), cleared by its DECRST
+/// (input.c:1959) or by `screen_reinit` when the pane respawns (screen.c:115),
+/// and there is no third party who could revoke it because there is no console.
+///
+/// psmux has a console in the way, so it records WHO earned the authorization
+/// and keeps it for as long as that process is alive inside the pane.  A child
+/// rewriting the console mode word cannot revoke what it never granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WheelAuth {
+    /// The pane's foreground leaf pid at the moment a mouse signal was first
+    /// observed.  Liveness of THIS pid is what keeps the latch.
+    pub owner_pid: u32,
+    /// `(checked_at, still_alive)`, same 2 second TTL as the other
+    /// mouse-inject detectors, so a wheel burst costs one process walk.
+    pub alive_cache: Option<(Instant, bool)>,
+}
+
 pub struct Pane {
     pub master: Box<dyn MasterPty>,
     pub writer: Box<dyn std::io::Write + Send>,
@@ -198,6 +218,23 @@ pub struct Pane {
     /// is forwarded — tmux `mouse_any_flag` parity).  Updated by
     /// `window_ops::update_mouse_proto_owner` on the server data tick.
     pub mouse_proto_owner: Option<(vt100::MouseProtocolMode, bool)>,
+    /// Pane-owned wheel authorization latch (issue #613).
+    ///
+    /// Both #598 signals — `mouse_proto_owner` and the live
+    /// `ENABLE_MOUSE_INPUT` probe — resolve to the same console input mode
+    /// word, and that word belongs to the CONSOLE, not to the application.
+    /// Any descendant that enters raw mode assigns it wholesale (libuv writes
+    /// `ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT` and restores
+    /// nothing), conhost reports the loss upstream as `ESC[?1003;1006l`, and
+    /// the pane's wheel goes silent for good even though its application never
+    /// changed its mind.
+    ///
+    /// This latch is psmux's stand-in for tmux's `s->mode & ALL_MOUSE_MODES`,
+    /// which lives on the pane's own screen and no other process can reach.
+    /// It is earned by a confirmed non-shell foreground, anchored to that
+    /// process's pid, and dropped when it exits.  See
+    /// `window_ops::latch_wheel_auth`.
+    pub wheel_auth: Option<WheelAuth>,
     /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
     /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
     pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -471,7 +508,7 @@ pub struct CopyModeState {
     pub selection_mode: SelectionMode,
     pub search_query: String,
     pub count: Option<usize>,
-    pub search_matches: Vec<(u16, u16, u16)>,
+    pub search_matches: Vec<(usize, u16, u16)>,
     pub search_idx: usize,
     pub search_forward: bool,
     pub find_char_pending: Option<u8>,
@@ -603,8 +640,11 @@ pub struct AppState {
     pub copy_selection_mode: SelectionMode,
     /// Copy-mode search query
     pub copy_search_query: String,    /// Numeric prefix count for copy-mode motions (vi-style)
-    pub copy_count: Option<usize>,    /// Copy-mode search matches: (row, col_start, col_end) in screen coords
-    pub copy_search_matches: Vec<(u16, u16, u16)>,
+    pub copy_count: Option<usize>,    /// Copy-mode search matches: (absolute_line, col_start, col_end).
+    /// The line is an index into the whole pane buffer, scrollback history
+    /// first and then the visible screen, so a match above the viewport is
+    /// addressable (#612).
+    pub copy_search_matches: Vec<(usize, u16, u16)>,
     /// Current match index in copy_search_matches
     pub copy_search_idx: usize,
     /// Search direction: true = forward (/), false = backward (?)
@@ -712,6 +752,9 @@ pub struct AppState {
     pub status_visible: bool,
     /// status-position: "top" or "bottom" (default "bottom")
     pub status_position: String,
+    /// priority: scheduling class for psmux's OWN processes, never for pane
+    /// children (issue #608). One of "normal", "above-normal", "high".
+    pub priority: String,
     /// status-style: stored for compat
     pub status_style: String,
     /// default-command / default-shell: shell to launch for new panes
@@ -1531,6 +1574,12 @@ impl AppState {
             mode_keys: "emacs".to_string(),
             status_visible: true,
             status_position: "bottom".to_string(),
+            // Deliberately the compile-time default, not the environment: a
+            // fresh AppState must match the catalog default no matter what
+            // PSMUX_PRIORITY happens to be set to in the process that built it
+            // (tests-rs/test_option_default_parity.rs). The environment is
+            // consulted where the class is actually applied, at startup.
+            priority: crate::platform::DEFAULT_PRIORITY.to_string(),
             status_style: "bg=green,fg=black".to_string(),
             default_shell: String::new(),
             word_separators: " -_@".to_string(),
@@ -1876,8 +1925,14 @@ pub enum CtrlReq {
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),
     /// Claim a warm server: rename session + send response so CLI knows it's done.
-    /// Fields: session name, optional client CWD, response sender.
-    ClaimSession(String, Option<String>, mpsc::Sender<String>),
+    /// Fields: session name, optional client CWD, optional client priority,
+    /// response sender.
+    ///
+    /// The priority rides along for the same reason the CWD does (#608): a warm
+    /// standby was spawned ahead of time, in an environment that predates the
+    /// claiming client, so anything the user set in the shell they ran psmux
+    /// from can only reach the already running process through the claim.
+    ClaimSession(String, Option<String>, Option<String>, mpsc::Sender<String>),
     SwapPane(String),
     /// swap-pane -t <target>: swap the active pane with the pane identified by
     /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id
@@ -1946,7 +2001,16 @@ pub enum CtrlReq {
     SetOptionQuiet(String, String, bool),  // set-option with quiet flag
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
-    SetOptionOnlyIfUnset(String, String),  // set-option -o
+    /// `set-option -o`: apply only when the option is not already set.
+    ///
+    /// The third field is an OPTIONAL reply channel. tmux fails a `-o` on an
+    /// option that is already set (`already set: <name>`, exit 1) and only
+    /// swallows it under `-q`, so a caller that wants that answer passes a
+    /// channel and gets `""` on success or `ERROR: already set: <name>` on the
+    /// refusal. `-q` callers pass `None` and the request stays fire and
+    /// forget, which is what every caller used to do unconditionally: the
+    /// refusal was invisible on every route (#619 follow up).
+    SetOptionOnlyIfUnset(String, String, Option<mpsc::Sender<String>>),  // set-option -o
     SetOptionToggle(String),  // set-option <bool-option> with no value (#535)
     /// Per-window `window-size` override; None unsets the local value.
     SetWindowSize(Option<String>),

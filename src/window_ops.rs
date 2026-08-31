@@ -145,6 +145,26 @@ pub(crate) fn update_mouse_proto_owner(pane: &mut Pane) {
     };
     if mode == vt100::MouseProtocolMode::None {
         pane.mouse_proto_owner = None;
+        // #613: a mode->None transition is NOT automatically the application
+        // withdrawing.  Under ConPTY the pane's mouse protocol is driven by
+        // conhost, which reports the console input mode word upstream, so a
+        // wholesale rewrite of that word by an unrelated child arrives here as
+        // an indistinguishable `ESC[?1003;1006l`.  Measured on this tree:
+        // starting `node -e "process.stdin.setRawMode(true)"` inside a pane
+        // whose TUI had ENABLE_MOUSE_INPUT on produced exactly that sequence,
+        // with the TUI never told and never asked.
+        //
+        // So the latch is only dropped when the console looks like an
+        // application narrowed its own mode.  When it carries libuv's raw-mode
+        // signature the standing authorization survives, which is what tmux
+        // does implicitly by keeping the mouse modes on the pane's own screen.
+        //
+        // The console query is skipped entirely unless a latch exists, so the
+        // common case (every shell pane, on every data tick) stays free.
+        if pane.wheel_auth.is_some() && !console_mode_is_libuv_raw(pane) {
+            mouse_log("  -> wheel latch DROPPED: mouse protocol withdrawn by the pane app (#613)");
+            pane.wheel_auth = None;
+        }
         return;
     }
     let changed = match pane.mouse_proto_owner {
@@ -152,12 +172,162 @@ pub(crate) fn update_mouse_proto_owner(pane: &mut Pane) {
         None => true,
     };
     if changed {
-        let app_owned = pane
+        let fg_shell = pane
             .child_pid
-            .and_then(crate::platform::process_info::foreground_is_shell)
-            == Some(false);
+            .and_then(crate::platform::process_info::foreground_is_shell);
+        // #613: the process walk is not always ready in time.  Claude Code is
+        // launched through a `claude` shim, so at the instant its DECSET is
+        // parsed the pane's deepest leaf can still be the launcher — measured
+        // here, with the whole sequence in one burst:
+        //
+        //   ESC[?1004h ESC[?1049h ESC[?1000h ESC[?1002h ESC[?1003h ESC[?1006h
+        //   -> mouse proto AnyMotion on pane 1 (fg_shell=Some(true) app_owned=false)
+        //
+        // and because the attribution is sampled ONCE per transition and the
+        // mode never changes again, that wrong answer is frozen for the life of
+        // the pane.  `#{mouse_any_flag}` reads no forever, which is exactly what
+        // the reporter measured across five panes and three versions.
+        //
+        // The alternate screen settles it without reopening #548.  PSReadLine's
+        // spurious tracking is enabled by the shell at a PROMPT, on the main
+        // screen; an application that turns the mouse on while the pane is on
+        // the alternate screen is not the shell.  This is the same
+        // `alternate_on` term tmux carries in its default WheelUpPane binding
+        // (key-bindings.c:510), used here for attribution rather than for
+        // forwarding, and it cannot resurrect the #598 audience: htop and codex
+        // never cause a mouse-protocol transition at all, so this branch is
+        // unreachable for them.  A protocol that was already on before the app
+        // reached the alternate screen produces no transition either, so an
+        // inherited mode is still attributed where it was earned.
+        let app_owned = fg_shell == Some(false) || pane_in_alt_screen(pane);
+        mouse_log(&format!(
+            "  -> mouse proto {:?} on pane {} (fg_shell={:?} alt={} app_owned={})",
+            mode, pane.id, fg_shell, pane_in_alt_screen(pane), app_owned));
         pane.mouse_proto_owner = Some((mode, app_owned));
+        if app_owned {
+            latch_wheel_auth(pane);
+        }
     }
+}
+
+/// libuv's raw-mode console input word: `uv_tty_set_mode(UV_TTY_MODE_RAW)`
+/// ASSIGNS `ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT` rather than
+/// clearing individual bits, and restores nothing when the process exits
+/// (issue #613).
+///
+/// This is the fingerprint that tells "some node process raw-moded the shared
+/// console" apart from "the application narrowed its own input mode".  An app
+/// that decides it no longer wants the mouse clears one bit and keeps the rest
+/// of its word (measured: `0x03B0` -> `0x03A0`); libuv leaves exactly `0x0208`.
+pub(crate) const LIBUV_RAW_INPUT_MODE: u32 = 0x0008 | 0x0200;
+
+/// Does the pane's child console carry [`LIBUV_RAW_INPUT_MODE`] right now?
+///
+/// A probe failure answers `false`, i.e. "treat it as a real withdrawal": the
+/// safe side of #598 is always to suppress, never to type into an application
+/// that did not ask.
+fn console_mode_is_libuv_raw(pane: &mut Pane) -> bool {
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    match pane.child_pid.and_then(mouse_inject::query_console_input_mode) {
+        Some(mode) => mode == LIBUV_RAW_INPUT_MODE,
+        None => false,
+    }
+}
+
+/// Record that this pane's application has asked for the mouse, anchored to
+/// the process that asked (issue #613).
+///
+/// The anchor is the pane's foreground LEAF pid, not the pane root: the latch
+/// has to expire when the application exits, or a wheel notch at the shell
+/// prompt afterwards would be typed into the shell instead of entering copy
+/// mode (#360).  The pane root outlives every application in the pane, so it
+/// is only the fallback when the process walk cannot resolve a leaf.
+///
+/// Latching requires a CONFIRMED non-shell foreground OR the alternate screen,
+/// the same rule `update_mouse_proto_owner` uses for `app_owned`.  PSReadLine
+/// enables mouse tracking on the shell's behalf at a MAIN screen prompt, and a
+/// shell prompt must never earn a standing authorization from it.
+pub(crate) fn latch_wheel_auth(pane: &mut Pane) {
+    if pane.child_pid.is_none() {
+        pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
+    }
+    let Some(root) = pane.child_pid else { return };
+    if crate::platform::process_info::foreground_is_shell(root) != Some(false)
+        && !pane_in_alt_screen(pane)
+    {
+        return;
+    }
+    let owner = crate::platform::process_info::foreground_leaf_pid(root).unwrap_or(root);
+    if matches!(pane.wheel_auth, Some(a) if a.owner_pid == owner) {
+        return;
+    }
+    mouse_log(&format!("  -> wheel latch EARNED by pid {} in pane {} (#613)", owner, pane.id));
+    pane.wheel_auth = Some(crate::types::WheelAuth { owner_pid: owner, alive_cache: None });
+}
+
+/// Does the pane's standing wheel authorization still hold (issue #613)?
+///
+/// Held while the process that earned it is alive AND still inside this pane's
+/// process tree.  The tree check is what makes PID reuse harmless: a recycled
+/// pid belonging to some unrelated program elsewhere on the machine is not
+/// this pane's application and must not keep its authorization alive.
+///
+/// This is the last resort in the wheel gate: it is consulted only after both
+/// live signals have already answered no, so a pane that never earned a latch
+/// is exactly as silent as #598 made it.
+pub(crate) fn wheel_auth_holds(pane: &mut Pane) -> bool {
+    let Some(auth) = pane.wheel_auth else { return false };
+    if let Some((ts, alive)) = auth.alive_cache {
+        if ts.elapsed().as_secs() < 2 {
+            return alive;
+        }
+    }
+    let root = pane.child_pid;
+    let alive = root.is_some_and(|r| {
+        crate::platform::process_info::pid_in_pane_tree(r, auth.owner_pid)
+    });
+    if !alive {
+        mouse_log(&format!("  -> wheel latch EXPIRED: owner pid {} left pane {} (#613)",
+            auth.owner_pid, pane.id));
+        pane.wheel_auth = None;
+        return false;
+    }
+    pane.wheel_auth = Some(crate::types::WheelAuth {
+        owner_pid: auth.owner_pid,
+        alive_cache: Some((std::time::Instant::now(), true)),
+    });
+    true
+}
+
+/// The explicit opt-in for a pane whose application can never earn the gate
+/// (issue #613).
+///
+/// The latch above rescues every pane that once satisfied a signal.  It cannot
+/// rescue a pane that never did: measured on this tree, a node TUI that writes
+/// `ESC[?1000h ESC[?1002h ESC[?1003h ESC[?1006h` and then enters raw mode can
+/// have conhost swallow the DECSET entirely, so psmux sees no mouse protocol
+/// at any point in the pane's life while the application reads SGR reports
+/// perfectly well.  For that shape there is nothing to latch onto and the user
+/// has to say so.
+///
+/// Two spellings, deliberately ordered narrowest first:
+///
+///   1. `set-option -p -t %N @mouse-force on`  — one pane, which is the scope
+///      the damage #598 prevents is decided at.
+///   2. `PSMUX_FORCE_WHEEL=1` in the server's environment — server wide, the
+///      shape PR #614 proposed, kept as the last resort for a user who wants
+///      it everywhere and does not want to set it per pane.
+///
+/// Both are off by default and neither relaxes anything else: #457's build
+/// gate and #573's `PSMUX_FORCE_MOUSE` govern the opposite direction (whether
+/// psmux may write mouse DECSET OUT to the terminal), and are untouched.
+pub(crate) fn wheel_forced(pane: &Pane) -> bool {
+    if let Some(v) = pane.pane_options.get("@mouse-force") {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
+    }
+    crate::ssh_input::wheel_gate_forced()
 }
 
 /// The wheel-forwarding decision (#548 + #570): forward when the pane is on
@@ -441,6 +611,27 @@ fn write_mouse_to_pty(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press:
     let _ = pane.writer.flush();
 }
 
+/// Does this native ConPTY mouse event get the Win32 `MOUSE_EVENT` record in
+/// addition to the SGR write into the pane's ConPTY input pipe?
+///
+/// Split out from `inject_mouse_combined` so the whole routing table can be
+/// asserted without building a live pane (#597).  Two rules, and only two:
+///
+///   * the wheel always gets the record, on every build.  That is #277, and it
+///     is what makes the wheel work for Bubble Tea style apps whose VTI
+///     console turns the pipe's SGR into KEY_EVENT text.
+///   * every other event gets it only on a build whose conhost cannot deliver
+///     the pipe write at all (`conpty_needs_mouse_record_bypass`), where the
+///     record is the only channel that reaches the child.
+///
+/// The caller gates (`pane_wants_click`, `pane_wants_bare_motion`, the #598
+/// wheel gate) run BEFORE this and are untouched: this decides how a report
+/// travels, never whether one is owed.
+pub(crate) fn record_bypass_applies(event_flags: u32) -> bool {
+    event_flags & mouse_inject::MOUSE_WHEELED != 0
+        || crate::ssh_input::conpty_needs_mouse_record_bypass()
+}
+
 /// Inject a mouse event into a pane using the best available method.
 ///
 /// Architecture (mirrors Windows Terminal):
@@ -553,13 +744,37 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // it is only run for the wheel, and only after the cheap
         // `mouse_proto_owner` check has already failed.  Clicks, drags and
         // motion never reach it.
-        if _event_flags & mouse_inject::MOUSE_WHEELED != 0
-            && !matches!(pane.mouse_proto_owner, Some((_, true)))
-            && !detect_mouse_input(pane)
-        {
-            mouse_log("  -> wheel report SUPPRESSED on both channels: pane app enabled no \
-                       mouse protocol (tmux input_key_mouse parity, #598)");
-            return;
+        //
+        // BOTH of those signals resolve to the same console input mode word,
+        // and that word belongs to the console rather than to the application
+        // that set it (#613).  `uv_tty_set_mode` assigns
+        // `ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT` over the whole
+        // word and restores nothing on exit, so ANY node process anywhere in
+        // the pane's tree — a subagent, an MCP server, one tool invocation —
+        // takes ENABLE_MOUSE_INPUT away and makes conhost publish the loss as
+        // `ESC[?1003;1006l`, which clears `mouse_proto_owner` too.  Measured
+        // here: a pane whose TUI held `0x03B0` forwarded the wheel, and after
+        // one `node -e "process.stdin.setRawMode(true)"` it read `0x0208` and
+        // forwarded nothing, permanently, with the TUI never consulted.
+        //
+        // tmux cannot have this bug: its authorization is `s->mode &
+        // ALL_MOUSE_MODES` on the pane's OWN screen (input-keys.c:805), set by
+        // the app's DECSET and cleared only by its DECRST or a respawn.  So
+        // psmux keeps a pane-owned record of the same thing — `wheel_auth`,
+        // anchored to the process that earned it — and consults it last, after
+        // both live signals have already said no.  A pane that never earned an
+        // authorization is exactly as silent as #598 made it.
+        if _event_flags & mouse_inject::MOUSE_WHEELED != 0 && !wheel_forced(pane) {
+            if matches!(pane.mouse_proto_owner, Some((_, true))) || detect_mouse_input(pane) {
+                // A live signal answered yes: refresh the latch so the
+                // authorization outlives the next child that raw-modes the
+                // console.
+                latch_wheel_auth(pane);
+            } else if !wheel_auth_holds(pane) {
+                mouse_log("  -> wheel report SUPPRESSED on both channels: pane app enabled no \
+                           mouse protocol (tmux input_key_mouse parity, #598)");
+                return;
+            }
         }
 
         // #277/#245: conhost silently drops the SGR bytes below unless the
@@ -569,7 +784,7 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         ensure_vti(pane);
         write_mouse_to_pty(pane, col, row, vt_button, press);
 
-        // For wheel events, also inject a Win32 MOUSE_EVENT record.
+        // Also inject a Win32 MOUSE_EVENT record.
         //
         // Some TUI frameworks (Bubble Tea / Go apps like opencode) enable
         // VT input mode (ENABLE_VIRTUAL_TERMINAL_INPUT) for keyboard but
@@ -581,12 +796,35 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // The Win32 MOUSE_EVENT injection bypasses ConPTY entirely and
         // delivers the event directly to the child's console input buffer.
         //
-        // This is done only for wheel events (not click/drag/hover) to
-        // minimize risk of duplicate events for apps where ConPTY already
-        // converts SGR to MOUSE_EVENT (e.g. crossterm with VTI off).
-        // (fixes #277)
-        if _event_flags & mouse_inject::MOUSE_WHEELED != 0 {
-            mouse_log(&format!("  -> also injecting Win32 MOUSE_EVENT (wheel, fixes #277)"));
+        // On 22523 and above this stays wheel only, exactly as #277 shipped
+        // it: the pipe write above already reaches the child there, and
+        // widening the record channel would risk a second copy of every
+        // click for apps where conhost does convert SGR to MOUSE_EVENT.
+        //
+        // Below 22523 the record channel is the ONLY one that works, so it
+        // covers clicks, releases, drags and motion as well (#597).  Those
+        // builds are the ones CONPTY_MOUSE_MIN_BUILD already documents as
+        // unable to hand an inbound SGR mouse report to the child, so the
+        // pipe write cannot be the duplicate: the reporter measured a
+        // crossterm app receiving every wheel notch through this record
+        // channel on real 19045 while a node child reading VT bytes received
+        // nothing at all.  There is no double delivery to create, only the
+        // clicks that were missing.  Every event that gets here has already
+        // passed its own caller gate (pane_wants_click, or
+        // pane_wants_bare_motion for DECSET 1003, or the wheel gate above),
+        // so this widens the CHANNEL, never the audience: an application
+        // that never asked for the mouse still receives nothing (#598).
+        //
+        // tmux parity: tmux writes SGR bytes and has no record channel at
+        // all.  The MOUSE_EVENT bypass is a Windows only extension that
+        // exists because conhost sits between psmux and the pane child.
+        if record_bypass_applies(_event_flags) {
+            let reason = if _event_flags & mouse_inject::MOUSE_WHEELED != 0 {
+                "wheel, fixes #277"
+            } else {
+                "build below CONPTY_MOUSE_MIN_BUILD, #597"
+            };
+            mouse_log(&format!("  -> also injecting Win32 MOUSE_EVENT ({})", reason));
             inject_mouse(pane, col, row, _button_state, _event_flags);
         }
     }
@@ -2453,3 +2691,11 @@ mod test_discussion349_podman_motion_leak;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue604_wsl_nvim_mouse.rs"]
 mod test_issue604_wsl_nvim_mouse;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue597_legacy_mouse_bypass.rs"]
+mod test_issue597_legacy_mouse_bypass;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue613_wheel_gate_durability.rs"]
+mod test_issue613_wheel_gate_durability;

@@ -1201,13 +1201,27 @@ pub mod mouse_inject {
     /// child reads input as text (ReadConsole/ReadFile) and expects VT
     /// mouse sequences delivered as KEY_EVENT records (nvim, vim).
     pub fn query_mouse_input_enabled(child_pid: u32) -> Option<bool> {
+        query_console_input_mode(child_pid).map(|mode| (mode & ENABLE_MOUSE_INPUT) != 0)
+    }
+
+    /// The child console's whole input mode word (issue #613).
+    ///
+    /// `query_mouse_input_enabled` only ever needed one bit, but the shape of
+    /// the WHOLE word is what tells a considered change apart from a wholesale
+    /// overwrite.  libuv's `uv_tty_set_mode(UV_TTY_MODE_RAW)` assigns
+    /// `ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT` over the entire
+    /// word rather than clearing individual bits, so a pane whose mode reads
+    /// exactly `0x0208` has been raw-moded by a node process, not narrowed by
+    /// an application that decided it no longer wants the mouse.  See
+    /// `window_ops::console_mode_is_libuv_raw`.
+    pub fn query_console_input_mode(child_pid: u32) -> Option<u32> {
         let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
 
             if AttachConsole(child_pid) == 0 {
-                debug_log(&format!("query_mouse_input_enabled: AttachConsole({}) FAILED", child_pid));
+                debug_log(&format!("query_console_input_mode: AttachConsole({}) FAILED", child_pid));
                 if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
                 return None;
             }
@@ -1227,7 +1241,7 @@ pub mod mouse_inject {
             );
 
             if handle == INVALID_HANDLE || handle == 0 {
-                debug_log("query_mouse_input_enabled: CreateFileW(CONIN$) FAILED");
+                debug_log("query_console_input_mode: CreateFileW(CONIN$) FAILED");
                 FreeConsole();
                 if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
                 return None;
@@ -1245,13 +1259,13 @@ pub mod mouse_inject {
             if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
 
             if ok == 0 {
-                debug_log("query_mouse_input_enabled: GetConsoleMode FAILED");
+                debug_log("query_console_input_mode: GetConsoleMode FAILED");
                 return None;
             }
 
-            let mouse_input = (mode & ENABLE_MOUSE_INPUT) != 0;
-            debug_log(&format!("query_mouse_input_enabled: pid={} mode=0x{:04X} ENABLE_MOUSE_INPUT={}", child_pid, mode, mouse_input));
-            Some(mouse_input)
+            debug_log(&format!("query_console_input_mode: pid={} mode=0x{:04X} ENABLE_MOUSE_INPUT={}",
+                child_pid, mode, (mode & ENABLE_MOUSE_INPUT) != 0));
+            Some(mode)
         }
     }
 
@@ -2379,6 +2393,7 @@ pub mod mouse_inject {
     pub fn send_ctrl_c_event(_pid: u32, _reattach: bool) -> bool { false }
     pub fn send_ctrl_break_event(_pid: u32, _reattach: bool) -> bool { false }
     pub fn query_mouse_input_enabled(_pid: u32) -> Option<bool> { None }
+    pub fn query_console_input_mode(_pid: u32) -> Option<u32> { None }
     pub fn send_bracketed_paste(_pid: u32, _text: &str, _bracket: bool) -> bool { false }
     pub fn send_vt_response(_pid: u32, _text: &str) -> bool { false }
     pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
@@ -3280,6 +3295,43 @@ pub mod process_info {
         leaf
     }
 
+    /// Is a VT bridge (`wsl.exe`, `wslhost.exe`, `ssh.exe`, a distro launcher)
+    /// alive anywhere in the pane's process tree?  Issue #615.
+    ///
+    /// When one is, no Win32 process in the pane can answer "where is the
+    /// shell": `wsl.exe` keeps the working directory it was created with for
+    /// its whole life while the real shell moves around inside the distro (or
+    /// on another machine).  `#{pane_current_path}` uses this to decide that a
+    /// directory the shell announced over OSC 7 / OSC 9;9 outranks the PEB
+    /// reading it would otherwise trust.
+    ///
+    /// This is the render-path twin of `has_vt_bridge_descendant`: identical
+    /// walk, but off the shared cached snapshot, because it runs behind every
+    /// status-line repaint that mentions `#{pane_current_path}`.  It is only
+    /// ever reached for a pane that actually announced a directory, so a pane
+    /// without shell integration pays nothing.
+    pub fn tree_has_vt_bridge_cached(root_pid: u32) -> bool {
+        let entries = match process_table(RENDER_PATH_TTL) {
+            Some(t) => t,
+            None => return false,
+        };
+        let mut queue: Vec<u32> = vec![root_pid];
+        let mut head = 0;
+        while head < queue.len() {
+            let parent = queue[head];
+            head += 1;
+            for (pid, ppid, name) in entries.iter() {
+                if *ppid == parent && *pid != root_pid && !queue.contains(pid) {
+                    if is_vt_bridge_exe(name) {
+                        return true;
+                    }
+                    queue.push(*pid);
+                }
+            }
+        }
+        false
+    }
+
     /// Get the CWD of the foreground process in the pane.
     pub fn get_foreground_cwd(pid: u32) -> Option<String> {
         if let Some(target) = find_foreground_child_pid(pid) {
@@ -3547,6 +3599,52 @@ pub mod process_info {
         }
     }
 
+    /// The PID of the pane's deepest foreground leaf (issue #613).
+    ///
+    /// `foreground_is_shell` throws the pid away and keeps only the
+    /// classification.  The wheel authorization latch needs the identity: the
+    /// thing it anchors to is "the process that asked for the mouse", and a
+    /// name cannot be checked for liveness.  Returns `None` when the snapshot
+    /// fails or the root has no foreground leaf distinct from itself, in which
+    /// case the caller falls back to the pane's root child pid.
+    pub fn foreground_leaf_pid(root_pid: u32) -> Option<u32> {
+        let entries = process_table(std::time::Duration::ZERO)?;
+        deepest_descendant(&entries, root_pid).map(|(pid, _)| pid)
+    }
+
+    /// Is `pid` the pane root itself or one of its descendants (issue #613)?
+    ///
+    /// Guards the wheel latch against PID reuse: an owner pid that has died and
+    /// been recycled by an unrelated process elsewhere on the machine is not
+    /// this pane's application, and the latch must not survive on its liveness.
+    pub fn pid_in_pane_tree(root_pid: u32, pid: u32) -> bool {
+        if pid == root_pid {
+            return process_table(std::time::Duration::from_millis(250))
+                .is_some_and(|t| t.iter().any(|(p, _, _)| *p == pid));
+        }
+        let Some(entries) = process_table(std::time::Duration::from_millis(250)) else {
+            return false;
+        };
+        let mut cur = pid;
+        // Same iteration guard as `deepest_descendant`: a snapshot taken across
+        // PID reuse can contain a parent cycle, and this must terminate.
+        for _ in 0..64 {
+            match entries.iter().find(|(p, _, _)| *p == cur) {
+                Some((_, ppid, _)) => {
+                    if *ppid == root_pid {
+                        return true;
+                    }
+                    if *ppid == 0 || *ppid == cur {
+                        return false;
+                    }
+                    cur = *ppid;
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// True when the pane's deepest foreground process is a VT bridge
     /// (wsl.exe, ssh.exe, ...).  Used by the Ctrl+C router (issue #491):
     /// bridges read raw bytes from their console and forward 0x03 into the
@@ -3782,8 +3880,11 @@ pub mod process_info {
     pub fn get_deepest_foreground_process_name(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
     pub fn has_vt_bridge_descendant(_root_pid: u32) -> bool { false }
+    pub fn tree_has_vt_bridge_cached(_root_pid: u32) -> bool { false }
     pub fn foreground_is_shell(_root_pid: u32) -> Option<bool> { None }
     pub fn foreground_is_vt_bridge(_root_pid: u32) -> bool { false }
+    pub fn foreground_leaf_pid(_root_pid: u32) -> Option<u32> { None }
+    pub fn pid_in_pane_tree(_root_pid: u32, _pid: u32) -> bool { false }
 }
 
 // ─── UTF-16 Console Writer (Windows) ────────────────────────────────────
@@ -3957,6 +4058,159 @@ pub static BOLD_IS_BRIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Windows console writer).
 pub fn set_bold_is_bright(on: bool) {
     BOLD_IS_BRIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── Process priority (issue #608) ───────────────────────────────────────────
+//
+// Windows hands its foreground boost to whoever owns the foreground WINDOW.
+// The psmux server owns no window at all, and the attach client draws inside a
+// console window that the terminal host owns, so neither process is ever the
+// one Windows decides to favour. On a box that is merely busy that costs
+// nothing. On a heavily oversubscribed one it means the keystroke path queues
+// behind every compute job on the machine, which is the lag reported in #608.
+//
+// tmux has no equivalent. It never calls setpriority or nice anywhere in its
+// source, because on Linux the CFS scheduler already favours a process that
+// spends its life blocked on a read: interactivity is inferred from the sleep
+// pattern rather than granted to a window. This knob is therefore a Windows
+// specific extension, not a tmux parity item.
+
+/// Priority class psmux's own processes run at unless something overrides it.
+pub const DEFAULT_PRIORITY: &str = "above-normal";
+
+/// The values `priority` and `PSMUX_PRIORITY` accept, in the order shown to a
+/// user who got one wrong.
+pub const PRIORITY_VALUES: &[&str] = &["normal", "above-normal", "high"];
+
+const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+
+/// Canonical spelling of an accepted priority value, or `None` if it is not one.
+///
+/// Deliberately narrow. `realtime` is not offered at any spelling: it outranks
+/// most of the kernel's own threads and a wedged psmux at that class can make a
+/// machine unusable. `idle` and `below-normal` are not offered either, because
+/// they would make the reported symptom worse rather than better.
+pub fn normalize_priority(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some("normal"),
+        "above-normal" | "above_normal" | "abovenormal" => Some("above-normal"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
+fn priority_class(value: &str) -> Option<u32> {
+    match normalize_priority(value)? {
+        "normal" => Some(NORMAL_PRIORITY_CLASS),
+        "above-normal" => Some(ABOVE_NORMAL_PRIORITY_CLASS),
+        "high" => Some(HIGH_PRIORITY_CLASS),
+        _ => None,
+    }
+}
+
+/// `PSMUX_PRIORITY` as a canonical value, or `None` when it is unset, empty or
+/// unusable. Silent: the one place that warns about a bad value is startup.
+pub fn env_priority() -> Option<&'static str> {
+    let raw = std::env::var("PSMUX_PRIORITY").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    normalize_priority(&raw)
+}
+
+/// Resolve the class this process should run at.
+///
+/// `PSMUX_PRIORITY` outranks the `priority` option, so a user can climb out of
+/// a bad configured value from the shell they start psmux in without editing a
+/// config file. `warn` is for the startup call only: the option arms re-resolve
+/// on every `set -g priority` and must not print on each one.
+pub fn resolve_priority(from_option: Option<&str>, warn: bool) -> String {
+    if let Ok(raw) = std::env::var("PSMUX_PRIORITY") {
+        if !raw.trim().is_empty() {
+            match normalize_priority(&raw) {
+                Some(v) => return v.to_string(),
+                None if warn => eprintln!(
+                    "psmux: PSMUX_PRIORITY: unknown value '{}' (expected {}); ignoring it",
+                    raw.trim(),
+                    PRIORITY_VALUES.join(", ")
+                ),
+                None => {}
+            }
+        }
+    }
+    from_option
+        .and_then(normalize_priority)
+        .unwrap_or(DEFAULT_PRIORITY)
+        .to_string()
+}
+
+/// The class a claiming client wants its server to end up at, resolved under
+/// the documented precedence (env, then the `priority` option in the config
+/// file, then the default).
+///
+/// This exists so `claim-session -p <value>` is built the same way at all three
+/// send sites (#608). The resolution happens on the CLIENT because that is the
+/// only process that can see the user's shell environment: a warm standby was
+/// spawned by an earlier server generation and inherits ITS environment, never
+/// the claimant's.
+pub fn claim_priority_arg() -> String {
+    resolve_priority(crate::config::priority_from_config().as_deref(), false)
+}
+
+/// Set THIS process's priority class. Never raises pane children: a Windows
+/// child created without an explicit class flag gets NORMAL_PRIORITY_CLASS
+/// unless its creator is idle or below-normal, so the shells and programs psmux
+/// spawns stay where the user expects them.
+///
+/// Fail open. A refused SetPriorityClass (a restricted token, a job object that
+/// caps the class) returns false and is otherwise ignored, because losing a few
+/// milliseconds of scheduling is never a reason to refuse to start.
+#[cfg(windows)]
+pub fn set_process_priority(value: &str) -> bool {
+    let Some(class) = priority_class(value) else {
+        return false;
+    };
+    #[link(name = "kernel32")]
+    extern "system" {
+        // *mut c_void to match the other GetCurrentProcess declaration in the
+        // crate (src/paths.rs); a second shape trips clashing_extern_declarations.
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn SetPriorityClass(handle: *mut std::ffi::c_void, class: u32) -> i32;
+    }
+    unsafe { SetPriorityClass(GetCurrentProcess(), class) != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn set_process_priority(value: &str) -> bool {
+    priority_class(value).is_some()
+}
+
+/// This process's current class as one of the accepted names, or `None` when it
+/// is something psmux never sets. Used by the tests and by `#{priority}`-style
+/// introspection rather than by the runtime itself.
+#[cfg(windows)]
+pub fn current_process_priority() -> Option<&'static str> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        // *mut c_void to match the other GetCurrentProcess declaration in the
+        // crate (src/paths.rs); a second shape trips clashing_extern_declarations.
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetPriorityClass(handle: *mut std::ffi::c_void) -> u32;
+    }
+    let class = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    match class {
+        NORMAL_PRIORITY_CLASS => Some("normal"),
+        ABOVE_NORMAL_PRIORITY_CLASS => Some("above-normal"),
+        HIGH_PRIORITY_CLASS => Some("high"),
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn current_process_priority() -> Option<&'static str> {
+    None
 }
 
 /// Returns true when an SGR parameter list contains only ASCII digits and
@@ -4426,57 +4680,67 @@ pub mod caret {
     pub fn destroy() {}
 }
 
-/// On Windows ConPTY, Shift+Enter is misreported by crossterm:
+/// Last-resort modifier recovery for Enter on terminals that cannot encode one.
 ///
-/// VS Code's xterm.js sends `\x1b\r` (ESC + CR) for Shift+Enter.
-/// ConPTY interprets the ESC prefix as Alt, so crossterm reports
-/// `KeyModifiers::ALT` instead of `KeyModifiers::SHIFT`.
+/// VT has no encoding for a modified Return, so a terminal that has nothing
+/// better to say sends a bare `\r` and the modifier is simply gone by the time
+/// psmux sees the key.  #121 papered over that by polling `GetAsyncKeyState`.
 ///
-/// This function polls the physical keyboard state to detect the real
-/// modifiers and remaps accordingly.
+/// A poll reads the keyboard **now**, not at the time the key event was
+/// generated, so it loses the race whenever event processing lags the
+/// keystroke: the user has already let Shift go and Shift+Enter silently
+/// becomes Enter, which in a node TUI means "submit" instead of "newline".
+/// That is issue #611, and it gets worse the busier the host is.
+///
+/// The information is normally right there in the event.  Measured on Windows
+/// 11 26200 with crossterm 0.29:
+///
+/// ```text
+///   real Shift+Enter typed into Windows Terminal, seen by the ConPTY child:
+///     REC DOWN vk=0x0D scan=0x1C uChar=0x000D ctrl=0x0010 [SHIFT]
+///   which crossterm reports as:
+///     KEY code=Enter mods=KeyModifiers(SHIFT) kind=Press
+///
+///   the bytes 1b 0d (VS Code / the Windows Terminal sendInput workaround),
+///   written into a pseudoconsole in ONE write:
+///     REC DOWN vk=0x0D scan=0x1C uChar=0x000D ctrl=0x0002 [LALT]
+/// ```
+///
+/// So whenever the event carries **any** modifier it already answers the
+/// question, and the poll can only corrupt it with stale hardware state (the
+/// old code stripped a genuine ALT off the `1b 0d` form whenever the physical
+/// Shift happened to still be down).  The poll is therefore consulted only for
+/// a completely unmodified Enter, where nothing else is left to consult.
 #[cfg(windows)]
 pub fn augment_enter_shift(key: &mut crossterm::event::KeyEvent) {
+    augment_enter_shift_with(key, || {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetAsyncKeyState(vKey: i32) -> i16;
+        }
+        const VK_SHIFT: i32 = 0x10;
+        unsafe { GetAsyncKeyState(VK_SHIFT) < 0 }
+    })
+}
+
+/// [`augment_enter_shift`] with the hardware poll injected, so the "the event
+/// wins over the poll" rule can be tested without a keyboard.
+#[cfg(windows)]
+pub fn augment_enter_shift_with<F: FnOnce() -> bool>(
+    key: &mut crossterm::event::KeyEvent,
+    shift_is_down: F,
+) {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     if !matches!(key.code, KeyCode::Enter) {
         return;
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
+    // The event already recorded what was held AT EVENT TIME.  Trust it.
+    if !key.modifiers.is_empty() {
         return;
     }
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn GetAsyncKeyState(vKey: i32) -> i16;
-    }
-
-    const VK_SHIFT: i32 = 0x10;
-    const VK_CONTROL: i32 = 0x11;
-    const VK_MENU: i32 = 0x12; // Alt
-
-    unsafe {
-        let shift_down = GetAsyncKeyState(VK_SHIFT) < 0;
-        let ctrl_down = GetAsyncKeyState(VK_CONTROL) < 0;
-        let alt_down = GetAsyncKeyState(VK_MENU) < 0;
-
-        if shift_down {
-            key.modifiers.insert(KeyModifiers::SHIFT);
-            // Windows Terminal + crossterm sometimes reports a phantom CONTROL
-            // modifier on the Press event for Shift+Enter while the physical
-            // Ctrl key is not held.  Remove it.
-            if !ctrl_down && key.modifiers.contains(KeyModifiers::CONTROL) {
-                key.modifiers.remove(KeyModifiers::CONTROL);
-            }
-            if !alt_down && key.modifiers.contains(KeyModifiers::ALT) {
-                key.modifiers.remove(KeyModifiers::ALT);
-            }
-        } else if !shift_down && !ctrl_down && !alt_down {
-            // No physical modifiers held; ConPTY may have injected a phantom
-            // ALT from ESC+CR.  Already handled by the early return for SHIFT
-            // above, but guard plain Enter too.
-        } else if !shift_down && alt_down {
-            // Physical Alt is held, leave as is.
-        }
+    if shift_is_down() {
+        key.modifiers.insert(KeyModifiers::SHIFT);
     }
 }
 
@@ -4925,3 +5189,7 @@ mod tests_issue589_undercurl;
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue599_data_root_mutex.rs"]
 mod tests_issue599_data_root_mutex;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue608_priority.rs"]
+mod tests_issue608_priority;

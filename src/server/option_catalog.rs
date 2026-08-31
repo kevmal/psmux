@@ -20,6 +20,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "default-terminal", scope: "server", option_type: "string", default: "xterm-256color", description: "TERM value for new panes" },
     OptionDef { name: "copy-command", scope: "server", option_type: "string", default: "", description: "External copy command (pipe selection)" },
     OptionDef { name: "exit-empty", scope: "server", option_type: "boolean", default: "on", description: "Exit server when no sessions remain" },
+    OptionDef { name: "priority", scope: "server", option_type: "choice", default: "above-normal", description: "Scheduling class for psmux's own server and client processes (normal/above-normal/high). Pane children are never raised" },
     // ── Session options ──
     OptionDef { name: "prefix", scope: "session", option_type: "string", default: "C-b", description: "Primary prefix key" },
     OptionDef { name: "prefix2", scope: "session", option_type: "string", default: "none", description: "Secondary prefix key" },
@@ -67,6 +68,11 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "allow-set-title", scope: "session", option_type: "boolean", default: "off", description: "Allow programs to set pane title via escape sequences" },
     OptionDef { name: "update-environment", scope: "session", option_type: "string", default: "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY", description: "Environment variables to update on attach" },
     OptionDef { name: "synchronize-panes", scope: "session", option_type: "boolean", default: "off", description: "Send input to all panes simultaneously" },
+    // Catalogued for #619: `set-option -u` restores an option to its catalog
+    // default, so an option missing from here could not be restored at all.
+    // Both already had a hand written arm in the server's old restore table;
+    // this is the same value, in the one place that now owns it.
+    OptionDef { name: "choose-tree-preview", scope: "session", option_type: "boolean", default: "off", description: "Show a live pane preview in choose-tree" },
     // ── psmux extensions (session scope) ──
     OptionDef { name: "prediction-dimming", scope: "session", option_type: "boolean", default: "off", description: "Dim PSReadLine prediction text" },
     OptionDef { name: "allow-predictions", scope: "session", option_type: "boolean", default: "off", description: "Allow PSReadLine predictions" },
@@ -95,6 +101,8 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "pane-border-style", scope: "pane", option_type: "string", default: "default", description: "Inactive pane border style" },
     OptionDef { name: "pane-active-border-style", scope: "pane", option_type: "string", default: "fg=green", description: "Active pane border style" },
     OptionDef { name: "pane-border-lines", scope: "pane", option_type: "choice", default: "single", description: "Pane border line style (single/double/heavy/simple/number/spaces/none)" },
+    // See the choose-tree-preview note above (#619).
+    OptionDef { name: "pane-border-hover-style", scope: "pane", option_type: "string", default: "fg=yellow", description: "Pane border style under the mouse pointer" },
 ];
 
 /// Build the flattened option list for CustomizeMode using live values from AppState.
@@ -109,6 +117,32 @@ pub fn build_option_list(app: &crate::types::AppState) -> Vec<(String, String, S
 /// Look up the default value for a given option name.
 pub fn default_for(name: &str) -> Option<&'static str> {
     OPTION_CATALOG.iter().find(|d| d.name == name).map(|d| d.default)
+}
+
+/// Names of the options this catalog marks server scope, sorted.
+///
+/// tmux keeps a separate server option table (options-table.c,
+/// OPTIONS_TABLE_SERVER) and `options_scope_from_flags` points `-s` at it, so a
+/// bare `show-options -s` there prints server options only. psmux runs one
+/// server per session and keeps a single option store, so `-s` cannot select a
+/// different store; it selects this SLICE of the one store, which is the part a
+/// caller passing `-s` is actually asking about (#618).
+pub fn server_option_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = OPTION_CATALOG
+        .iter()
+        .filter(|d| d.scope == "server")
+        .map(|d| d.name)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// True when the catalog marks `name` server scope. `set-option -s` accepts any
+/// option name (tmux does the same: for a table option `options_scope_from_name`
+/// ignores `-s` entirely rather than erroring), so this only ever narrows a
+/// listing, never rejects a write.
+pub fn is_server_option(name: &str) -> bool {
+    OPTION_CATALOG.iter().any(|d| d.name == name && d.scope == "server")
 }
 
 #[cfg(test)]

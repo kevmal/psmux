@@ -1,5 +1,7 @@
 # Features
 
+psmux brings the tmux feature set to Windows natively: sessions that outlive the terminal window, split panes and windows, full mouse support, a vim style copy mode, tmux themes and plugins, 90+ tmux compatible commands and 140+ format variables, all in one Rust binary on ConPTY with no WSL, Cygwin or MSYS2. This page is the complete list; the [Getting Started tutorial](tutorials/getting-started-windows.md) shows the essentials in ten minutes.
+
 ## Highlights
 
 - 🦠 **Made in Rust** : opt-level 3, full LTO, single codegen unit. Maximum performance.
@@ -53,7 +55,8 @@
 
 - **53 vi-style key bindings** : motions, selections, search, text objects
 - Visual, line, and **rectangle selection** modes (`v`, `V`, `Ctrl+v`)
-- `/` and `?` search with `n`/`N` navigation
+- `/` and `?` search with `n`/`N` navigation, across the whole scrollback (an off screen match scrolls the view to it)
+- Copy mode is a property of the pane, as in tmux: new panes start live, and more than one pane can be in copy mode at once
 - `f`/`F`/`t`/`T` character find, `%` bracket matching, `{`/`}` paragraph jump
 - Named registers (`"a` through `"z`), count prefixes, word/WORD variants
 - Mouse drag-select copies to Windows clipboard on release and returns to the live view (tmux parity); dragging at the pane's first/last row auto-scrolls through scrollback

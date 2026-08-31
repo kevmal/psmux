@@ -525,15 +525,19 @@ pub fn render_runs_line(
         if c >= width { break; }
         let style = run_style(&run.fg, &run.bg, run.flags);
         last_bg = style.bg.unwrap_or(Color::Reset);
-        // Hidden cells render as spaces to match the main view's behavior.
+        let run_w = run.width.max(1);
+        // Hidden cells render as spaces to match the main view's behavior, one
+        // space per column of the run: the column accounting below advances by
+        // `run_w`, so a single space would claim `run_w` columns while painting
+        // one and shift every later run on the row (#617, #619).
+        let hidden = " ".repeat(run_w as usize);
         let text: &str = if run.flags & 64 != 0 {
-            " "
+            &hidden
         } else if run.text.is_empty() {
             " "
         } else {
             &run.text
         };
-        let run_w = run.width.max(1);
         if c + run_w > width {
             // Truncate to the available width.
             let avail = (width - c) as usize;
@@ -678,11 +682,9 @@ pub fn dump_separators(
     out
 }
 
-/// Render a `LayoutJson` window dump into `area` so the preview is a
-/// pixel-for-pixel miniature of the real psmux window.  Reuses the
-/// canonical `crate::client::render_layout_json` so every separator,
-/// every color, every cell of pane content matches what the user
-/// would see if they switched to that window.
+/// Render the target's pane contents and separators into the preview area.
+/// Target window styles are not part of `window-dump`, so cross-session
+/// previews use only the colours serialized in the dump.
 pub fn render_dump_tree(
     f: &mut ratatui::Frame,
     layout: &crate::layout::LayoutJson,
@@ -708,6 +710,7 @@ pub fn render_dump_tree(
         total_panes,
         crate::border_lines::border_chars(crate::border_lines::DEFAULT),
         None,
+        crate::client::WindowContentStyles::default(),
     );
     let border_mask = crate::client::border_mask_from_layout(layout, area, f.buffer_mut().area, false);
     crate::rendering::fix_border_intersections(f.buffer_mut(), crate::border_lines::border_chars(crate::border_lines::DEFAULT), &border_mask);
@@ -753,4 +756,3 @@ mod tests_ansi {
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 }
-

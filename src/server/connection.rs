@@ -1797,12 +1797,15 @@ match cmd {
     }
     "claim-session" => {
         // Warm-server claim: rename + synchronous response so CLI knows it's done.
-        // Usage: claim-session <name> [<client-cwd>]
-        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(|s| &**s).collect();
-        if let Some(name) = non_flag.first().copied() {
-            let client_cwd = non_flag.get(1).map(|s| s.to_string());
+        // Usage: claim-session <name> [<client-cwd>] [-p <priority>]
+        //
+        // Positionals and the -p flag are split by crate::util::parse_claim_args
+        // so the wire contract has one implementation and one set of tests.
+        let (non_flag, client_priority) = crate::util::parse_claim_args(&args);
+        if let Some(name) = non_flag.first().cloned() {
+            let client_cwd = non_flag.get(1).cloned();
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ClaimSession(name.to_string(), client_cwd, rtx));
+            let _ = tx.send(CtrlReq::ClaimSession(name, client_cwd, client_priority, rtx));
             if let Ok(resp) = rrx.recv_timeout(std::time::Duration::from_secs(5)) {
                 let _ = write!(write_stream, "{}", resp);
                 let _ = write_stream.flush();
@@ -2483,7 +2486,11 @@ match cmd {
         let has_a = flag_chars.contains('a');
         let has_q = flag_chars.contains('q');
         let has_o = flag_chars.contains('o');
-        let global = flag_chars.contains('g');
+        // -s is the server scope flag (#618). psmux runs one server per session
+        // and keeps a single option store, so -s selects the same store as -g;
+        // it is NOT genuine cross-session server-option storage, it just puts
+        // the write where a tool passing tmux 3.2+ syntax expects to find it.
+        let global = flag_chars.contains('g') || flag_chars.contains('s');
         // tmux parity (#580): `-p` is a bare PANE-SCOPE flag like `-w`; it
         // never consumes the next argument.
         let pane_scope = flag_chars.contains('p');
@@ -2529,7 +2536,23 @@ match cmd {
             } else if has_a {
                 let _ = tx.send(CtrlReq::SetOptionAppend(option, value));
             } else if has_o {
-                let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(option, value));
+                // `-o` on an option that is already set is an ERROR in tmux
+                // (`already set: <name>`, exit 1), quiet only under `-q`. The
+                // request used to be fire and forget, so the refusal was
+                // invisible on this route; ask for the answer unless the
+                // caller passed -q (#619 follow up).
+                if has_q {
+                    let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(option, value, None));
+                } else {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(option, value, Some(rtx)));
+                    if let Ok(reply) = rrx.recv_timeout(Duration::from_millis(2000)) {
+                        if !reply.is_empty() {
+                            let _ = write!(write_stream, "{}\n", reply);
+                            let _ = write_stream.flush();
+                        }
+                    }
+                }
             } else {
                 let _ = tx.send(CtrlReq::SetOptionQuiet(option, value, has_q));
             }
@@ -2562,11 +2585,39 @@ match cmd {
             })
         };
         let has_a = combined_has('A');
-        let _has_s = combined_has('s');
+        let has_s = combined_has('s');
         let has_w = combined_has('w');
         let window_scope = matches!(cmd, "show-window-options" | "showw" | "show-window-option") || has_w;
         let has_v = combined_has('v');
         let has_q = combined_has('q');
+        // Issue #618: `-s` used to be parsed into a variable nothing read, so
+        // `show-options -s` was accepted but printed the whole store, session
+        // options and all. tmux points `-s` at the server option table
+        // (options.c options_scope_from_flags) and a bare `show-options -s`
+        // there lists server options only, so narrow the listing to the
+        // catalog's server-scope names. A named query (`show -s escape-time`)
+        // is untouched: tmux ignores `-s` for a table option too
+        // (options_scope_from_name derives the scope from the name).
+        let server_scope = has_s && !window_scope;
+        // `values_only` is applied here rather than by the generic name
+        // stripper below: an empty server option (copy-command is usually
+        // empty) has no space to split on, so the stripper would have printed
+        // its NAME where tmux prints a blank line.
+        let server_listing = |values_only: bool| -> String {
+            let mut out = String::new();
+            for name in crate::server::option_catalog::server_option_names() {
+                let (rtx, rrx) = mpsc::channel::<String>();
+                let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
+                if let Ok(v) = rrx.recv_timeout(Duration::from_millis(2000)) {
+                    if values_only {
+                        out.push_str(&format!("{}\n", v));
+                    } else {
+                        out.push_str(&format!("{} {}\n", name, v));
+                    }
+                }
+            }
+            out
+        };
         // Pane scope (issue #580): list the target pane's `set-option -p`
         // options. `-p` is a bare flag; only -t carries a value.
         if combined_has('p') {
@@ -2638,6 +2689,14 @@ match cmd {
                     }
                 }
             }
+        } else if has_v && opt_name.is_none() && server_scope {
+            let output = server_listing(true);
+            if persistent {
+                let _ = tx.send(CtrlReq::ShowTextPopup("show-options".to_string(), output));
+            } else {
+                let _ = write_stream.write_all(output.as_bytes());
+                let _ = write_stream.flush();
+            }
         } else if has_v && opt_name.is_none() {
             // -v without option name: list all options, values only
             let (rtx, rrx) = mpsc::channel::<String>();
@@ -2690,6 +2749,13 @@ match cmd {
                         let _ = write!(write_stream, "{}\n", text);
                         let _ = write_stream.flush();
                     }
+                }
+            } else if server_scope {
+                let text = server_listing(false);
+                if persistent {
+                    let _ = tx.send(CtrlReq::ShowTextPopup("show-options".to_string(), text));
+                } else {
+                    let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
                 }
             } else {
                 let (rtx, rrx) = mpsc::channel::<String>();
@@ -4157,7 +4223,9 @@ fn dispatch_control_command(
             // one-shot handler above.
             let unset = combined_has_set2('u') || combined_has_set2('U');
             let append = combined_has_set2('a');
-            let global = combined_has_set2('g');
+            // -s (server scope, #618) resolves to the same single option store
+            // as -g here; see the one-shot handler above.
+            let global = combined_has_set2('g') || combined_has_set2('s');
             let only_if_unset = combined_has_set2('o');
             // `-p` is a bare pane-scope flag (#580), like `-w`: it never
             // consumes the next argument. Only -t carries a value here.
@@ -4200,7 +4268,18 @@ fn dispatch_control_command(
                 } else if append {
                     let _ = tx.send(CtrlReq::SetOptionAppend(key, val));
                 } else if only_if_unset {
-                    let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(key, val));
+                    // Same as the one-shot handler above: report tmux's
+                    // `already set: <name>` refusal instead of dropping the
+                    // command in silence, unless -q asked for silence (#619).
+                    if quiet {
+                        let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(key, val, None));
+                    } else {
+                        let (rtx, rrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::SetOptionOnlyIfUnset(key, val, Some(rtx)));
+                        let reply = rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
+                        let _ = resp_tx.send(reply);
+                        return true;
+                    }
                 } else if quiet || global {
                     let _ = tx.send(CtrlReq::SetOptionQuiet(key, val, quiet));
                 } else {
@@ -4238,6 +4317,8 @@ fn dispatch_control_command(
             }
             let value_only = combined_has2('v');
             let window_scope2 = matches!(cmd, "show-window-options" | "showw" | "show-window-option") || combined_has2('w');
+            // Server scope (#618), same narrowing as the one-shot handler above.
+            let server_scope2 = combined_has2('s') && !window_scope2;
             let opt_name = args.iter().filter(|a| !a.starts_with('-')).next().map(|s| s.to_string());
             let has_opt_name = opt_name.is_some();
             // See issue #266 — same -t window-index extraction as the
@@ -4246,6 +4327,23 @@ fn dispatch_control_command(
                 .as_deref()
                 .map(parse_target)
                 .and_then(|pt| pt.window);
+            if opt_name.is_none() && server_scope2 {
+                // Bare `show-options -s`: server options only (tmux parity).
+                let mut text = String::new();
+                for name in crate::server::option_catalog::server_option_names() {
+                    let (srtx, srrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowOptionValue(srtx, name.to_string()));
+                    if let Ok(v) = srrx.recv_timeout(Duration::from_millis(2000)) {
+                        if value_only {
+                            text.push_str(&format!("{}\n", v));
+                        } else {
+                            text.push_str(&format!("{} {}\n", name, v));
+                        }
+                    }
+                }
+                let _ = resp_tx.send(text);
+                return true;
+            }
             if let Some(name) = opt_name {
                 if value_only {
                     let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name));

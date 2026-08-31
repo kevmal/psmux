@@ -113,6 +113,12 @@ Details worth knowing:
   escaped, so `"#{session_name}"` and `"#[fg=red]"` are safe.
 - `#{p<n>:}` still pads at render time and remains useful for padding that
   should follow the rendered width rather than a fixed number of spaces.
+- Flags are only parsed before the option name. `set -g @k -u` stores the
+  value `-u` rather than unsetting `@k`, and a value that starts with a dash
+  can also be written after `--`, the tmux end of options marker:
+  `psmux set-option -g -- status-left "-> "`.
+- `show-option` and `show-window-option` are accepted as singular spellings of
+  `show-options` and `show-window-options`, as they are in tmux.
 
 ## All Set Options
 
@@ -125,6 +131,7 @@ Details worth knowing:
 | `escape-time` | Int | `500` | Escape delay (ms) |
 | `repeat-time` | Int | `500` | How long a key bound with `bind-key -r` keeps repeating without the prefix, in ms. Range `0` to `2000000`; `0` disables repeat |
 | `history-limit` | Int | `2000` | Scrollback lines per pane |
+| `priority` | Str | `above-normal` | Scheduling class for psmux's own processes: `normal`, `above-normal`, `high`. Pane shells and the programs you run are never raised. See [Process Priority](#process-priority) |
 | `display-time` | Int | `750` | Message display time (ms) |
 | `display-panes-time` | Int | `1000` | Pane overlay time (ms) |
 | `status-interval` | Int | `15` | Status refresh (seconds) |
@@ -155,6 +162,7 @@ Details worth knowing:
 | `synchronize-panes` | Bool | `off` | Send input to all panes |
 | `remain-on-exit` | Bool | `off` | Keep panes after process exits |
 | `@kill-descendants` | Bool | `on` | Terminate a self-exited pane shell's background children (psmux extension) |
+| `@mouse-force` | Bool | `off` | Pane scoped only (`set-option -p -t %N @mouse-force on`). Forward the wheel into this pane even though its application registered for the mouse through neither channel psmux can see. psmux normally forwards only to a pane that asked, either by sending a mouse DECSET or by holding `ENABLE_MOUSE_INPUT` on its console, and it keeps that authorization for as long as the process that earned it is alive, so a `node` child entering raw mode can no longer take it away. Some applications never register through either channel on Windows: conhost can swallow their DECSET before psmux parses it, and libuv raw mode leaves their console without the mouse bit. Set this for that pane. Leave it off for panes running programs that do not read the mouse, which receive the report as literal keystrokes (psmux extension) |
 | `aggressive-resize` | Bool | `off` | Resize to smallest client |
 | `window-size` | Str | `latest` | `largest`, `smallest`, `manual`, `latest` |
 | `destroy-unattached` | Bool | `off` | Exit server when no clients attached |
@@ -204,8 +212,8 @@ Details worth knowing:
 | `pane-border-status` | Str | | Pane border status position (`top`/`bottom`/`off`) |
 | `copy-mode-line-number-style` | Str | `fg=brightblack` | Style of the copy-mode line number gutter |
 | `copy-mode-current-line-number-style` | Str | `fg=yellow,bold` | Style of the line number on the copy-mode cursor row |
-| `window-style` | Str | | Style applied to the contents of every pane |
-| `window-active-style` | Str | | Style applied to the contents of the active pane |
+| `window-style` | Str | | Style applied to the contents of panes that are not the active pane (tmux `options-table.c` wording), and the fallback for the active pane; fills only cells whose colour is the terminal default. Also accepts `dim=N` (0 to 100 percent) |
+| `window-active-style` | Str | | Style applied to the contents of the active pane; each of `fg` and `bg` falls back to `window-style` when this option does not name it. Explicit application colours always win. Also accepts `dim=N` |
 | `popup-border-style` | Str | `fg=yellow` | Border style of `display-popup` overlays |
 | `popup-border-lines` | Str | `single` | Popup border glyph set: `single`, `double`, `heavy`, `rounded` |
 | `popup-style` | Str | | Accepted and stored, but never read. See [Accepted but Not Functional](#accepted-but-not-functional) |
@@ -330,6 +338,39 @@ set -g window-active-style "fg=colour250,bg=black"
 
 # Colour of the clock-mode digits (Prefix + t)
 set -g clock-mode-colour cyan
+```
+
+### How the two window styles combine
+
+`window-active-style` does not replace `window-style` for the active pane, it
+layers on top of it one attribute at a time, matching tmux `tty.c`
+`tty_default_colours`. The active pane takes `fg` from `window-active-style`
+only when that option actually names an `fg`, and the same holds separately for
+`bg`. Anything it leaves unnamed comes from `window-style`.
+
+Three consequences worth knowing:
+
+* `set -g window-style "bg=colour52"` on its own tints **every** pane, the
+  active one included. You do not need to repeat the colour in
+  `window-active-style`.
+* Mixing works. With `window-style "bg=blue"` and
+  `window-active-style "fg=red"`, the active pane is red on blue while the
+  other panes keep the terminal foreground on blue.
+* `bg=default` (tmux colour 8) names no colour, so
+  `window-active-style "bg=default"` reads as "inherit `window-style`", not as
+  "use the terminal background".
+
+Both options also accept a `dim=N` percentage, where `N` runs from 0 to 100, as
+newer tmux does. It scales the pane's colours toward black by that percentage
+and applies to application colours too, not only to the ones the window style
+supplies. Unlike `fg` and `bg`, `dim` does not fall back: the active pane uses
+the `dim` from `window-active-style`, other panes use the one from
+`window-style`.
+
+```tmux
+# Every pane sits on a dark red ground, the active pane simply undimmed
+set -g window-style "bg=colour52,dim=40"
+set -g window-active-style "bg=colour52"
 ```
 
 `popup-border-lines` accepts `single` (the default), `double`, `heavy` and `rounded`. The values `none` and `simple` are accepted but render as plain single lines, because a popup always draws a border.
@@ -595,6 +636,65 @@ bind-key C-Space send-prefix
 [Bold Is Bright](#bold-is-bright-color-rendering) and
 [Paste Detection](#paste-detection-ctrlv-passthrough).
 
+### Process Priority
+
+Windows gives its foreground scheduling boost to whichever process owns the foreground window. The
+psmux server owns no window at all, and the attach client draws inside a console window that the
+terminal host owns, so neither of them ever receives that boost. On an idle or lightly loaded
+machine this costs nothing. On a heavily oversubscribed one it means your keystrokes queue behind
+every compute job on the box, and typing starts to lag.
+
+`priority` sets the scheduling class of psmux's **own** processes, and nothing else:
+
+```tmux
+# Default: a small boost, enough to stay ahead of background compute
+set -g priority above-normal
+
+# Turn the boost off entirely
+set -g priority normal
+
+# For a machine you deliberately oversubscribe. Use sparingly
+set -g priority high
+```
+
+Any other value is refused: `set -g priority realtime` exits nonzero with a message and leaves the
+class where it was. Realtime is not offered at all, because a process at that class outranks most of
+the kernel's own threads.
+
+**What it applies to, exactly:**
+
+| | |
+|---|---|
+| The server process | Immediately, the moment the option is set, and again at every server startup |
+| The attach client | At client startup, from `PSMUX_PRIORITY` or from a `priority` line in your config file |
+| A warm standby server | At its own startup, so a session that claims one gets the configured class |
+| Pane shells and your programs | **Never.** A Windows child created with no explicit class flag gets `NORMAL_PRIORITY_CLASS` regardless of its parent, so nothing you run inside a pane is raised |
+
+Two things it does not do. A `set -g priority` issued in one session does not reach a warm standby
+that is already parked in the pool, and it does not retroactively change a client that is already
+attached; both pick the value up the next time they start. And an already running client keeps its
+class for its whole life, so use `PSMUX_PRIORITY` or a config file line if you want every client to
+agree.
+
+`PSMUX_PRIORITY` overrides the option, for both processes. That ordering is deliberate: it is the
+escape hatch that lets you climb out of a configured value from the shell you start psmux in,
+without editing a file. `show-options -g priority` always reports what the process is **actually**
+running at, so if the environment won you will see the environment's value there.
+
+```powershell
+# This shell only
+$env:PSMUX_PRIORITY = "normal"
+psmux
+```
+
+Setting the class can be refused by a restricted token or by a job object that caps it. psmux treats
+that as nothing to report: it carries on at whatever class it already had rather than failing to
+start.
+
+For reference, tmux has no equivalent option. It never sets a scheduling priority anywhere in its
+source, because the Linux scheduler already favours a process that spends its life blocked on a
+read. This is a Windows specific extension rather than a parity feature.
+
 ### Style Value Grammar
 
 Every `*-style` option and every inline `#[...]` block in a format string uses the same comma separated grammar:
@@ -716,6 +816,7 @@ hatch you want for one invocation rather than forever.
 | Variable | Effect |
 |---|---|
 | `PSMUX_CONFIG_FILE` | Replaces the config file search entirely. Set for you by `psmux -f <file>`. A leading `~` is expanded |
+| `PSMUX_DATA_DIR` | Absolute path of the directory that holds the server registry (`.port`, `.key`, `.sid`, `.pid` files), logs and other runtime state, instead of `~\.psmux`. Two data directories are fully independent: each has its own single server guard, so both can hold a session of the same name, including the `__warm__` standby. Must be absolute and non empty |
 | `PSMUX_DEFAULT_SESSION` | Session name used when nothing else determines one |
 | `PSMUX_SESSION_NAME` | Target session for a bare `psmux` or a control mode invocation. psmux also sets this itself when it spawns |
 | `PSMUX_TARGET_SESSION` | Session that CLI commands address when you give no `-t`. Exported into panes, which is how a command run inside a pane knows where it is |
@@ -724,7 +825,10 @@ hatch you want for one invocation rather than forever.
 | `PSMUX_REMOTE_ATTACH` | Marks the invocation as a remote attach, which skips the bare invocation session bootstrap |
 | `PSMUX_ACTIVE` | Set to `1` on a client process to mark that it owns the console. This is what the nesting guard reads |
 | `PSMUX_SWITCH_TO` | Handshake variable carrying the session name across a `switch-client` |
+| `PSMUX_CLIENT_LAST_SESSION` | Handshake variable set by `switch-client` with the session the client is leaving, so `switch-client -l` returns to a session this client actually visited |
+| `PSMUX_SESSION_DISPLAY_NAME` | The session name as you typed it, kept alongside the on disk `<namespace>__<session>` spelling that `-L` produces, so error messages show the name you used |
 | `PSMUX_NO_WARM` | Set to `1` to disable warm pane and warm server pre-spawning. Equivalent to `set -g warm off`. See [warm-sessions.md](warm-sessions.md) |
+| `PSMUX_PRIORITY` | Scheduling class for the psmux server and client processes: `normal`, `above-normal` or `high`. Overrides the `priority` option, so it is the per shell way out of a configured value. An unrecognised value is reported and ignored. See [Process Priority](#process-priority) |
 
 ### Appearance and rendering
 
@@ -743,6 +847,7 @@ hatch you want for one invocation rather than forever.
 | `PSMUX_PIPE_VT` | Forces pipe mode VT handling for Cygwin and MSYS style PTYs. `1` forces it on, `0` forces it off. Left unset, psmux detects the pipe itself |
 | `PSMUX_BARE_ENV` | Spawn panes with a bare environment instead of inheriting yours. Useful when a broken inherited variable stops shells from starting |
 | `PSMUX_FORCE_MOUSE` | Overrides the ConPTY mouse safety gate. On Windows builds below 22523 psmux refuses to enable mouse reporting, because on Windows 10 era conhost the first click could fast fail the console host and take the pane down with it. Some later builds under that threshold, Windows Server 2022 (20348) among them, handle mouse perfectly well but still need psmux to write the enable sequence itself. Set to `1` there to get the mouse back. Set to `0` to force it off on a newer build whose console host misbehaves. Accepts `1`, `on`, `true`, `yes` and their negatives. If your session dies the moment you click, unset it |
+| `PSMUX_FORCE_WHEEL` | Set to `1` to forward the wheel into every pane on this server regardless of whether its application registered for the mouse. This is the server wide last resort; prefer the pane scoped `set-option -p -t %N @mouse-force on`, which is the scope the decision belongs at. psmux normally forwards only to a pane that asked, and it now keeps that authorization for as long as the process that earned it is alive, so a `node` child entering raw mode no longer takes it away. Reach for this only when an application registers through neither channel psmux can see and the wheel is dead in the pane from its first instant. Leave it unset if you run programs that do not read the mouse: they receive the report as literal keystrokes, which is what the gate exists to prevent. Accepts `1`, `on`, `true`, `yes`; anything else keeps the gate |
 
 ### Set inside panes by psmux
 
@@ -753,6 +858,7 @@ These are exported into every pane, so scripts can detect that they are running 
 | `TMUX` | Socket path and server info, for tmux compatibility. This is what most tools check |
 | `TMUX_PANE` | Current pane id (`%0`, `%1`, and so on) |
 | `PSMUX_SESSION` | Current session name |
+| `PSMUX_POPUP` | Set to `1` on the child of a `display-popup`, so the nesting guard does not mistake it for a pane and a popup can run `psmux` commands |
 
 Setting a variable for one shell, or for good:
 

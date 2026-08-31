@@ -1157,6 +1157,18 @@ fn config_file_window_active_style() {
 }
 
 #[test]
+fn config_only_if_unset_sets_window_style_after_unset() {
+    let mut app = mock_app();
+    parse_config_content(
+        &mut app,
+        "set -g window-style 'bg=black'\n\
+         set -gu window-style\n\
+         set -go window-style 'bg=colour235'\n",
+    );
+    assert_eq!(app.user_options.get("window-style").unwrap(), "bg=colour235");
+}
+
+#[test]
 fn config_file_wrap_search() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g wrap-search on\n");
@@ -1240,25 +1252,38 @@ fn config_flag_g_global() {
 fn config_flag_u_unset_user_option() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g @test hello\nset -gu @test\n");
-    // -gu sets @user option to empty string
-    assert_eq!(app.user_options.get("@test").unwrap(), "");
+    // -gu REMOVES the @user option (#619). It used to blank it in place, which
+    // left the key present, so `set -o` afterwards still read the option as
+    // set and refused to apply. tmux removes a user option outright on -u:
+    // it has no table entry, so options_remove_or_default takes the
+    // options_remove branch.
+    assert!(
+        app.user_options.get("@test").is_none(),
+        "set -gu @test must remove the key, not leave it holding an empty string"
+    );
 }
 
 #[test]
 fn config_flag_u_unset_numeric_option() {
-    // -u on numeric options: tries to parse empty string as number, silently fails
+    // -u RESTORES THE TABLE DEFAULT (#619). This used to assert 100, pinning
+    // the defect: the config parser applied an EMPTY value on -u, `"".parse()`
+    // failed, and the number the user had set simply stayed. The same
+    // `set -gu escape-time` on the CLI route restored 500, so the two routes
+    // disagreed about what an unset even means. tmux runs every unset through
+    // options_remove_or_default (options.c), which writes the options-table
+    // default at a global scope.
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g escape-time 100\nset -gu escape-time\n");
-    // escape-time stays at 100 because "".parse::<u64>() fails
-    assert_eq!(app.escape_time_ms, 100);
+    assert_eq!(app.escape_time_ms, 500);
 }
 
 #[test]
 fn config_flag_u_unset_string_option() {
+    // Same fix (#619): the default, not a blank. Blanking status-left produced
+    // an empty left status section where a fresh server shows `[#S] `.
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g status-left HELLO\nset -gu status-left\n");
-    // -u on string option sets to empty string
-    assert_eq!(app.status_left, "");
+    assert_eq!(app.status_left, "[#S] ");
 }
 
 #[test]
@@ -1328,7 +1353,9 @@ fn config_flag_F_format_expand() {
 fn config_combined_flags_gu() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g @x hello\nset -gu @x\n");
-    assert_eq!(app.user_options.get("@x").unwrap(), "");
+    // The combined token takes the same route as `-g -u`, so it removes the
+    // key rather than blanking it (#619).
+    assert!(app.user_options.get("@x").is_none());
 }
 
 #[test]

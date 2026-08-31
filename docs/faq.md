@@ -1,5 +1,7 @@
 # FAQ
 
+Answers to the questions people ask most about psmux, the native tmux for Windows: what it runs on, how it relates to tmux and Windows Terminal, whether an existing `.tmux.conf` carries over, how the mouse and the wheel behave inside programs, and what to do when a key, a colour or a path does not look right. Each answer links to the guide that has the full detail.
+
 **Q: Is psmux cross-platform?**
 A: No. psmux is built exclusively for Windows using the Windows ConPTY API. For Linux/macOS, use tmux. psmux is the Windows counterpart.
 
@@ -26,6 +28,9 @@ A: Full mouse support: click to focus panes, drag to resize borders, scroll whee
 
 **Q: The scroll wheel does nothing inside some full screen program. Why?**
 A: Because that program never asked for the mouse, and psmux follows tmux here. tmux only writes a mouse report to a pane whose application has enabled a mouse mode (`input_key_mouse` in `input-keys.c` returns immediately otherwise), and its default `WheelUpPane` binding treats the alternate screen only as a reason NOT to fall through to copy mode. So over a full screen program with no mouse support the wheel is a no-op in tmux, and now in psmux too. Before psmux 3.3.9 psmux forwarded the report anyway, and a program that does not parse mouse reports read the bytes as keystrokes: htop opened its `Search:` prompt and typed the report into it, and codex lost its transcript ([#598](https://github.com/psmux/psmux/issues/598)). Turn the program's own mouse support on (`:set mouse=a` in vim and neovim, `--mouse` for `less`, the mouse setting in htop) and the wheel starts working again. Over a plain shell prompt the wheel still enters copy mode and scrolls psmux's own scrollback, unchanged.
+
+**Q: The mouse works in some programs but not in Claude Code on Windows 10. Why?**
+A: On Windows builds below 22523 (Windows 10 19041 and 19045, Windows Server 2019 and Server 2022 build 20348) conhost's inbound VT parser does not pass an SGR mouse report to the pane's child. psmux writes that report into the pane, and on those builds it dies inside conhost, so a program that reads the mouse as VT bytes on stdin never sees it. That covers node based TUIs such as Claude Code and anything reading raw stdin. Programs that read the mouse as console INPUT_RECORDs do get it, because psmux also injects a Win32 `MOUSE_EVENT` record straight into the pane's console input buffer, which skips that parser entirely. That covers crossterm and ratatui apps, Bubble Tea and other Go TUIs, PSReadLine, and native Windows TUIs, and since psmux 3.3.9 it covers clicks, releases and drags on those builds and not only the wheel. On 22523 and above both kinds of program work. This was measured on real 19045 hardware in [#597](https://github.com/psmux/psmux/issues/597): a crossterm app received every wheel notch while a node child reading stdin received zero bytes. There is no psmux level fix for the VT half, the data is lost inside conhost. Upgrading to a build of 22523 or later is the only way to get the mouse into a VT reading program.
 
 **Q: What shells does psmux support?**
 A: PowerShell 7 (default), PowerShell 5, cmd.exe, Git Bash, WSL, nushell, and any Windows executable. Change with `set -g default-shell <shell>`.
@@ -74,6 +79,38 @@ A: Use the `-p` flag with a percentage: `split-window -v -p 30` gives the new pa
 
 **Q: How do I open a new pane in the same directory?**
 A: Use `split-window -c "#{pane_current_path}"`. You can bind this in your config for convenience: `bind-key '"' split-window -v -c "#{pane_current_path}"`.
+
+**Q: `#{pane_current_path}` does not follow `cd` inside `wsl`. Why?**
+A: psmux answers `#{pane_current_path}` the way tmux does, by asking the operating system for the working directory of the pane's foreground process. That works for PowerShell, `cmd`, Cygwin bash and Git Bash, because their `cd` also moves the Win32 working directory. It cannot work for WSL: the shell you are typing at is a Linux process inside the WSL VM, and the only Windows processes in the pane are `wsl.exe` and `wslhost.exe`, whose working directory is fixed when they start and never moves. Nothing on the Windows side can see where the Linux shell went.
+
+The fix is shell integration: have the Linux shell announce its directory. Add this one line to `~/.bashrc` in the distro:
+
+```bash
+PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'
+```
+
+or for zsh, in `~/.zshrc`:
+
+```zsh
+precmd() { printf '\033]7;file://%s%s\033\\' "$HOST" "$PWD"; }
+```
+
+psmux translates what it receives into a native Windows path, so `/mnt/c/Users` becomes `C:\Users` and a Linux only directory such as `/home/you` becomes `\\wsl.localhost/<distro>/home/you` (written with backslashes), which `split-window -c` can actually open. ConEmu's `OSC 9;9` form is accepted too, if you already emit that:
+
+```bash
+PROMPT_COMMAND='printf "\033]9;9;%s\033\\" "$PWD"'
+```
+
+This is optional. Without it nothing breaks: `#{pane_current_path}` simply keeps the last directory it could observe, which is where you were before you typed `wsl`. Note that Windows Terminal needs the same shell integration for its own "duplicate tab in the same directory", so many WSL users already have it.
+
+**Q: Task Manager shows psmux at "Above normal" priority. Why, and can I turn it off?**
+A: By design. Windows gives its foreground scheduling boost to the process that owns the foreground window; the psmux server owns no window and the client draws inside a window the terminal host owns, so neither gets it and keystrokes queue behind compute jobs on a loaded machine. psmux therefore runs its own server and client at `above-normal`. Only psmux's processes are raised: the shells and programs inside panes always start at normal priority. Change it with `set -g priority normal` (or `high`) in your config, or per shell with `$env:PSMUX_PRIORITY = "normal"`, which outranks the option. `realtime` is refused. See [Process Priority](configuration.md#process-priority).
+
+**Q: `bind ы ...` or `bind M-ф ...` from my tmux config does nothing.**
+A: It works on current builds. Key names are parsed by character, so any single Unicode character is a valid key with or without `C-`, `M-` and `S-`. A key name psmux cannot parse is now reported rather than dropped: the CLI prints `unknown key: <name>` and exits 1, a config file line lands in the boot summary and in `~/.psmux/config-warnings.log`. tmux's mouse names (`WheelUpPane` and friends) are accepted so a ported config loads, though psmux does not act on them. See [Supported Key Names](keybindings.md#supported-key-names).
+
+**Q: Copy mode search cannot find text that has scrolled off screen.**
+A: It can on current builds. `/`, `?`, `Ctrl+s`, `Ctrl+r` and `n` / `N` walk the whole scrollback, and an off screen match scrolls the view to it the way tmux does. `send-keys -X search-backward <text>` from a script does the same and updates `#{search_match}`.
 
 **Q: How do I prevent psmux from nesting inside itself?**
 A: psmux automatically detects when it is already running inside a psmux session and prevents accidental nesting. If you try to start `psmux` inside an existing session, it will warn you instead of creating a nested instance. To explicitly create a new session from within psmux, use the command prompt (`Prefix + :`) and type `new-session`.

@@ -67,7 +67,7 @@ fn extract_confirm_command(args: &str) -> String {
 }
 
 /// Build a send-key name with modifier prefix (e.g. "C-Left", "S-Right", "C-S-Up").
-fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
+pub(crate) fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
     let mut prefix = String::new();
     if mods.contains(KeyModifiers::CONTROL) { prefix.push_str("C-"); }
     if mods.contains(KeyModifiers::ALT) { prefix.push_str("M-"); }
@@ -852,7 +852,12 @@ pub(crate) fn compute_active_rect_json_zoom_aware(
 /// Render a large ASCII clock overlay (tmux clock-mode).
 /// Top-level so both the main viewport and the choose-tree/choose-session
 /// preview can share one implementation.
-pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
+pub fn render_clock_overlay(
+    f: &mut Frame,
+    area: Rect,
+    colour: Color,
+    window_style: Option<Style>,
+) {
     const DIGITS: [&[&str; 5]; 10] = [
         &["###", "# #", "# #", "# #", "###"],
         &["  #", "  #", "  #", "  #", "  #"],
@@ -875,18 +880,21 @@ pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
     let start_y = area.y + (area.height.saturating_sub(total_h)) / 2;
     let clock_area = Rect::new(start_x.saturating_sub(1), start_y, total_w + 2, total_h);
     f.render_widget(Clear, clock_area);
+    let fill_style = window_content_fill_style(window_style);
+    f.render_widget(Block::default().style(fill_style), clock_area);
+    let glyph_style = fill_style.fg(colour);
     for row in 0..5u16 {
         let mut x = start_x;
         for ch in time_str.chars() {
             if ch == ':' {
                 let cell_area = Rect::new(x, start_y + row, 1, 1);
-                let s = Span::styled(COLON[row as usize], Style::default().fg(colour));
+                let s = Span::styled(COLON[row as usize], glyph_style);
                 f.render_widget(Paragraph::new(Line::from(s)), cell_area);
                 x += 2;
             } else if let Some(d) = ch.to_digit(10) {
                 let pattern = DIGITS[d as usize][row as usize];
                 let cell_area = Rect::new(x, start_y + row, 3, 1);
-                let s = Span::styled(pattern, Style::default().fg(colour));
+                let s = Span::styled(pattern, glyph_style);
                 f.render_widget(Paragraph::new(Line::from(s)), cell_area);
                 x += 4;
             }
@@ -894,16 +902,17 @@ pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
     }
 }
 
-/// Render a LayoutJson tree into the given area.  This is the canonical
-/// pane renderer used by both the main viewport and the choose-tree/
-/// choose-session preview, so a preview is a true miniature of the real
-/// window (same separators, same colors, same content rendering).
 /// Draw the active window's floating panes (tmux new-pane) as positioned
 /// overlays over the tiled layout. Called after `render_layout_json` and before
 /// the modal popup overlay, so popups still stack on top. Reuses the popup
 /// run-rendering; borders come from `-B` (mapped to ratatui border types),
 /// `none` draws no border. The focused float gets a highlighted border.
-pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: &[FloatJson]) {
+pub(crate) fn render_float_overlays(
+    f: &mut Frame,
+    content_chunk: Rect,
+    floats: &[FloatJson],
+    window_styles: WindowContentStyles,
+) {
     for fl in floats {
         if fl.w < 2 || fl.h < 2 { continue; }
         let w = fl.w.min(content_chunk.width);
@@ -919,6 +928,11 @@ pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: 
             _ => Some(BorderType::Plain),
         };
         let bcol = if fl.focused { Color::Green } else { Color::DarkGray };
+        let window_style = window_styles.for_pane(fl.focused);
+        let window_dim = window_styles.dim_for_pane(fl.focused);
+        // Paths that paint straight from the window style take it pre dimmed;
+        // `apply_window_content_style` dims the cell colours itself.
+        let window_fill = crate::style::dim_window_style(window_style, window_dim);
         let inner_w = if border_type.is_some() { w.saturating_sub(2) } else { w };
         let mut lines: Vec<Line<'static>> = Vec::new();
         for row_data in &fl.rows {
@@ -926,8 +940,9 @@ pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: 
             let mut col: u16 = 0;
             for run in &row_data.runs {
                 if col >= inner_w { break; }
-                let fg = crate::style::map_color(&run.fg);
-                let bg = crate::style::map_color(&run.bg);
+                let mut fg = crate::style::map_color(&run.fg);
+                let mut bg = crate::style::map_color(&run.bg);
+                apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
                 let mut style = Style::default().fg(fg).bg(bg);
                 if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
                 if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
@@ -942,15 +957,21 @@ pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: 
                 if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
                 if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                 if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                let text: &str = if run.flags & 64 != 0 { " " } else if run.text.is_empty() { " " } else { &run.text };
                 let run_w = run.width.max(1);
+                let text = if run.flags & 64 != 0 {
+                    " ".repeat(run_w as usize)
+                } else if run.text.is_empty() {
+                    " ".to_string()
+                } else {
+                    run.text.clone()
+                };
                 if col + run_w > inner_w {
                     let avail = (inner_w - col) as usize;
                     let truncated: String = text.chars().take(avail).collect();
                     if !truncated.is_empty() { spans.push(Span::styled(truncated, style)); }
                     col = inner_w;
                 } else {
-                    spans.push(Span::styled(text.to_string(), style));
+                    spans.push(Span::styled(text, style));
                     col += run_w;
                 }
             }
@@ -966,10 +987,18 @@ pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: 
                     .title(fl.title.clone());
                 let inner = block.inner(area);
                 f.render_widget(block, area);
-                f.render_widget(Paragraph::new(Text::from(lines)), inner);
+                f.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .style(window_content_fill_style(window_fill)),
+                    inner,
+                );
             }
             None => {
-                f.render_widget(Paragraph::new(Text::from(lines)), area);
+                f.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .style(window_content_fill_style(window_fill)),
+                    area,
+                );
             }
         }
     }
@@ -983,6 +1012,135 @@ pub struct CopyLnRender {
     pub hsize: usize,
     pub num_style: Style,
     pub cur_style: Style,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct WindowContentStyles {
+    pub inactive: Option<Style>,
+    pub active: Option<Style>,
+    /// `dim=N` percentage from `window-style` (tmux `wp->cached_dim`).
+    pub inactive_dim: u8,
+    /// `dim=N` percentage from `window-active-style` (tmux `wp->cached_active_dim`).
+    pub active_dim: u8,
+}
+
+impl WindowContentStyles {
+    /// The effective content style for a pane.
+    ///
+    /// The active pane merges `window-active-style` over `window-style` per
+    /// attribute, matching tmux `tty.c` `tty_default_colours`. See
+    /// `crate::style::active_window_style_with_fallback`.
+    pub(crate) fn for_pane(self, active: bool) -> Option<Style> {
+        if active {
+            crate::style::active_window_style_with_fallback(self.active, self.inactive)
+        } else {
+            self.inactive
+        }
+    }
+
+    /// The `dim` percentage for a pane.
+    ///
+    /// tmux `tty_default_colours` picks `cached_active_dim` or `cached_dim`
+    /// outright: unlike fg and bg, `dim` has no fallback between the two styles.
+    pub(crate) fn dim_for_pane(self, active: bool) -> u8 {
+        if active { self.active_dim } else { self.inactive_dim }
+    }
+
+    pub(crate) fn for_tiled_panes(self, floating_pane_focused: bool) -> Self {
+        if floating_pane_focused {
+            Self {
+                inactive: self.inactive,
+                active: self.inactive,
+                inactive_dim: self.inactive_dim,
+                active_dim: self.inactive_dim,
+            }
+        } else {
+            self
+        }
+    }
+}
+
+/// Render one popup or menu row's run list into a `Line`, clipping to `inner_w`.
+///
+/// Extracted from the popup draw path so the run accounting is unit testable.
+pub(crate) fn render_popup_runs_line(
+    runs: &[crate::layout::CellRunJson],
+    inner_w: u16,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col: u16 = 0;
+    for run in runs {
+        if col >= inner_w { break; }
+        let fg = crate::style::map_color(&run.fg);
+        let bg = crate::style::map_color(&run.bg);
+        let mut style = Style::default().fg(fg).bg(bg);
+        if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
+        if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
+        if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
+        if run.flags & 8  != 0 {
+            style = crate::rendering::with_underline(
+                style,
+                if run.ul == 0 { 1 } else { run.ul },
+                run.ulc.as_deref().map(map_color),
+            );
+        }
+        if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
+        if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
+        if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
+        let run_w = run.width.max(1);
+        // ratatui-crossterm omits SGR 8 (HIDDEN), render as spaces. One space
+        // per column of the run: the column accounting below advances by
+        // `run_w`, so a single space would claim `run_w` columns while painting
+        // one and shift every later run on the row (#617, #619).
+        let hidden = " ".repeat(run_w as usize);
+        let text: &str = if run.flags & 64 != 0 {
+            &hidden
+        } else if run.text.is_empty() {
+            " "
+        } else {
+            &run.text
+        };
+        if col + run_w > inner_w {
+            let avail = (inner_w - col) as usize;
+            let truncated: String = text.chars().take(avail).collect();
+            if !truncated.is_empty() {
+                spans.push(Span::styled(truncated, style));
+            }
+            col = inner_w;
+        } else {
+            spans.push(Span::styled(text.to_string(), style));
+            col += run_w;
+        }
+    }
+    Line::from(spans)
+}
+
+fn apply_window_content_style(fg: &mut Color, bg: &mut Color, style: Option<Style>, dim: u8) {
+    if let Some(style) = style {
+        if *fg == Color::Reset {
+            if let Some(default_fg) = style.fg {
+                *fg = default_fg;
+            }
+        }
+        if *bg == Color::Reset {
+            if let Some(default_bg) = style.bg {
+                *bg = default_bg;
+            }
+        }
+    }
+    // tmux `tty.c` `tty_attributes` dims the resolved colours, application
+    // colours included, by the window style's `dim=N` percentage (#619 item 4).
+    if dim != 0 {
+        *fg = crate::style::dim_colour_percent(*fg, dim);
+        *bg = crate::style::dim_colour_percent(*bg, dim);
+    }
+}
+
+fn window_content_fill_style(style: Option<Style>) -> Style {
+    let Some(style) = style else { return Style::default(); };
+    Style::default()
+        .fg(style.fg.unwrap_or(Color::Reset))
+        .bg(style.bg.unwrap_or(Color::Reset))
 }
 
 pub fn render_layout_json(
@@ -1002,6 +1160,7 @@ pub fn render_layout_json(
     total_panes: usize,
     bchars: Option<crate::border_lines::BorderChars>,
     copy_ln: Option<CopyLnRender>,
+    window_styles: WindowContentStyles,
 ) {
     match node {
         LayoutJson::Leaf {
@@ -1029,6 +1188,11 @@ pub fn render_layout_json(
             rows_v2,
             title,
         } => {
+            let window_style = window_styles.for_pane(*active);
+            let window_dim = window_styles.dim_for_pane(*active);
+            // Paths that paint straight from the window style take it pre
+            // dimmed; `apply_window_content_style` dims the cell colours itself.
+            let window_fill = crate::style::dim_window_style(window_style, window_dim);
             // Reserve 1 row for the border label so it doesn't overlap content (#288).
             let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
             let inner = pane_content_inner(area, border_status, border_format);
@@ -1060,7 +1224,8 @@ pub fn render_layout_json(
                     while c < max_c {
                         let cell = &row[c as usize];
                         let mut fg = map_color(&cell.fg);
-                        let bg = map_color(&cell.bg);
+                        let mut bg = map_color(&cell.bg);
+                        apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
                         let in_selection = if *copy_mode && *active {
                             if let (Some(sr), Some(sc), Some(er), Some(ec)) = (sel_start_row, sel_start_col, sel_end_row, sel_end_col) {
                                 let mode = sel_mode.as_deref().unwrap_or("char");
@@ -1122,8 +1287,11 @@ pub fn render_layout_json(
                         let last_bg = if !spans.is_empty() {
                             spans.last().unwrap().style.bg.unwrap_or(Color::Reset)
                         } else { Color::Reset };
+                        let padding_bg = window_fill
+                            .and_then(|style| style.bg)
+                            .unwrap_or(last_bg);
                         let pad = " ".repeat((inner.width - c) as usize);
-                        spans.push(Span::styled(pad, Style::default().bg(last_bg)));
+                        spans.push(Span::styled(pad, Style::default().bg(padding_bg)));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -1131,11 +1299,14 @@ pub fn render_layout_json(
                 for r in 0..inner.height.min(rows_v2_eff.len() as u16) {
                     let mut spans: Vec<Span> = Vec::new();
                     let mut c: u16 = 0;
-                    let mut last_bg = Color::Reset;
+                    let mut last_bg = window_fill
+                        .and_then(|style| style.bg)
+                        .unwrap_or(Color::Reset);
                     for run in &rows_v2_eff[r as usize].runs {
                         if c >= inner.width { break; }
                         let mut fg = map_color(&run.fg);
-                        let bg = map_color(&run.bg);
+                        let mut bg = map_color(&run.bg);
+                        apply_window_content_style(&mut fg, &mut bg, window_style, window_dim);
                         last_bg = bg;
                         if *active && dim_preds && !*alternate_screen
                             && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col))
@@ -1156,14 +1327,14 @@ pub fn render_layout_json(
                         }
                         if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
                         if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                        let text: &str = if run.flags & 64 != 0 {
-                            " "
-                        } else if run.text.is_empty() {
-                            " "
-                        } else {
-                            &run.text
-                        };
                         let run_w = run.width.max(1);
+                        let text = if run.flags & 64 != 0 {
+                            " ".repeat(run_w as usize)
+                        } else if run.text.is_empty() {
+                            " ".to_string()
+                        } else {
+                            run.text.clone()
+                        };
                         if c + run_w > inner.width {
                             let avail = (inner.width - c) as usize;
                             let mut truncated = String::new();
@@ -1188,7 +1359,7 @@ pub fn render_layout_json(
                             if let Some(uri) = &run.link {
                                 frame_hyperlinks_push(HyperlinkRun {
                                     x: inner.x + c, y: inner.y + r,
-                                    text: text.to_string(), uri: uri.clone(), style,
+                                    text: text.clone(), uri: uri.clone(), style,
                                 });
                             }
                             spans.push(Span::styled(text, style));
@@ -1196,8 +1367,11 @@ pub fn render_layout_json(
                         }
                     }
                     if c < inner.width {
+                        let padding_bg = window_fill
+                            .and_then(|style| style.bg)
+                            .unwrap_or(last_bg);
                         let pad = " ".repeat((inner.width - c) as usize);
-                        spans.push(Span::styled(pad, Style::default().bg(last_bg)));
+                        spans.push(Span::styled(pad, Style::default().bg(padding_bg)));
                     }
                     lines.push(Line::from(spans));
                 }
@@ -1222,10 +1396,17 @@ pub fn render_layout_json(
             }
 
             f.render_widget(Clear, inner);
-            let para = Paragraph::new(Text::from(lines));
+            let para = Paragraph::new(Text::from(lines))
+                .style(window_content_fill_style(window_fill));
             f.render_widget(para, inner);
 
-            if *copy_mode && *active {
+            // tmux draws the copy-mode position indicator out of each pane's
+            // OWN mode screen (`window-copy.c` `window_copy_write_line`), so
+            // every pane that is in copy mode is marked, focused or not.
+            // psmux used to gate this on `active` because only one pane could
+            // ever be in copy mode; now that a mode belongs to its pane
+            // (#607), mark every pane that holds one.
+            if *copy_mode {
                 let label = "[copy mode]";
                 let lw = label.len() as u16;
                 if area.width >= lw {
@@ -1250,7 +1431,7 @@ pub fn render_layout_json(
 
             if *active && !*copy_mode {
                 if clock_mode {
-                    render_clock_overlay(f, inner, clock_colour);
+                    render_clock_overlay(f, inner, clock_colour, window_fill);
                 }
             }
 
@@ -1303,7 +1484,7 @@ pub fn render_layout_json(
             if zoomed {
                 if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
                     if let Some(child) = children.get(i) {
-                        render_layout_json(f, child, area, dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln);
+                        render_layout_json(f, child, area, dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles);
                     }
                 }
                 return;
@@ -1313,7 +1494,7 @@ pub fn render_layout_json(
 
             for (i, child) in children.iter().enumerate() {
                 if i < rects.len() {
-                    render_layout_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln);
+                    render_layout_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes, bchars, copy_ln, window_styles);
                 }
             }
             let border_style = Style::default().fg(border_fg);
@@ -1935,6 +2116,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         pane_active_border_style: Option<String>,
         #[serde(default)]
         pane_border_hover_style: Option<String>,
+        #[serde(default)]
+        window_style: Option<String>,
+        #[serde(default)]
+        window_active_style: Option<String>,
         #[serde(default)]
         pane_border_status: Option<String>,
         #[serde(default)]
@@ -3317,12 +3502,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // how many sessions exist, so the picker stays responsive (no
                                 // sequential O(N * timeout) cleanup pass).
                                 let mut targets: Vec<(String, String, String)> = Vec::new();
+                                // A -L socket is a separate server in tmux; a client never
+                                // sees another socket's sessions. Same rule `ls` applies.
+                                let picker_ns = crate::session::session_namespace(&current_session);
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     for e in entries.flatten() {
                                         if let Some(fname) = e.file_name().to_str() {
                                             if let Some((base, ext)) = fname.rsplit_once('.') {
                                                 if ext == "port" {
                                                     if crate::session::is_warm_session(base) { continue; }
+                                                    if !crate::session::session_visible_from(base, picker_ns) { continue; }
                                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
                                                         if let Ok(p) = port_str.trim().parse::<u16>() {
                                                             let sess_addr = format!("127.0.0.1:{}", p);
@@ -4238,7 +4427,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     { cmd_batch.push("send-key tab\n".into()); }
                                 }
                                 KeyCode::BackTab => { cmd_batch.push("send-key btab\n".into()); }
-                                KeyCode::Backspace => { cmd_batch.push("send-key backspace\n".into()); }
+                                // Backspace has to carry its modifiers like every
+                                // other special key here (issue #610).  Naming it
+                                // "backspace" unconditionally threw Ctrl away on the
+                                // wire, so the server could only ever write a plain
+                                // 0x7f and no bind-key C-BSpace could match.  The
+                                // unmodified case still lowercases to "backspace",
+                                // exactly as before.
+                                KeyCode::Backspace => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Backspace", key.modifiers))); }
                                 KeyCode::Delete => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Delete", key.modifiers))); }
                                 KeyCode::Esc => { cmd_batch.push("send-key esc\n".into()); }
                                 KeyCode::Left => { cmd_batch.push(format!("send-key {}\n", modified_key_name("Left", key.modifiers))); }
@@ -5528,7 +5724,29 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     Some(CopyLnRender { mode, hsize: state.copy_hsize, num_style, cur_style })
                 } else { None }
             };
-            render_layout_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed, border_status, border_format, total_panes, bchars, copy_ln);
+            let window_styles = WindowContentStyles {
+                inactive: state.window_style.as_deref()
+                    .filter(|style| !style.is_empty())
+                    .map(crate::style::parse_tmux_style),
+                active: state.window_active_style.as_deref()
+                    .filter(|style| !style.is_empty())
+                    .map(crate::style::parse_tmux_style),
+                // tmux `style.c` reads a `dim=N` percentage out of both window
+                // styles and `tty.c` applies it via `colour_dim` (#619 item 4).
+                inactive_dim: state.window_style.as_deref()
+                    .map(crate::style::parse_style_dim).unwrap_or(0),
+                active_dim: state.window_active_style.as_deref()
+                    .map(crate::style::parse_style_dim).unwrap_or(0),
+            };
+            let floating_pane_focused =
+                srv_floats.iter().any(|float| float.focused);
+            render_layout_json(
+                f, &root, content_chunk, dim_preds, pane_border_fg,
+                pane_active_border_fg, clock_active, clock_col, active_rect,
+                &mode_style_str, state.zoomed, border_status, border_format,
+                total_panes, bchars, copy_ln,
+                window_styles.for_tiled_panes(floating_pane_focused),
+            );
             let border_mask = border_mask_from_layout(&root, content_chunk, f.buffer_mut().area, state.zoomed);
             fix_border_intersections(f.buffer_mut(), bchars, &border_mask);
             // render_json and fix_border_intersections can leave inconsistent styles
@@ -6469,7 +6687,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             // Floating panes (tmux new-pane) draw above the tiled layout but
             // below modal popups so a popup still stacks on top.
             if !srv_floats.is_empty() {
-                render_float_overlays(f, content_chunk, &srv_floats);
+                render_float_overlays(
+                    f,
+                    content_chunk,
+                    &srv_floats,
+                    window_styles,
+                );
             }
             if srv_popup_active {
                 let popup_area = popup_overlay_rect(content_chunk, srv_popup_width, srv_popup_height);
@@ -6484,48 +6707,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 if !srv_popup_rows.is_empty() {
                     // Render with full color/style data from popup_rows (#154)
                     for row_data in &srv_popup_rows {
-                        let mut spans: Vec<Span<'static>> = Vec::new();
-                        let mut col: u16 = 0;
-                        for run in &row_data.runs {
-                            if col >= inner_w { break; }
-                            let fg = crate::style::map_color(&run.fg);
-                            let bg = crate::style::map_color(&run.bg);
-                            let mut style = Style::default().fg(fg).bg(bg);
-                            if run.flags & 1  != 0 { style = style.add_modifier(Modifier::DIM); }
-                            if run.flags & 2  != 0 { style = style.add_modifier(Modifier::BOLD); }
-                            if run.flags & 4  != 0 { style = style.add_modifier(Modifier::ITALIC); }
-                            if run.flags & 8  != 0 {
-                    style = crate::rendering::with_underline(
-                        style,
-                        if run.ul == 0 { 1 } else { run.ul },
-                        run.ulc.as_deref().map(map_color),
-                    );
-                }
-                            if run.flags & 16 != 0 { style = style.add_modifier(Modifier::REVERSED); }
-                            if run.flags & 32 != 0 { style = style.add_modifier(Modifier::SLOW_BLINK); }
-                            if run.flags & 128 != 0 { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                            // ratatui-crossterm omits SGR 8 (HIDDEN), render as spaces
-                            let text: &str = if run.flags & 64 != 0 {
-                                " "
-                            } else if run.text.is_empty() {
-                                " "
-                            } else {
-                                &run.text
-                            };
-                            let run_w = run.width.max(1);
-                            if col + run_w > inner_w {
-                                let avail = (inner_w - col) as usize;
-                                let truncated: String = text.chars().take(avail).collect();
-                                if !truncated.is_empty() {
-                                    spans.push(Span::styled(truncated, style));
-                                }
-                                col = inner_w;
-                            } else {
-                                spans.push(Span::styled(text.to_string(), style));
-                                col += run_w;
-                            }
-                        }
-                        lines.push(Line::from(spans));
+                        lines.push(render_popup_runs_line(&row_data.runs, inner_w));
                     }
                 } else {
                     // Fallback: plain text lines for non-PTY popups
@@ -7152,3 +7334,11 @@ mod test_issue507_popup_cursor;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue605_stale_port_attach.rs"]
 mod test_issue605_stale_port_attach;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_window_content_styles.rs"]
+mod test_window_content_styles;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue619_window_style_fallback.rs"]
+mod test_issue619_window_style_fallback;

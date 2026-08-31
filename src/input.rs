@@ -1057,12 +1057,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         let fwd = forward;
                         app.copy_search_query = query.clone();
                         app.copy_search_forward = fwd;
+                        // search_copy_mode already parks the cursor on the
+                        // first match, scrolling the viewport when that match
+                        // sits in the scrollback history (#612).
                         search_copy_mode(app, &query, fwd);
-                        // Jump to first match
-                        if !app.copy_search_matches.is_empty() {
-                            let (r, c, _) = app.copy_search_matches[0];
-                            app.copy_pos = Some((r, c));
-                        }
                     }
                     app.mode = Mode::CopyMode;
                     app.status_message = None;
@@ -1757,12 +1755,70 @@ pub fn parse_modified_special_key(s: &str) -> Option<String> {
     let m = bits + 1; // xterm modifier param = 1 + modifier bits
     // Match the base key name
     match rest {
-        "ENTER" | "RETURN" | "CR" => Some(format!("\x1b[13;{}~", m)),
+        // Enter is the second modified special key whose Windows encoding is
+        // NOT a CSI sequence (issue #611, same shape as Backspace in #610).
+        //
+        // Measured by writing each candidate into a real pseudoconsole, the
+        // same thing psmux gives a pane:
+        //   ESC [ 13;2 ~   (S-Enter)  -> ZERO input records
+        //   ESC [ 13;3 ~   (M-Enter)  -> ZERO input records
+        //   1b 0d                     -> REC DOWN vk=0x0D uChar=0x000D ctrl=0x0002 [LALT]
+        // So the CSI form silently delivered nothing at all to a pane child,
+        // while ESC CR is what ConPTY turns back into a modified Return.  It
+        // is also what `encode_key_event` already sends for a modified Enter
+        // typed by a real user, so the binding and the keystroke now agree,
+        // and it matches tmux, whose `M-Enter` is written as the `\033` prefix
+        // (input-keys.c) followed by the key's own CR.
+        "ENTER" | "RETURN" | "CR" => {
+            #[cfg(windows)]
+            {
+                if bits & 4 == 0 {
+                    // Shift and/or Alt: ESC CR, the pair libuv reports as
+                    // meta+return so node TUIs insert a newline.
+                    return Some("\x1b\r".to_string());
+                }
+                if bits == 4 {
+                    // Plain Ctrl+Enter is LF, matching Windows Terminal and the
+                    // native VK_RETURN injection payload (#409).
+                    return Some("\n".to_string());
+                }
+            }
+            Some(format!("\x1b[13;{}~", m))
+        }
         "TAB" => Some(format!("\x1b[9;{}~", m)),
         "BTAB" | "BACKTAB" => {
             // Shift is implicit in BackTab; ensure Shift bit is set in the bitmask
             let sm = (bits | 1) + 1;
             Some(format!("\x1b[9;{}~", sm))
+        }
+        // Backspace is the one modified special key whose Windows encoding is a
+        // RAW BYTE rather than a CSI sequence, so it cannot use `m` (issue #610).
+        //
+        // Measured against a real pseudoconsole (the same thing psmux gives a
+        // pane), in both directions:
+        //   * ConPTY's input parser turns the byte 0x7f into VK_BACK with no
+        //     modifiers, and the byte 0x08 into VK_BACK with LEFT_CTRL_PRESSED.
+        //   * conhost's own record to VT encoder produces exactly those two
+        //     bytes for Backspace and Ctrl+Backspace, and 1b 7f for Alt+Backspace.
+        // So 0x08 is not an approximation of Ctrl+Backspace on Windows, it IS
+        // the encoding, and it is what a record reading app such as PSReadLine
+        // needs to run BackwardKillWord.
+        //
+        // A CSI form would deliver NOTHING: ESC [ 127;5 u, ESC [ 8;5 u and
+        // ESC [ 27;5;127 ~ were all measured to be silently discarded by the
+        // ConPTY input parser, producing zero input records.
+        //
+        // Alt takes the usual ESC prefix, matching tmux 3.4, whose
+        // `send-keys M-BSpace` writes 1b 7f into the pane.  Shift has no
+        // distinct encoding on either side (conhost sends plain 0x7f for
+        // Shift+Backspace), so S- collapses onto the unmodified byte.
+        "BSPACE" | "BACKSPACE" => {
+            let base = if bits & 4 != 0 { '\u{8}' } else { '\u{7f}' };
+            if bits & 2 != 0 {
+                Some(format!("\x1b{}", base))
+            } else {
+                Some(base.to_string())
+            }
         }
         "LEFT" => Some(format!("\x1b[1;{}D", m)),
         "RIGHT" => Some(format!("\x1b[1;{}C", m)),
@@ -2919,11 +2975,9 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     let fwd = forward;
                     app.copy_search_query = query.clone();
                     app.copy_search_forward = fwd;
+                    // search_copy_mode parks the cursor on the first match and
+                    // scrolls the viewport to it when it is in history (#612).
                     search_copy_mode(app, &query, fwd);
-                    if !app.copy_search_matches.is_empty() {
-                        let (r, c, _) = app.copy_search_matches[0];
-                        app.copy_pos = Some((r, c));
-                    }
                 }
                 app.mode = Mode::CopyMode;
                 app.status_message = None;
@@ -3350,3 +3404,7 @@ mod tests_copy_mode_key_tables;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue596_copy_scroll_keys.rs"]
 mod tests_issue596_copy_scroll_keys;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue610_ctrl_backspace.rs"]
+mod tests_issue610_ctrl_backspace;
