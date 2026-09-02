@@ -836,6 +836,23 @@ pub fn parse_target(target: &str) -> ParsedTarget {
     result
 }
 
+/// True when a send command names its pane by id (`-t %N`, `-t sess:%N`,
+/// `-t sess:@W.%N`) and must therefore be delivered by id inside ONE server
+/// request, skipping the temporary `-t` focus entirely.
+///
+/// The temp focus is a global side effect (`active_idx`) that the follow-on
+/// request relies on implicitly. Between the two, any other client's request
+/// can restore or re-point it, so `send-keys -t sess:%N` typed into whichever
+/// pane happened to be active at that instant. `capture-pane -t %N` never had
+/// the problem because it resolves the id inside the capture; the send
+/// commands now do the same (see `CtrlReq::SendKeysToPane` and friends).
+/// Index and name targets keep the focus path unchanged.
+pub fn sends_by_pane_id(cmd: &str, pane_is_id: bool, target_pane: Option<usize>) -> bool {
+    matches!(cmd, "send-keys" | "send" | "send-paste" | "send-text" | "send-key")
+        && pane_is_id
+        && target_pane.is_some()
+}
+
 /// Extract the session name from a target string (for port file lookup)
 pub fn extract_session_from_target(target: &str) -> String {
     let parsed = parse_target(target);

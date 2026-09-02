@@ -24,6 +24,7 @@ fn clear_inherit(_s: &TcpStream) {}
 use crate::cli::{parse_target, extract_flag_value};
 use crate::util::base64_decode;
 use crate::control;
+use super::send_keys::dispatch_send;
 
 /// Append-only AUTH diagnostics, gated by PSMUX_AUTH_DEBUG=1. Written to
 /// %TEMP%\psmux_auth_debug.log so concurrent processes never truncate each
@@ -779,7 +780,11 @@ if control_echo || control_noecho {
         // active pane (temp-focusing the target would make active == target
         // and turn the swap into a no-op).
         let ctrl_capture_by_id = matches!(cmd_name, "capture-pane" | "capturep") && ctrl_pane_is_id && ctrl_target_pane.is_some();
-        let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id;
+        // A send command with a `-t %N` target is delivered by id inside its
+        // own request (CtrlReq::SendKeysToPane and friends), so it needs no
+        // focus at all — window or pane. See cli::sends_by_pane_id.
+        let ctrl_send_by_id = crate::cli::sends_by_pane_id(cmd_name, ctrl_pane_is_id, ctrl_target_pane);
+        let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id || ctrl_send_by_id;
         let mut focus_err: Option<String> = None;
         if is_focus_cmd {
             if let Some(wid) = ctrl_target_win {
@@ -802,7 +807,7 @@ if control_echo || control_noecho {
             // Validated temporary focus (issue #545): on an unresolvable
             // window/pane target the command must not run — reply %error
             // instead of silently executing against the active window.
-            let want_win = (ctrl_target_win.is_some() || ctrl_target_win_name.is_some()) && !skip_target_focus;
+            let want_win = (ctrl_target_win.is_some() || ctrl_target_win_name.is_some()) && !skip_target_focus && !ctrl_send_by_id;
             let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
             if want_win || want_pane {
                 let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
@@ -1048,9 +1053,15 @@ let targeted_kill_pane_id = if matches!(cmd, "kill-pane" | "killp") && pane_is_i
 // window for other clients. Non-id targets (-t 0.1) still use the
 // temporary-focus path below.
 let capture_pane_by_id = matches!(cmd, "capture-pane" | "capturep") && pane_is_id && target_pane.is_some();
+// A send command with a `-t %N` target is delivered by id inside its own
+// request (CtrlReq::SendKeysToPane and friends), so it needs no focus at
+// all — window or pane. The temp focus was the bug: it is a global side
+// effect, and another client's request between it and the send moved it
+// (see cli::sends_by_pane_id).
+let send_by_id = crate::cli::sends_by_pane_id(cmd, pane_is_id, target_pane);
 // swap-pane swaps the target with the *current* active pane; focusing the
 // target first would make active == target and turn the swap into a no-op.
-let skip_pane_focus = matches!(cmd, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || capture_pane_by_id;
+let skip_pane_focus = matches!(cmd, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || capture_pane_by_id || send_by_id;
 if is_focus_cmd {
     if let Some(wid) = target_win {
         if target_win_is_id {
@@ -1075,7 +1086,7 @@ if is_focus_cmd {
     // no-opped on a bad target and the untargeted command then executed
     // against the ACTIVE window (kill-pane destroyed it, send-keys typed
     // into it, capture-pane read it) at rc=0.
-    let want_win = (target_win.is_some() || target_win_name.is_some()) && !skip_target_focus;
+    let want_win = (target_win.is_some() || target_win_name.is_some()) && !skip_target_focus && !send_by_id;
     let want_pane = target_pane.is_some() && !skip_pane_focus && targeted_kill_pane_id.is_none();
     if want_win || want_pane {
         let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
@@ -1098,6 +1109,10 @@ if is_focus_cmd {
         }
     }
 }
+// The pane a `-t %N` send goes to, resolved by id inside the request; None
+// keeps the historical active-pane route. Derived from send_by_id above so
+// the focus skip and the delivery route cannot disagree.
+let send_pane_id: Option<usize> = if send_by_id { target_pane } else { None };
 match cmd {
     "new-window" | "neww" => {
         let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
@@ -1287,17 +1302,44 @@ match cmd {
         }
     }
     "send-text" => {
-        if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendText(payload.to_string())); }
+        if let Some(payload) = args.get(0) {
+            let text = payload.to_string();
+            let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                |pane_id, resp| CtrlReq::SendTextToPane { pane_id, text: text.clone(), resp },
+                || CtrlReq::SendText(text.clone()));
+            if let Err(e) = sent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+                if !persistent { break; }
+            }
+        }
     }
     "send-paste" => {
         if let Some(encoded) = args.get(0) {
             if let Some(decoded) = base64_decode(encoded) {
-                let _ = tx.send(CtrlReq::SendPaste(decoded));
+                let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                    |pane_id, resp| CtrlReq::SendPasteToPane { pane_id, text: decoded.clone(), resp },
+                    || CtrlReq::SendPaste(decoded.clone()));
+                if let Err(e) = sent {
+                    let _ = writeln!(write_stream, "ERROR: {}", e);
+                    let _ = write_stream.flush();
+                    if !persistent { break; }
+                }
             }
         }
     }
     "send-key" => {
-        if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendKey(payload.to_string())); }
+        if let Some(payload) = args.get(0) {
+            let key = payload.to_string();
+            let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                |pane_id, resp| CtrlReq::SendKeyToPane { pane_id, key: key.clone(), resp },
+                || CtrlReq::SendKey(key.clone()));
+            if let Err(e) = sent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+                if !persistent { break; }
+            }
+        }
     }
     "zoom-pane" | "resize-pane" | "resizep" if args.iter().any(|a| *a == "-Z") => { let _ = tx.send(CtrlReq::ZoomPane); }
     "zoom-pane" => { let _ = tx.send(CtrlReq::ZoomPane); }
@@ -1500,6 +1542,9 @@ match cmd {
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" | "send" => {
+        // First failed pane-id delivery, reported after the arm (a `break`
+        // inside the repeat loops below would only leave the loop).
+        let mut send_err: Option<String> = None;
         // End-of-options: a bare `--` terminates flag parsing. Every token after
         // it is an operand even if it begins with '-', and `--` itself is
         // consumed. Without this, `send-keys -l -- -foo` dropped `--` as a dash
@@ -1586,7 +1631,10 @@ match cmd {
             }
             if !bytes.is_empty() {
                 for _ in 0..repeat_count {
-                    let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
+                    let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                        |pane_id, resp| CtrlReq::SendBytesToPane { pane_id, bytes: bytes.clone(), resp },
+                        || CtrlReq::SendBytes(bytes.clone()));
+                    if let Err(e) = sent { send_err = Some(e); break; }
                 }
             }
         } else if has_x {
@@ -1630,14 +1678,28 @@ match cmd {
             });
             let effective_literal = literal || any_hex;
             for _ in 0..repeat_count {
-                if paste_mode {
-                    let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
+                let sent = if paste_mode {
+                    let text = keys.join("");
+                    dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                        |pane_id, resp| CtrlReq::SendPasteToPane { pane_id, text: text.clone(), resp },
+                        || CtrlReq::SendPaste(text.clone()))
                 } else {
                     // #490: hand the tokens over UNJOINED so quoted
                     // arguments keep their exact whitespace end to end.
-                    let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
-                }
+                    dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                        |pane_id, resp| CtrlReq::SendKeysToPane { pane_id, keys: keys.clone(), literal: effective_literal, resp },
+                        || CtrlReq::SendKeys(keys.clone(), effective_literal))
+                };
+                if let Err(e) = sent { send_err = Some(e); break; }
             }
+        }
+        if let Some(e) = send_err {
+            // Unresolvable pane id: tmux parity ("can't find pane: %N", exit
+            // 1, nothing typed anywhere) — the same contract the temp-focus
+            // validation gives every other `-t` command.
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
+            if !persistent { break; }
         }
     }
     "select-pane" | "selectp" => {
@@ -4048,6 +4110,10 @@ fn dispatch_control_command(
             true
         }
         "send-keys" | "send" => {
+            // `-t %N`: deliver by pane id inside the request (see
+            // cli::sends_by_pane_id); the temp focus was skipped for it above.
+            let send_pane_id: Option<usize> =
+                if crate::cli::sends_by_pane_id(cmd, pane_is_id, target_pane) { target_pane } else { None };
             let flag_has = |c: char| -> bool {
                 args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.chars().skip(1).any(|fc| fc == c))
             };
@@ -4078,8 +4144,15 @@ fn dispatch_control_command(
                     if let Ok(byte) = u8::from_str_radix(a, 16) { bytes.push(byte); }
                 }
                 if !bytes.is_empty() {
-                    let _ = tx.send(CtrlReq::SendBytes(bytes));
+                    let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                        |pane_id, resp| CtrlReq::SendBytesToPane { pane_id, bytes: bytes.clone(), resp },
+                        || CtrlReq::SendBytes(bytes.clone()));
+                    if let Err(e) = sent {
+                        let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e));
+                        return true;
+                    }
                 }
+                let _ = resp_tx.send(String::new());
                 return true;
             }
             // Convert real-tmux 0xNN hex codepoint syntax (used by iTerm2 for
@@ -4112,8 +4185,13 @@ fn dispatch_control_command(
             let effective_literal = literal || any_hex;
             // #490: hand the tokens over UNJOINED so quoted arguments keep
             // their exact whitespace end to end.
-            let _ = tx.send(CtrlReq::SendKeys(keys, effective_literal));
-            let _ = resp_tx.send(String::new());
+            let sent = dispatch_send(|r| { let _ = tx.send(r); }, send_pane_id,
+                |pane_id, resp| CtrlReq::SendKeysToPane { pane_id, keys: keys.clone(), literal: effective_literal, resp },
+                || CtrlReq::SendKeys(keys.clone(), effective_literal));
+            match sent {
+                Ok(()) => { let _ = resp_tx.send(String::new()); }
+                Err(e) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+            }
             true
         }
         "capture-pane" | "capturep" => {

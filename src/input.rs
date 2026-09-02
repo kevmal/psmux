@@ -2875,6 +2875,237 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
     Ok(())
 }
 
+/// Write a named key to a single pane. One table for what a key name means, shared by
+/// the active-pane route (`send_key_to_active`, below) and the pane-id route
+/// (`send_key_to_pane_by_id`), so the two can never drift.
+pub(crate) fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
+    use std::io::Write as _;
+    match k {
+        "enter" | "return" | "cr" => write_key_seq(p, b"\r"),
+        "tab" => write_key_seq(p, b"\t"),
+        "btab" | "backtab" => write_key_seq(p, b"\x1b[Z"),
+        "backspace" => write_key_seq(p, b"\x7f"),
+        "delete" => write_key_seq(p, b"\x1b[3~"),
+        "esc" => write_key_seq(p, b"\x1b"),
+        "up" => write_key_seq(p, b"\x1b[A"),
+        "down" => write_key_seq(p, b"\x1b[B"),
+        "right" => write_key_seq(p, b"\x1b[C"),
+        "left" => write_key_seq(p, b"\x1b[D"),
+        "home" => write_key_seq(p, b"\x1b[H"),
+        "end" => write_key_seq(p, b"\x1b[F"),
+        "pageup" => write_key_seq(p, b"\x1b[5~"),
+        "pagedown" => write_key_seq(p, b"\x1b[6~"),
+        "insert" => write_key_seq(p, b"\x1b[2~"),
+        "space" => write_key_seq(p, b" "),
+        s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
+            if let Ok(n) = s[1..].parse::<u8>() {
+                let seq = match n {
+                    1 => "\x1bOP",
+                    2 => "\x1bOQ",
+                    3 => "\x1bOR",
+                    4 => "\x1bOS",
+                    5 => "\x1b[15~",
+                    6 => "\x1b[17~",
+                    7 => "\x1b[18~",
+                    8 => "\x1b[19~",
+                    9 => "\x1b[20~",
+                    10 => "\x1b[21~",
+                    11 => "\x1b[23~",
+                    12 => "\x1b[24~",
+                    _ => "",
+                };
+                if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
+            }
+        }
+        // Ctrl+Shift+<letter>: inject a native KEY_EVENT carrying BOTH the
+        // Ctrl and Shift modifier flags so console-input apps (ReadConsoleInputW)
+        // can distinguish it from a plain Ctrl+<letter> (issue #368: psmux used
+        // to collapse Ctrl+Shift+V to Ctrl+V, stripping Shift).  We deliberately
+        // do NOT also write the raw C0 byte: emitting both double-delivers the
+        // key (issue #363).  VT-pipe apps still receive ConPTY's translation of
+        // this single event.
+        s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
+            && s.chars().count() == 5
+            && s.chars().nth(4).map_or(false, |c| c.is_ascii_alphabetic()) =>
+        {
+            let c = s.chars().nth(4).unwrap().to_ascii_lowercase();
+            let ctrl_char = (c as u8) & 0x1F;
+            #[cfg(windows)]
+            {
+                let injected = if let Some(pid) = p.child_pid {
+                    crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, true)
+                } else {
+                    false
+                };
+                if !injected {
+                    // No child pid / injection failed: fall back to the raw
+                    // control byte (Shift unrepresentable, but key still arrives).
+                    let _ = p.writer.write_all(&[ctrl_char]);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                // Non-Windows: no console-input modifier channel; legacy VT has
+                // no distinct Ctrl+Shift+<letter> encoding, so deliver the byte.
+                let _ = p.writer.write_all(&[ctrl_char]);
+            }
+        }
+        // Ctrl+Shift+<punctuation/digit> that collapses to a single C0 byte.
+        // ConPTY terminals (Alacritty, WezTerm) deliver Ctrl+/ as VK_OEM_MINUS
+        // with Ctrl+Shift, so the client forwards it as "C-S--".  That must
+        // reach the child as 0x1f (^_) — identical to Ctrl+_ and to tmux — so
+        // neovim's Ctrl+/ comment-toggle fires.  Before this branch, "C-S--"
+        // matched neither the alphabetic C-S- arm nor the len==3 C- arm and
+        // was silently dropped (issue #394).  No native KEY_EVENT injection:
+        // the raw byte is enough (ConPTY reconstructs the key) and injecting
+        // both would double-deliver (issue #363).
+        s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
+            && s.chars().count() == 5
+            && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
+        {
+            let c = s.chars().nth(4).unwrap();
+            if let Some(byte) = ctrl_char_send_keys_byte(c) {
+                let _ = p.writer.write_all(&[byte]);
+                let _ = p.writer.flush();
+            }
+        }
+        // Ctrl+Break (issue #454).  The attached client traps the Ctrl+Break
+        // console signal — which Windows never delivers as a keystroke — and
+        // forwards it here as `send-key C-Break` so it interrupts the running
+        // program instead of tearing down the client / session.
+        //
+        // We deliver a GENUINE CTRL_BREAK_EVENT to the pane's ConPTY child,
+        // exactly like Windows Terminal.  Ctrl+Break exists to stop a program
+        // that *ignores* Ctrl+C, so the old Ctrl+C path (raw 0x03 + a
+        // CTRL_C_EVENT) was not enough — a Ctrl+C-immune program survived it.
+        // Attaching to the child's console places us in its process group and
+        // the broadcast reaches the child (proven to kill a Ctrl+C-immune
+        // program); the server survives via its own CTRL_BREAK-surviving
+        // console handler.  See platform::mouse_inject::send_ctrl_break_event.
+        "break" | "Break" | "C-Break" | "c-break" | "C-break" => {
+            #[cfg(windows)]
+            if let Some(pid) = p.child_pid {
+                crate::platform::mouse_inject::send_ctrl_break_event(pid, false);
+            }
+        }
+        s if s.starts_with("C-") && s.len() == 3 => {
+            let c = s.chars().nth(2).unwrap_or('c');
+            // tmux-parity mapping so C-/ -> 0x1f (^_), not the naive '/' & 0x1f
+            // == 0x0f (^O) collision with C-o (issue #226/#394).  Letters keep
+            // their usual byte (a->0x01 …), so Ctrl+<letter> is unaffected.
+            let ctrl_char = ctrl_char_send_keys_byte(c)
+                .unwrap_or((c.to_ascii_lowercase() as u8) & 0x1F);
+            // Always write the raw control byte so ConPTY can generate
+            // console control events (e.g. CTRL_C_EVENT for \x03).
+            // Raw bytes do NOT start with \x1b so they never corrupt
+            // ConPTY's VT parser state.
+            //
+            // ConPTY already reconstructs the proper VK + LEFT_CTRL_PRESSED
+            // console key event from this raw C0 byte, so console apps
+            // (PSReadLine, neovim) receive a correct Ctrl+<letter> event
+            // from the byte alone.  We must therefore NOT also inject a
+            // separate KEY_EVENT via WriteConsoleInputW for letters — doing
+            // both delivered the key TWICE (issue #363: a single <C-w>
+            // arrived as <C-w><C-w>, turning neovim's window command into a
+            // no-op and making `<C-w>s` behave like a bare `s`; PSReadLine's
+            // Ctrl+W likewise deleted two words instead of one).
+            // Ctrl+C is the sole exception: the interrupt router runs so the
+            // child's console handler can be signalled (SIGINT parity, #338)
+            // — BEFORE the byte, because when the router decides "raw 0x03
+            // only" it may strip PROCESSED_INPUT from the pane console so
+            // conhost delivers the byte as input instead of converting it
+            // into a console-wide CTRL_C_EVENT that aborts a booting WSL
+            // launch (#579). Writing first loses that race.
+            #[cfg(windows)]
+            if c.eq_ignore_ascii_case(&'c') {
+                if let Some(pid) = p.child_pid {
+                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                }
+            }
+            let _ = p.writer.write_all(&[ctrl_char]);
+            let _ = p.writer.flush();
+        }
+        s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
+            let c = s.chars().nth(2).unwrap_or('a');
+            // Try native console injection (WriteConsoleInputW with LEFT_ALT_PRESSED)
+            // first.  ConPTY does NOT reassemble ESC+char into Alt+key events, so
+            // PSReadLine Alt+f/Alt+b/etc. won't work via the VT path.
+            let injected = if let Some(pid) = p.child_pid {
+                crate::platform::mouse_inject::send_alt_key_event(pid, c)
+            } else {
+                false
+            };
+            if !injected {
+                // Fallback: VT encoding (ESC + char) — works for VT-native apps
+                let _ = write!(p.writer, "\x1b{}", c);
+            }
+        }
+        s if (s.starts_with("C-M-") || s.starts_with("c-m-")) && s.len() == 5 => {
+            let c = s.chars().nth(4).unwrap_or('c');
+            // Try native console injection (WriteConsoleInputW with
+            // LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED).  ConPTY does NOT
+            // reassemble ESC + ctrl-char into Ctrl+Alt+key.
+            let injected = if let Some(pid) = p.child_pid {
+                crate::platform::mouse_inject::send_modified_key_event(pid, c, true, true, false)
+            } else {
+                false
+            };
+            if !injected {
+                let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
+                let _ = p.writer.write_all(&[0x1b, ctrl_char]);
+            }
+        }
+        // Modified Enter: for Ctrl combos, try native console injection
+        // (WriteConsoleInputW) so PSReadLine sees the correct modifier flags.
+        // For Shift/Alt-only combos, use VT encoding to avoid ConPTY
+        // translating the injected KEY_EVENT back to plain \r (double Enter).
+        #[cfg(windows)]
+        s if {
+            let u = s.to_uppercase();
+            let r = u.trim_start_matches("C-").trim_start_matches("M-").trim_start_matches("S-");
+            r == "ENTER" || r == "RETURN" || r == "CR"
+        } => {
+            let upper = s.to_uppercase();
+            let has_shift = upper.contains("S-");
+            let has_ctrl = upper.contains("C-");
+            let has_alt = upper.contains("M-");
+            let injected = if has_ctrl {
+                // Only use native injection for Ctrl combos.  For plain
+                // Ctrl+Enter this carries an LF payload (#409); Ctrl+Shift /
+                // Ctrl+Alt keep CR.
+                if let Some(pid) = p.child_pid {
+                    crate::platform::mouse_inject::send_modified_enter_event(pid, has_ctrl, has_alt, has_shift)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !injected {
+                if has_ctrl && !has_shift && !has_alt {
+                    // Fallback: plain Ctrl+Enter is LF, matching WT (#409).
+                    let _ = p.writer.write_all(b"\n");
+                } else if (has_shift || has_alt) && !has_ctrl {
+                    // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
+                    let _ = p.writer.write_all(b"\x1b\r");
+                } else {
+                    // Ctrl+Shift/Ctrl+Alt+Enter and other combos: CSI encoding
+                    if let Some(seq) = parse_modified_special_key(s) {
+                        let _ = p.writer.write_all(seq.as_bytes());
+                    }
+                }
+            }
+        }
+        // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.
+        s if parse_modified_special_key(s).is_some() => {
+            let seq = parse_modified_special_key(s).unwrap();
+            let _ = p.writer.write_all(seq.as_bytes());
+        }
+        _ => {}
+    }
+    let _ = p.writer.flush();
+}
+
 pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // In clock mode, any key exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {
@@ -3107,235 +3338,6 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         return Ok(());
     }
     
-    // Write a named key to a single pane (extracted for sync_input support).
-    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
-        use std::io::Write as _;
-        match k {
-            "enter" | "return" | "cr" => write_key_seq(p, b"\r"),
-            "tab" => write_key_seq(p, b"\t"),
-            "btab" | "backtab" => write_key_seq(p, b"\x1b[Z"),
-            "backspace" => write_key_seq(p, b"\x7f"),
-            "delete" => write_key_seq(p, b"\x1b[3~"),
-            "esc" => write_key_seq(p, b"\x1b"),
-            "up" => write_key_seq(p, b"\x1b[A"),
-            "down" => write_key_seq(p, b"\x1b[B"),
-            "right" => write_key_seq(p, b"\x1b[C"),
-            "left" => write_key_seq(p, b"\x1b[D"),
-            "home" => write_key_seq(p, b"\x1b[H"),
-            "end" => write_key_seq(p, b"\x1b[F"),
-            "pageup" => write_key_seq(p, b"\x1b[5~"),
-            "pagedown" => write_key_seq(p, b"\x1b[6~"),
-            "insert" => write_key_seq(p, b"\x1b[2~"),
-            "space" => write_key_seq(p, b" "),
-            s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
-                if let Ok(n) = s[1..].parse::<u8>() {
-                    let seq = match n {
-                        1 => "\x1bOP",
-                        2 => "\x1bOQ",
-                        3 => "\x1bOR",
-                        4 => "\x1bOS",
-                        5 => "\x1b[15~",
-                        6 => "\x1b[17~",
-                        7 => "\x1b[18~",
-                        8 => "\x1b[19~",
-                        9 => "\x1b[20~",
-                        10 => "\x1b[21~",
-                        11 => "\x1b[23~",
-                        12 => "\x1b[24~",
-                        _ => "",
-                    };
-                    if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
-                }
-            }
-            // Ctrl+Shift+<letter>: inject a native KEY_EVENT carrying BOTH the
-            // Ctrl and Shift modifier flags so console-input apps (ReadConsoleInputW)
-            // can distinguish it from a plain Ctrl+<letter> (issue #368: psmux used
-            // to collapse Ctrl+Shift+V to Ctrl+V, stripping Shift).  We deliberately
-            // do NOT also write the raw C0 byte: emitting both double-delivers the
-            // key (issue #363).  VT-pipe apps still receive ConPTY's translation of
-            // this single event.
-            s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
-                && s.chars().count() == 5
-                && s.chars().nth(4).map_or(false, |c| c.is_ascii_alphabetic()) =>
-            {
-                let c = s.chars().nth(4).unwrap().to_ascii_lowercase();
-                let ctrl_char = (c as u8) & 0x1F;
-                #[cfg(windows)]
-                {
-                    let injected = if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, true)
-                    } else {
-                        false
-                    };
-                    if !injected {
-                        // No child pid / injection failed: fall back to the raw
-                        // control byte (Shift unrepresentable, but key still arrives).
-                        let _ = p.writer.write_all(&[ctrl_char]);
-                    }
-                }
-                #[cfg(not(windows))]
-                {
-                    // Non-Windows: no console-input modifier channel; legacy VT has
-                    // no distinct Ctrl+Shift+<letter> encoding, so deliver the byte.
-                    let _ = p.writer.write_all(&[ctrl_char]);
-                }
-            }
-            // Ctrl+Shift+<punctuation/digit> that collapses to a single C0 byte.
-            // ConPTY terminals (Alacritty, WezTerm) deliver Ctrl+/ as VK_OEM_MINUS
-            // with Ctrl+Shift, so the client forwards it as "C-S--".  That must
-            // reach the child as 0x1f (^_) — identical to Ctrl+_ and to tmux — so
-            // neovim's Ctrl+/ comment-toggle fires.  Before this branch, "C-S--"
-            // matched neither the alphabetic C-S- arm nor the len==3 C- arm and
-            // was silently dropped (issue #394).  No native KEY_EVENT injection:
-            // the raw byte is enough (ConPTY reconstructs the key) and injecting
-            // both would double-deliver (issue #363).
-            s if (s.starts_with("C-S-") || s.starts_with("c-s-"))
-                && s.chars().count() == 5
-                && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
-            {
-                let c = s.chars().nth(4).unwrap();
-                if let Some(byte) = ctrl_char_send_keys_byte(c) {
-                    let _ = p.writer.write_all(&[byte]);
-                    let _ = p.writer.flush();
-                }
-            }
-            // Ctrl+Break (issue #454).  The attached client traps the Ctrl+Break
-            // console signal — which Windows never delivers as a keystroke — and
-            // forwards it here as `send-key C-Break` so it interrupts the running
-            // program instead of tearing down the client / session.
-            //
-            // We deliver a GENUINE CTRL_BREAK_EVENT to the pane's ConPTY child,
-            // exactly like Windows Terminal.  Ctrl+Break exists to stop a program
-            // that *ignores* Ctrl+C, so the old Ctrl+C path (raw 0x03 + a
-            // CTRL_C_EVENT) was not enough — a Ctrl+C-immune program survived it.
-            // Attaching to the child's console places us in its process group and
-            // the broadcast reaches the child (proven to kill a Ctrl+C-immune
-            // program); the server survives via its own CTRL_BREAK-surviving
-            // console handler.  See platform::mouse_inject::send_ctrl_break_event.
-            "break" | "Break" | "C-Break" | "c-break" | "C-break" => {
-                #[cfg(windows)]
-                if let Some(pid) = p.child_pid {
-                    crate::platform::mouse_inject::send_ctrl_break_event(pid, false);
-                }
-            }
-            s if s.starts_with("C-") && s.len() == 3 => {
-                let c = s.chars().nth(2).unwrap_or('c');
-                // tmux-parity mapping so C-/ -> 0x1f (^_), not the naive '/' & 0x1f
-                // == 0x0f (^O) collision with C-o (issue #226/#394).  Letters keep
-                // their usual byte (a->0x01 …), so Ctrl+<letter> is unaffected.
-                let ctrl_char = ctrl_char_send_keys_byte(c)
-                    .unwrap_or((c.to_ascii_lowercase() as u8) & 0x1F);
-                // Always write the raw control byte so ConPTY can generate
-                // console control events (e.g. CTRL_C_EVENT for \x03).
-                // Raw bytes do NOT start with \x1b so they never corrupt
-                // ConPTY's VT parser state.
-                //
-                // ConPTY already reconstructs the proper VK + LEFT_CTRL_PRESSED
-                // console key event from this raw C0 byte, so console apps
-                // (PSReadLine, neovim) receive a correct Ctrl+<letter> event
-                // from the byte alone.  We must therefore NOT also inject a
-                // separate KEY_EVENT via WriteConsoleInputW for letters — doing
-                // both delivered the key TWICE (issue #363: a single <C-w>
-                // arrived as <C-w><C-w>, turning neovim's window command into a
-                // no-op and making `<C-w>s` behave like a bare `s`; PSReadLine's
-                // Ctrl+W likewise deleted two words instead of one).
-                // Ctrl+C is the sole exception: the interrupt router runs so the
-                // child's console handler can be signalled (SIGINT parity, #338)
-                // — BEFORE the byte, because when the router decides "raw 0x03
-                // only" it may strip PROCESSED_INPUT from the pane console so
-                // conhost delivers the byte as input instead of converting it
-                // into a console-wide CTRL_C_EVENT that aborts a booting WSL
-                // launch (#579). Writing first loses that race.
-                #[cfg(windows)]
-                if c.eq_ignore_ascii_case(&'c') {
-                    if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
-                    }
-                }
-                let _ = p.writer.write_all(&[ctrl_char]);
-                let _ = p.writer.flush();
-            }
-            s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
-                let c = s.chars().nth(2).unwrap_or('a');
-                // Try native console injection (WriteConsoleInputW with LEFT_ALT_PRESSED)
-                // first.  ConPTY does NOT reassemble ESC+char into Alt+key events, so
-                // PSReadLine Alt+f/Alt+b/etc. won't work via the VT path.
-                let injected = if let Some(pid) = p.child_pid {
-                    crate::platform::mouse_inject::send_alt_key_event(pid, c)
-                } else {
-                    false
-                };
-                if !injected {
-                    // Fallback: VT encoding (ESC + char) — works for VT-native apps
-                    let _ = write!(p.writer, "\x1b{}", c);
-                }
-            }
-            s if (s.starts_with("C-M-") || s.starts_with("c-m-")) && s.len() == 5 => {
-                let c = s.chars().nth(4).unwrap_or('c');
-                // Try native console injection (WriteConsoleInputW with
-                // LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED).  ConPTY does NOT
-                // reassemble ESC + ctrl-char into Ctrl+Alt+key.
-                let injected = if let Some(pid) = p.child_pid {
-                    crate::platform::mouse_inject::send_modified_key_event(pid, c, true, true, false)
-                } else {
-                    false
-                };
-                if !injected {
-                    let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
-                    let _ = p.writer.write_all(&[0x1b, ctrl_char]);
-                }
-            }
-            // Modified Enter: for Ctrl combos, try native console injection
-            // (WriteConsoleInputW) so PSReadLine sees the correct modifier flags.
-            // For Shift/Alt-only combos, use VT encoding to avoid ConPTY
-            // translating the injected KEY_EVENT back to plain \r (double Enter).
-            #[cfg(windows)]
-            s if {
-                let u = s.to_uppercase();
-                let r = u.trim_start_matches("C-").trim_start_matches("M-").trim_start_matches("S-");
-                r == "ENTER" || r == "RETURN" || r == "CR"
-            } => {
-                let upper = s.to_uppercase();
-                let has_shift = upper.contains("S-");
-                let has_ctrl = upper.contains("C-");
-                let has_alt = upper.contains("M-");
-                let injected = if has_ctrl {
-                    // Only use native injection for Ctrl combos.  For plain
-                    // Ctrl+Enter this carries an LF payload (#409); Ctrl+Shift /
-                    // Ctrl+Alt keep CR.
-                    if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_modified_enter_event(pid, has_ctrl, has_alt, has_shift)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !injected {
-                    if has_ctrl && !has_shift && !has_alt {
-                        // Fallback: plain Ctrl+Enter is LF, matching WT (#409).
-                        let _ = p.writer.write_all(b"\n");
-                    } else if (has_shift || has_alt) && !has_ctrl {
-                        // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
-                        let _ = p.writer.write_all(b"\x1b\r");
-                    } else {
-                        // Ctrl+Shift/Ctrl+Alt+Enter and other combos: CSI encoding
-                        if let Some(seq) = parse_modified_special_key(s) {
-                            let _ = p.writer.write_all(seq.as_bytes());
-                        }
-                    }
-                }
-            }
-            // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.
-            s if parse_modified_special_key(s).is_some() => {
-                let seq = parse_modified_special_key(s).unwrap();
-                let _ = p.writer.write_all(seq.as_bytes());
-            }
-            _ => {}
-        }
-        let _ = p.writer.flush();
-    }
-
     // A focused floating pane (tmux new-pane) receives the key instead of the
     // tiled active pane.
     {
@@ -3365,6 +3367,106 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
             write_named_key_to_pane(p, k);
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pane-id delivery: `send-keys` / `send-paste` / `send-text` / `send-key` with
+// `-t %N`, resolved inside the request instead of through a temporary focus.
+//
+// The `*_to_active` functions above are the historical route: they write to
+// whatever pane is active and honour every mode the active pane can be in.
+// A `-t %N` target used to reach them via a separate FocusTargetTemp request,
+// and any other client's request landing between the two restored or
+// re-pointed the active pane, so the keys went to a window the caller never
+// named (2026-09-01: an orchestrator's prompt typed into another agent, three
+// sessions over). These resolve the pane by id and never touch `active_idx`,
+// `active_path` or the MRU list.
+//
+// When the id names the pane the active route would write to anyway, the
+// delivery is delegated to the `*_to_active` twin so copy mode, popups,
+// confirm/menu prompts and synchronized input behave exactly as before. A
+// pane that is not that pane cannot be in any of those modes — they belong
+// to the active pane — so a direct write to its PTY is the whole delivery.
+// ---------------------------------------------------------------------------
+
+fn pane_not_found(pid: usize) -> String {
+    format!("can't find pane: %{}", pid)
+}
+
+/// True when `pid` is a pane the `*_to_active` route would write to right
+/// now: the active window's active pane with no floating pane holding focus
+/// (a focused floating pane takes the active route's input instead), or, with
+/// synchronized input on, any pane of the active window.
+pub(crate) fn pane_id_receives_active_input(app: &AppState, pid: usize) -> bool {
+    let Some(win) = app.windows.get(app.active_idx) else { return false };
+    if win.floating_focus.is_some() {
+        return false;
+    }
+    if crate::tree::get_active_pane_id(&win.root, &win.active_path) == Some(pid) {
+        return true;
+    }
+    app.sync_input && crate::tree::find_path_by_id(&win.root, pid).is_some()
+}
+
+/// Type `text` into pane `%pid`. Err("can't find pane: %N") writes nothing.
+pub(crate) fn send_text_to_pane_by_id(app: &mut AppState, pid: usize, text: &str) -> Result<(), String> {
+    if crate::tree::find_pane_by_id_global(app, pid).is_none() {
+        return Err(pane_not_found(pid));
+    }
+    if pane_id_receives_active_input(app, pid) {
+        return send_text_to_active(app, text).map_err(|e| e.to_string());
+    }
+    if let Some(p) = crate::tree::find_pane_mut_by_id_global(app, pid) {
+        let _ = p.writer.write_all(text.as_bytes());
+        let _ = p.writer.flush();
+    }
+    Ok(())
+}
+
+/// Press named key `k` ("enter", "up", "C-c", ...) in pane `%pid`.
+pub(crate) fn send_key_to_pane_by_id(app: &mut AppState, pid: usize, k: &str) -> Result<(), String> {
+    if crate::tree::find_pane_by_id_global(app, pid).is_none() {
+        return Err(pane_not_found(pid));
+    }
+    if pane_id_receives_active_input(app, pid) {
+        return send_key_to_active(app, k).map_err(|e| e.to_string());
+    }
+    if let Some(p) = crate::tree::find_pane_mut_by_id_global(app, pid) {
+        write_named_key_to_pane(p, k);
+    }
+    Ok(())
+}
+
+/// Paste `text` into pane `%pid`, bracketed when THAT pane's child asked for
+/// bracketed paste (the active route consults the active pane's parser; this
+/// one consults the target's).
+pub(crate) fn send_paste_to_pane_by_id(app: &mut AppState, pid: usize, text: &str) -> Result<(), String> {
+    if crate::tree::find_pane_by_id_global(app, pid).is_none() {
+        return Err(pane_not_found(pid));
+    }
+    if pane_id_receives_active_input(app, pid) {
+        return send_paste_to_active(app, text).map_err(|e| e.to_string());
+    }
+    if let Some(p) = crate::tree::find_pane_mut_by_id_global(app, pid) {
+        let bracket = p.term.lock().map(|t| t.screen().bracketed_paste()).unwrap_or(false);
+        write_paste_chunked(&mut p.writer, text.as_bytes(), bracket);
+    }
+    Ok(())
+}
+
+/// Write raw bytes (`send-keys -H`) to pane `%pid`.
+pub(crate) fn send_bytes_to_pane_by_id(app: &mut AppState, pid: usize, bytes: &[u8]) -> Result<(), String> {
+    if crate::tree::find_pane_by_id_global(app, pid).is_none() {
+        return Err(pane_not_found(pid));
+    }
+    if pane_id_receives_active_input(app, pid) {
+        return send_bytes_to_active(app, bytes).map_err(|e| e.to_string());
+    }
+    if let Some(p) = crate::tree::find_pane_mut_by_id_global(app, pid) {
+        let _ = p.writer.write_all(bytes);
+        let _ = p.writer.flush();
     }
     Ok(())
 }
@@ -3408,3 +3510,7 @@ mod tests_issue596_copy_scroll_keys;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue610_ctrl_backspace.rs"]
 mod tests_issue610_ctrl_backspace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_send_by_pane_id.rs"]
+mod tests_send_by_pane_id;

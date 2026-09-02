@@ -1902,6 +1902,24 @@ pub enum CtrlReq {
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
+    /// The `-t %N` forms of the send commands, delivered to that pane BY ID
+    /// inside this one request. The plain variants above write to whatever
+    /// pane is active, and a `-t` target used to reach them as a separate
+    /// `FocusTargetTemp` request first: two requests on a channel every client
+    /// shares. Any other client's request landing in between (a capture from
+    /// another agent's output poll, another temp focus, a `new-window`)
+    /// restored or re-pointed the active pane, and the keys went to a window
+    /// the caller never named — an orchestrator's message for one agent was
+    /// typed into another agent's prompt (2026-09-01). Resolving the pane
+    /// inside the request is what `capture-pane -t %N` and
+    /// `display-message -t %N` already do; these give the sends the same
+    /// guarantee. `resp` answers Err("can't find pane: %N") for an unknown
+    /// id, with nothing written anywhere, so the client can report it.
+    SendKeysToPane { pane_id: usize, keys: Vec<String>, literal: bool, resp: mpsc::Sender<Result<(), String>> },
+    SendPasteToPane { pane_id: usize, text: String, resp: mpsc::Sender<Result<(), String>> },
+    SendTextToPane { pane_id: usize, text: String, resp: mpsc::Sender<Result<(), String>> },
+    SendKeyToPane { pane_id: usize, key: String, resp: mpsc::Sender<Result<(), String>> },
+    SendBytesToPane { pane_id: usize, bytes: Vec<u8>, resp: mpsc::Sender<Result<(), String>> },
     SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String, bool),
     SelectWindow(usize),
