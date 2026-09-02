@@ -2,6 +2,7 @@ pub(crate) mod helpers;
 pub(crate) mod options;
 pub(crate) mod option_catalog;
 mod connection;
+pub(crate) mod send_keys;
 
 use std::io::{self, Write};
 use std::sync::mpsc;
@@ -1553,6 +1554,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::SendText(_)
                         | CtrlReq::SendKey(_)
                         | CtrlReq::SendPaste(_)
+                        | CtrlReq::SendTextToPane { .. }
+                        | CtrlReq::SendKeyToPane { .. }
+                        | CtrlReq::SendPasteToPane { .. }
                         | CtrlReq::WindowDump(..)
                         | CtrlReq::WindowLayout(..)
                     );
@@ -2608,209 +2612,62 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     send_bytes_to_active(&mut app, &bytes)?;
                 }
                 CtrlReq::SendKeys(keys, literal) => {
-                    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
-                    if in_copy {
-                        // In copy/search mode — route through mode-aware handlers
-                        if literal {
-                            send_text_to_active(&mut app, &keys.join(""))?;
-                        } else {
-                            // #490: `keys` holds the send-keys arguments as
-                            // separate tokens. Match each WHOLE token as a
-                            // named key or send it verbatim — never split a
-                            // token on whitespace, which destroyed spacing
-                            // inside quoted arguments.
-                            let parts: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                            for key in parts.iter() {
-                                let key_upper = key.to_uppercase();
-                                let normalized = match key_upper.as_str() {
-                                    "ENTER" | "RETURN" | "CR" => "enter",
-                                    "TAB" => "tab",
-                                    "BTAB" | "BACKTAB" => "btab",
-                                    "ESCAPE" | "ESC" => "esc",
-                                    "SPACE" => "space",
-                                    "BSPACE" | "BACKSPACE" => "backspace",
-                                    "UP" => "up",
-                                    "DOWN" => "down",
-                                    "RIGHT" => "right",
-                                    "LEFT" => "left",
-                                    "HOME" => "home",
-                                    "END" => "end",
-                                    "PAGEUP" | "PPAGE" => "pageup",
-                                    "PAGEDOWN" | "NPAGE" => "pagedown",
-                                    "DELETE" | "DC" => "delete",
-                                    "INSERT" | "IC" => "insert",
-                                    _ => "",
-                                };
-                                if !normalized.is_empty() {
-                                    send_key_to_active(&mut app, normalized)?;
-                                } else if key_upper.starts_with("C-") || key_upper.starts_with("M-") || (key_upper.starts_with("F") && key_upper.len() >= 2 && key_upper[1..].chars().all(|c| c.is_ascii_digit())) {
-                                    send_key_to_active(&mut app, &key.to_lowercase())?;
-                                } else {
-                                    // Plain text char — route through send_text_to_active (handles copy mode chars)
-                                    send_text_to_active(&mut app, key)?;
-                                }
-                            }
-                        }
-                    } else if literal {
-                        send_text_to_active(&mut app, &keys.join(""))?;
+                    send_keys::deliver_send_keys(&mut app, &keys, literal, send_keys::SendSink::Active)?;
+                    echo_pending_until = Some(Instant::now());
+                }
+                // The `-t %N` sends: resolved by pane id inside this one
+                // request, no temp focus (see CtrlReq::SendKeysToPane). The
+                // verdict goes back to the connection thread, so an unknown
+                // id is "can't find pane: %N" at the client with nothing typed
+                // anywhere — never a silent fallback to the active pane.
+                CtrlReq::SendKeysToPane { pane_id, keys, literal, resp } => {
+                    let verdict = if crate::tree::find_pane_by_id_global(&app, pane_id).is_none() {
+                        Err(format!("can't find pane: %{}", pane_id))
                     } else {
-                        // #490: `keys` holds the send-keys arguments as
-                        // separate tokens. A token either matches a named key
-                        // in its entirety or is typed verbatim with its
-                        // whitespace intact; a single separator space is
-                        // still inserted between adjacent PLAIN tokens for
-                        // backward compatibility with multi word scripts
-                        // (strict tmux would concatenate them).
-                        let parts: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                        for (i, key) in parts.iter().enumerate() {
-                            let key_upper = key.to_uppercase();
-                            let _is_special = matches!(key_upper.as_str(),
-                                "ENTER" | "RETURN" | "CR" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
-                                "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
-                                "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
-                                "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
-                            ) || key_upper.starts_with("C-") || key_upper.starts_with("M-") || key_upper.starts_with("S-");
-                            
-                            match key_upper.as_str() {
-                                "ENTER" | "RETURN" | "CR" => send_text_to_active(&mut app, "\r")?,
-                                "TAB" => send_text_to_active(&mut app, "\t")?,
-                                "BTAB" | "BACKTAB" => send_text_to_active(&mut app, "\x1b[Z")?,
-                                "ESCAPE" | "ESC" => send_text_to_active(&mut app, "\x1b")?,
-                                "SPACE" => send_text_to_active(&mut app, " ")?,
-                                "BSPACE" | "BACKSPACE" => send_text_to_active(&mut app, "\x7f")?,
-                                // DECCKM app-cursor mode: SS3, not CSI (see crate::input::csi_cursor_to_ss3).
-                                "UP" => send_key_to_active(&mut app, "up")?,
-                                "DOWN" => send_key_to_active(&mut app, "down")?,
-                                "RIGHT" => send_key_to_active(&mut app, "right")?,
-                                "LEFT" => send_key_to_active(&mut app, "left")?,
-                                "HOME" => send_key_to_active(&mut app, "home")?,
-                                "END" => send_key_to_active(&mut app, "end")?,
-                                "PAGEUP" | "PPAGE" => send_text_to_active(&mut app, "\x1b[5~")?,
-                                "PAGEDOWN" | "NPAGE" => send_text_to_active(&mut app, "\x1b[6~")?,
-                                "DELETE" | "DC" => send_text_to_active(&mut app, "\x1b[3~")?,
-                                "INSERT" | "IC" => send_text_to_active(&mut app, "\x1b[2~")?,
-                                "F1" => send_text_to_active(&mut app, "\x1bOP")?,
-                                "F2" => send_text_to_active(&mut app, "\x1bOQ")?,
-                                "F3" => send_text_to_active(&mut app, "\x1bOR")?,
-                                "F4" => send_text_to_active(&mut app, "\x1bOS")?,
-                                "F5" => send_text_to_active(&mut app, "\x1b[15~")?,
-                                "F6" => send_text_to_active(&mut app, "\x1b[17~")?,
-                                "F7" => send_text_to_active(&mut app, "\x1b[18~")?,
-                                "F8" => send_text_to_active(&mut app, "\x1b[19~")?,
-                                "F9" => send_text_to_active(&mut app, "\x1b[20~")?,
-                                "F10" => send_text_to_active(&mut app, "\x1b[21~")?,
-                                "F11" => send_text_to_active(&mut app, "\x1b[23~")?,
-                                "F12" => send_text_to_active(&mut app, "\x1b[24~")?,
-                                // Modifier + special key combos (C-Left, S-Right, C-M-Up, etc.)
-                                // must be checked BEFORE the generic C-x / M-x single-char handlers.
-                                s if crate::input::parse_modified_special_key(s).is_some() => {
-                                    let seq = crate::input::parse_modified_special_key(s).unwrap();
-                                    send_text_to_active(&mut app, &seq)?;
-                                }
-                                s if s.starts_with("C-M-") || s.starts_with("C-m-") => {
-                                    if let Some(c) = key.chars().nth(4) {
-                                        if let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) {
-                                            send_text_to_active(&mut app, &format!("\x1b{}", ctrl as char))?;
-                                        }
-                                    }
-                                }
-                                // Ctrl+Shift+<punctuation/digit> that collapses to a single
-                                // C0 byte, e.g. Ctrl+/ delivered by ConPTY terminals
-                                // (Alacritty, WezTerm) as "C-S--" (VK_OEM_MINUS + Ctrl +
-                                // Shift).  It must reach the child as 0x1f (^_), matching
-                                // Ctrl+_ and tmux, so neovim's Ctrl+/ comment toggle fires
-                                // (issue #394).  This MUST precede the generic C- arm below,
-                                // whose nth(2) extraction would otherwise read the 'S' and
-                                // mis-send Ctrl+S.
-                                s if (s.starts_with("C-S-") || s.starts_with("C-s-"))
-                                    && s.chars().count() == 5
-                                    && s.chars().nth(4).map_or(false, |c| !c.is_ascii_alphabetic()) =>
-                                {
-                                    if let Some(c) = s.chars().nth(4) {
-                                        if let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) {
-                                            send_text_to_active(&mut app, &String::from(ctrl as char))?;
-                                        }
-                                    }
-                                }
-                                s if s.starts_with("C-") => {
-                                    if let Some(c) = s.chars().nth(2) {
-                                        let Some(ctrl) = crate::input::ctrl_char_send_keys_byte(c) else { continue };
-                                        // On Windows with Win32 input mode, write the key as
-                                        // a Win32 input mode escape sequence so ConPTY generates
-                                        // a proper KEY_EVENT with VK + LEFT_CTRL_PRESSED (#305).
-                                        #[cfg(windows)]
-                                        {
-                                            if c.is_ascii_alphabetic() {
-                                                // Keep Ctrl+C on the legacy interrupt path:
-                                                // raw 0x03 + the interrupt router. The router
-                                                // runs BEFORE the byte: when it decides "raw
-                                                // 0x03 only" it may strip PROCESSED_INPUT from
-                                                // the pane console so conhost delivers the byte
-                                                // as input instead of converting it into a
-                                                // console-wide CTRL_C_EVENT that aborts a
-                                                // booting WSL launch (#579).
-                                                if ctrl == 0x03 {
-                                                    if let Some(win) = app.windows.get_mut(app.active_idx) {
-                                                        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                                                            if p.child_pid.is_none() {
-                                                                p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
-                                                            }
-                                                            if let Some(pid) = p.child_pid {
-                                                                crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
-                                                            }
-                                                        }
-                                                    }
-                                                    send_text_to_active(&mut app, &String::from(ctrl as char))?;
-                                                } else {
-                                                    let vk = crate::platform::mouse_inject::char_to_vk(c);
-                                                    let scan = crate::platform::mouse_inject::vk_to_scan(vk);
-                                                    let u_char = (c.to_ascii_lowercase() as u16) & 0x1F;
-                                                    const LEFT_CTRL_PRESSED: u32 = 0x0008;
-                                                    let seq = format!(
-                                                        "\x1b[{};{};{};1;{};1_\x1b[{};{};{};0;{};1_",
-                                                        vk, scan, u_char, LEFT_CTRL_PRESSED,
-                                                        vk, scan, u_char, LEFT_CTRL_PRESSED
-                                                    );
-                                                    send_text_to_active(&mut app, &seq)?;
-                                                }
-                                            } else {
-                                                send_text_to_active(&mut app, &String::from(ctrl as char))?;
-                                            }
-                                        }
-                                        #[cfg(not(windows))]
-                                        send_text_to_active(&mut app, &String::from(ctrl as char))?;
-                                    }
-                                }
-                                s if s.starts_with("M-") => {
-                                    if let Some(c) = key.chars().nth(2) {
-                                        send_text_to_active(&mut app, &format!("\x1b{}", c))?;
-                                    }
-                                }
-                                _ => {
-                                    // Plain token: typed VERBATIM (#490 — the
-                                    // token's own whitespace is untouched).
-                                    // Keep the historical single separator
-                                    // space between two adjacent plain tokens
-                                    // so existing multi word scripts like
-                                    // `send-keys echo hi Enter` keep working.
-                                    send_text_to_active(&mut app, key)?;
-                                    if i + 1 < parts.len() {
-                                        let next_upper = parts[i + 1].to_uppercase();
-                                        let next_is_special = matches!(next_upper.as_str(),
-                                            "ENTER" | "RETURN" | "CR" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
-                                            "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |
-                                            "PAGEUP" | "PPAGE" | "PAGEDOWN" | "NPAGE" | "DELETE" | "DC" | "INSERT" | "IC" |
-                                            "F1" | "F2" | "F3" | "F4" | "F5" | "F6" | "F7" | "F8" | "F9" | "F10" | "F11" | "F12"
-                                        ) || next_upper.starts_with("C-") || next_upper.starts_with("M-") || next_upper.starts_with("S-");
-                                        if !next_is_special {
-                                            send_text_to_active(&mut app, " ")?;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        send_keys::deliver_send_keys(&mut app, &keys, literal, send_keys::SendSink::Pane(pane_id))
+                            .map_err(|e| e.to_string())
+                    };
+                    if let Err(ref msg) = verdict {
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
                     }
                     echo_pending_until = Some(Instant::now());
+                    let _ = resp.send(verdict);
+                }
+                CtrlReq::SendPasteToPane { pane_id, text, resp } => {
+                    let verdict = crate::input::send_paste_to_pane_by_id(&mut app, pane_id, &text);
+                    if let Err(ref msg) = verdict {
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
+                    }
+                    echo_pending_until = Some(Instant::now());
+                    let _ = resp.send(verdict);
+                }
+                CtrlReq::SendTextToPane { pane_id, text, resp } => {
+                    let verdict = crate::input::send_text_to_pane_by_id(&mut app, pane_id, &text);
+                    if let Err(ref msg) = verdict {
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
+                    }
+                    echo_pending_until = Some(Instant::now());
+                    let _ = resp.send(verdict);
+                }
+                CtrlReq::SendKeyToPane { pane_id, key, resp } => {
+                    let verdict = crate::input::send_key_to_pane_by_id(&mut app, pane_id, &key);
+                    if let Err(ref msg) = verdict {
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
+                    }
+                    echo_pending_until = Some(Instant::now());
+                    let _ = resp.send(verdict);
+                }
+                CtrlReq::SendBytesToPane { pane_id, bytes, resp } => {
+                    let verdict = crate::input::send_bytes_to_pane_by_id(&mut app, pane_id, &bytes);
+                    if let Err(ref msg) = verdict {
+                        app.status_message = Some((msg.clone(), Instant::now(), None));
+                        state_dirty = true;
+                    }
+                    let _ = resp.send(verdict);
                 }
                 CtrlReq::SendKeysX(cmd) => {
                     // send-keys -X: dispatch copy-mode commands by name
