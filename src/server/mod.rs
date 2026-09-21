@@ -1584,6 +1584,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::PaneForwardExtract(..) => "PaneForwardExtract",
                         CtrlReq::PaneForwardInject { .. } => "PaneForwardInject",
                         CtrlReq::PaneForwardResize(..) => "PaneForwardResize",
+                        CtrlReq::PaneForwardFramed(..) => "PaneForwardFramed",
                         CtrlReq::PaneForwardStatus(..) => "PaneForwardStatus",
                         CtrlReq::PaneForwardKill(..) => "PaneForwardKill",
                         CtrlReq::MoveWindow { .. } => "MoveWindow",
@@ -3973,6 +3974,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             rows: fwd_rows, cols: fwd_cols, pixel_width: 0, pixel_height: 0,
                         });
                     }
+                }
+                CtrlReq::PaneForwardFramed(fwd_id, resp) => {
+                    let known = match app.forwarded_panes.get(&fwd_id) {
+                        Some(fp) => { fp.framed.store(true, std::sync::atomic::Ordering::SeqCst); true }
+                        None => false,
+                    };
+                    let _ = resp.send(if known { "OK".to_string() } else { "ERR".to_string() });
                 }
                 CtrlReq::PaneForwardStatus(fwd_id, resp) => {
                     let status = if let Some(fp) = app.forwarded_panes.get_mut(&fwd_id) {

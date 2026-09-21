@@ -56,6 +56,7 @@ impl PtySystem for ConPtySystem {
         const PIPE_BUF: u32 = 64 * 1024;
         let (stdin_read, stdin_write) = create_pipe_with_buffer(PIPE_BUF)?;
         let (stdout_read, stdout_write) = create_pipe_with_buffer(PIPE_BUF)?;
+        let input_probe = stdin_write.try_clone().ok();
 
         let con = PsuedoCon::new(
             COORD {
@@ -71,6 +72,7 @@ impl PtySystem for ConPtySystem {
                 con,
                 readable: stdout_read,
                 writable: Some(stdin_write),
+                input_probe,
                 size,
             })),
         };
@@ -90,6 +92,14 @@ struct Inner {
     con: PsuedoCon,
     readable: FileDescriptor,
     writable: Option<FileDescriptor>,
+    /// Our own handle on the write end of the input pipe, kept so
+    /// `try_clone_input_pending` can ask the pipe how many written bytes
+    /// conhost has not read yet.  Never written to.  It must be the write
+    /// end: a duplicate of the read end shares conhost's file object, and a
+    /// query on it waits behind conhost's blocking ReadFile until we write
+    /// something, which is a deadlock for a writer waiting for the pipe to
+    /// drain.
+    input_probe: Option<FileDescriptor>,
     size: PtySize,
 }
 
@@ -153,6 +163,11 @@ impl MasterPty for ConPtyMasterPty {
     fn conpty_passthrough_mode(&self) -> Option<bool> {
         Some(self.inner.lock().unwrap().con.used_passthrough)
     }
+
+    fn try_clone_input_pending(&self) -> Option<Box<dyn Fn() -> std::io::Result<usize> + Send>> {
+        let fd = self.inner.lock().unwrap().input_probe.as_ref()?.try_clone().ok()?;
+        Some(Box::new(move || pipe_pending_bytes(&fd)))
+    }
 }
 
 impl SlavePty for ConPtySlavePty {
@@ -176,6 +191,7 @@ impl SlavePty for ConPtySlavePty {
                 const PIPE_BUF: u32 = 64 * 1024;
                 let (stdin_read, stdin_write) = create_pipe_with_buffer(PIPE_BUF)?;
                 let (stdout_read, stdout_write) = create_pipe_with_buffer(PIPE_BUF)?;
+                let input_probe = stdin_write.try_clone().ok();
 
                 let new_con = PsuedoCon::new_without_passthrough(
                     COORD {
@@ -193,6 +209,7 @@ impl SlavePty for ConPtySlavePty {
                 inner.con = new_con;
                 inner.readable = stdout_read;
                 inner.writable = Some(stdin_write);
+                inner.input_probe = input_probe;
 
                 let child = inner.con.spawn_command(cmd)?;
                 Ok(Box::new(child))
@@ -200,6 +217,75 @@ impl SlavePty for ConPtySlavePty {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Bytes written to the pipe that the read side has not consumed yet, asked
+/// of the write end through `FilePipeLocalInformation`: the unread bytes are
+/// the inbound quota minus the write quota still available.  The write end
+/// is its own file object, so this never waits on the read side's ReadFile
+/// (see `Inner::input_probe`).
+fn pipe_pending_bytes(fd: &FileDescriptor) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: usize,
+        information: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FilePipeLocalInformation {
+        named_pipe_type: u32,
+        named_pipe_configuration: u32,
+        maximum_instances: u32,
+        current_instances: u32,
+        inbound_quota: u32,
+        read_data_available: u32,
+        outbound_quota: u32,
+        write_quota_available: u32,
+        named_pipe_state: u32,
+        named_pipe_end: u32,
+    }
+
+    const FILE_PIPE_LOCAL_INFORMATION: u32 = 24;
+    const FILE_PIPE_SERVER_END: u32 = 1;
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationFile(
+            file_handle: *mut std::ffi::c_void,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut std::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> i32;
+    }
+
+    let mut iosb = IoStatusBlock { status: 0, information: 0 };
+    let mut info = FilePipeLocalInformation::default();
+    let status = unsafe {
+        NtQueryInformationFile(
+            fd.as_raw_handle() as _,
+            &mut iosb,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<FilePipeLocalInformation>() as u32,
+            FILE_PIPE_LOCAL_INFORMATION,
+        )
+    };
+    if status < 0 {
+        return Err(std::io::Error::other(format!(
+            "NtQueryInformationFile(FilePipeLocalInformation) failed: NTSTATUS {status:#x}"
+        )));
+    }
+    // CreatePipe hands out the write end as the pipe's client, whose writes
+    // fill the inbound queue; a server-end write handle would fill outbound.
+    let (quota, available) = if info.named_pipe_end == FILE_PIPE_SERVER_END {
+        (info.outbound_quota, info.write_quota_available)
+    } else {
+        (info.inbound_quota, info.write_quota_available)
+    };
+    Ok(quota.saturating_sub(available) as usize)
 }
 
 /// Check if an error chain contains Windows ERROR_INVALID_PARAMETER (87).

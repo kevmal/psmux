@@ -111,6 +111,15 @@ pub trait MasterPty: Downcast + Send {
         None
     }
 
+    /// How many bytes the child side has not yet read from the input pipe, as
+    /// a probe the caller keeps and polls.  `None` when the platform cannot
+    /// tell (not ConPTY, or the pipe end is gone).  psmux paces its
+    /// escape-sequence writes on it: conhost reads that pipe 256 bytes at a
+    /// time and flushes a sequence cut by a read boundary as plain keys.
+    fn try_clone_input_pending(&self) -> Option<Box<dyn Fn() -> std::io::Result<usize> + Send>> {
+        None
+    }
+
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
     #[cfg(unix)]

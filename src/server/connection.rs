@@ -2273,6 +2273,19 @@ match cmd {
         let _ = write_stream.flush();
         if !persistent { break; }
     }
+    "pane-forward-framed" => {
+        // Usage: pane-forward-framed <forward_id>
+        // The target announces length-prefixed input frames before it
+        // connects the I/O stream; the source answers OK once the relay
+        // thread will decode them (crate::forward_frame).
+        let fwd_id: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(0);
+        let (rtx, rrx) = mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::PaneForwardFramed(fwd_id, rtx));
+        let resp = rrx.recv_timeout(std::time::Duration::from_millis(2000)).unwrap_or_else(|_| "ERR".to_string());
+        let _ = write!(write_stream, "{}\n", resp);
+        let _ = write_stream.flush();
+        if !persistent { break; }
+    }
     "pane-forward-status" => {
         // Usage: pane-forward-status <forward_id>
         let fwd_id: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(0);

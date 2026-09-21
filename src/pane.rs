@@ -95,6 +95,19 @@ pub fn spawn_pane_write_queue(
     Box::new(QueuedPaneWriter { tx })
 }
 
+/// The write queue for a ConPTY pane.  The raw writer first goes through
+/// `conpty_input`: scalars the inbox conhost would hand the child as
+/// Alt+numpad become win32-input records, and writes are paced on `probe` so
+/// conhost never cuts a sequence at its 256-byte read boundary.  Proxy panes
+/// keep the plain queue: their bytes reach a real pane on another server,
+/// which encodes for its own console.
+pub fn spawn_conpty_write_queue(
+    probe: Option<crate::conpty_input::PendingProbe>,
+    inner: Box<dyn std::io::Write + Send>,
+) -> Box<dyn std::io::Write + Send> {
+    spawn_pane_write_queue(crate::conpty_input::wrap_pane_writer(probe, inner))
+}
+
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
 /// Resolved once on first use, reused for all subsequent pane spawns.
 static CACHED_SHELL_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -549,7 +562,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-    let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
+    let mut pty_writer = spawn_conpty_write_queue(pair.master.try_clone_input_pending(), pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
@@ -627,7 +640,7 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id, child_pid);
-    let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
+    let mut pty_writer = spawn_conpty_write_queue(pair.master.try_clone_input_pending(), pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring })
@@ -685,7 +698,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
 
-    let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
+    let mut pty_writer = spawn_conpty_write_queue(pair.master.try_clone_input_pending(), pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
@@ -889,8 +902,8 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
-    let mut pty_writer = pair.master.take_writer()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let mut pty_writer = spawn_conpty_write_queue(pair.master.try_clone_input_pending(), pair.master.take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;

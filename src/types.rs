@@ -319,6 +319,10 @@ pub struct ForwardedPane {
     pub cols: u16,
     /// Handle to the forwarding threads (so we can abort on kill).
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the target has negotiated length-prefixed input frames
+    /// (`pane-forward-framed`); the relay thread then hands each frame to
+    /// the pane writer whole instead of each TCP read chunk.
+    pub framed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2099,6 +2103,9 @@ pub enum CtrlReq {
     },
     /// Resize a forwarded pane's real PTY. Fields: forward_id, rows, cols.
     PaneForwardResize(u64, u16, u16),
+    /// The target will send the forwarded pane's input as length-prefixed
+    /// frames. Fields: forward_id, response channel (`OK` or `ERR`).
+    PaneForwardFramed(u64, mpsc::Sender<String>),
     /// Query child status of a forwarded pane. Fields: forward_id, response channel.
     PaneForwardStatus(u64, mpsc::Sender<String>),
     /// Kill a forwarded pane's child process. Fields: forward_id.
