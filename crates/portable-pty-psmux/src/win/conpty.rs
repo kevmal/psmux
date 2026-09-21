@@ -274,10 +274,9 @@ fn pipe_pending_bytes(fd: &FileDescriptor) -> std::io::Result<usize> {
         )
     };
     if status < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("NtQueryInformationFile(FilePipeLocalInformation) failed: NTSTATUS {status:#x}"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "NtQueryInformationFile(FilePipeLocalInformation) failed: NTSTATUS {status:#x}"
+        )));
     }
     // CreatePipe hands out the write end as the pipe's client, whose writes
     // fill the inbound queue; a server-end write handle would fill outbound.
