@@ -902,7 +902,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
-    let mut pty_writer = crate::conpty_input::wrap_pane_writer(pair.master.try_clone_input_pending(), pair.master.take_writer()
+    let mut pty_writer = spawn_conpty_write_queue(pair.master.try_clone_input_pending(), pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);

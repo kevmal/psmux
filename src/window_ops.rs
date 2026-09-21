@@ -1953,6 +1953,7 @@ mod window_ops_tests {
             cols,
             id,
             None,
+            false,
         ).expect("create proxy pane")
     }
 

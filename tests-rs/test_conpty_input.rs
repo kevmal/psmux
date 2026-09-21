@@ -175,16 +175,25 @@ fn a_sequence_that_would_straddle_moves_whole_to_the_next_block() {
 }
 
 #[test]
-fn plain_text_splits_at_max_and_an_oversize_token_stands_alone() {
+fn plain_text_splits_at_max() {
     let buf = vec![b'a'; 1000];
     assert_eq!(split_blocks(&buf, 256), vec![0..256, 256..512, 512..768, 768..1000]);
+    assert!(split_blocks(b"", 256).is_empty());
+}
+
+#[test]
+fn an_oversize_control_string_is_cut_at_max_like_plain_text() {
+    // A 308-byte OSC cannot fit one conhost read, so pacing cannot keep it
+    // whole; it is cut at 256 and the remainder tokenized on its own. Every
+    // block still respects max, and every byte is still delivered.
     let mut buf = b"pre".to_vec();
     buf.extend_from_slice(b"\x1b]52;c;");
     buf.extend(std::iter::repeat(b'A').take(300));
     buf.extend_from_slice(b"\x07post");
     let blocks = split_blocks(&buf, 256);
-    assert_eq!(blocks, vec![0..3, 3..311, 311..315]);
-    assert!(split_blocks(b"", 256).is_empty());
+    assert_eq!(blocks, vec![0..3, 3..259, 259..315]);
+    assert!(blocks.iter().all(|r| r.len() <= 256));
+    assert_eq!(blocks.iter().map(|r| r.len()).sum::<usize>(), buf.len());
 }
 
 // ── paced writer against a fake pipe ───────────────────────────────────────
@@ -294,4 +303,55 @@ fn wait_drained_gives_up_after_the_cap_when_the_pipe_never_empties() {
     assert!(waited < DRAIN_WAIT_MAX * 4, "{waited:?}");
     let broken: PendingProbe = Box::new(|| Err(std::io::Error::other("gone")));
     assert!(!wait_drained(&broken));
+}
+
+#[test]
+fn a_held_tail_that_turns_out_invalid_goes_out_raw_ahead_of_the_new_data() {
+    let mut e = Win32InputEncoder::new();
+    let mut out = Vec::new();
+    e.encode(b"x\xe2\x80", &mut out);
+    assert_eq!(out, b"x".to_vec());
+    assert_eq!(e.pending(), b"\xe2\x80");
+    e.encode(b"A", &mut out);
+    assert_eq!(out, b"x\xe2\x80A".to_vec());
+    assert!(e.pending().is_empty());
+}
+
+#[test]
+fn a_write_ending_inside_an_escape_sequence_is_written_as_is() {
+    // A write is whole tokens by contract (local routes write whole units,
+    // forwarded input arrives framed), so nothing is held back: a lone ESC at
+    // the end of a write is the Escape key and must go out at once.
+    let pipe = FakePipe::default();
+    let mut w = ConptyInputWriter::new(Some(pipe.probe()), pipe.clone());
+    w.write(b"\x1b").unwrap();
+    w.write(b"\x1b[").unwrap();
+    w.write(b"A").unwrap();
+    assert_eq!(pipe.writes(), vec![b"\x1b".to_vec(), b"\x1b[".to_vec(), b"A".to_vec()]);
+}
+
+#[test]
+fn every_conpty_pane_writer_goes_through_the_async_queue() {
+    // The paced writer waits on the pipe (up to DRAIN_WAIT_MAX per escape
+    // block); that wait belongs on the pane-writer thread, never on the
+    // server loop. Only spawn_conpty_write_queue may wrap a ConPTY writer,
+    // and no site may take a ConPTY writer without going through it.
+    let pane = include_str!("../src/pane.rs");
+    assert_eq!(pane.matches("wrap_pane_writer(").count(), 1, "pane.rs wraps only inside spawn_conpty_write_queue");
+    let others = [
+        ("popup.rs", include_str!("../src/popup.rs")),
+        ("window_ops.rs", include_str!("../src/window_ops.rs")),
+        ("cross_session_server.rs", include_str!("../src/cross_session_server.rs")),
+        ("server/mod.rs", include_str!("../src/server/mod.rs")),
+    ];
+    for (name, src) in others {
+        assert_eq!(src.matches("wrap_pane_writer(").count(), 0, "{name} must use spawn_conpty_write_queue");
+    }
+    for (name, src) in [("pane.rs", pane), others[0], others[1]] {
+        for line in src.lines() {
+            if line.contains("pair.master.take_writer()") {
+                assert!(line.contains("spawn_conpty_write_queue("), "{name}: a ConPTY writer taken outside the queue: {line}");
+            }
+        }
+    }
 }

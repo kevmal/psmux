@@ -122,6 +122,8 @@ pub fn handle_pane_forward_extract(
     // to the detached local parser; the snapshot already covers the visible
     // screen at extract time.
     let sd_clone = shutdown.clone();
+    let framed = Arc::new(AtomicBool::new(false));
+    let framed_relay = framed.clone();
     std::thread::spawn(move || {
         // Accept one connection for I/O forwarding
         if let Ok((stream, _)) = listener.accept() {
@@ -137,16 +139,33 @@ pub fn handle_pane_forward_extract(
                 Err(_) => return,
             }
             // Writer: TCP -> PTY input (same 64K buffer as the reader side for
-            // symmetric throughput)
+            // symmetric throughput). A target that negotiated framing
+            // (`pane-forward-framed`, always before it connects) sends
+            // length-prefixed frames, and each frame reaches the pane writer
+            // whole; TCP chunk boundaries never split a sequence. Without
+            // the negotiation the raw chunks are passed on as before.
             let mut tcp_reader = stream;
             let mut pty_writer = pty_writer;
             let mut buf = [0u8; 65536];
+            let mut decoder = crate::forward_frame::FrameDecoder::new();
             loop {
                 if sd_clone.load(std::sync::atomic::Ordering::Relaxed) { break; }
                 match tcp_reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if pty_writer.write_all(&buf[..n]).is_err() { break; }
+                        if framed_relay.load(std::sync::atomic::Ordering::SeqCst) {
+                            let frames = match decoder.feed(&buf[..n]) {
+                                Ok(f) => f,
+                                Err(_) => break,
+                            };
+                            let mut failed = false;
+                            for frame in frames {
+                                if pty_writer.write_all(&frame).is_err() { failed = true; break; }
+                            }
+                            if failed { break; }
+                        } else if pty_writer.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
                         let _ = pty_writer.flush();
                     }
                     Err(_) => break,
@@ -168,6 +187,7 @@ pub fn handle_pane_forward_extract(
         rows,
         cols,
         shutdown,
+        framed,
     });
     // Send response
     let title_wire = title.replace(' ', "\x01");
@@ -200,6 +220,11 @@ pub fn handle_pane_forward_inject(
     target_pane: Option<usize>,
     horizontal: bool,
 ) {
+    // Ask the source to take this pane's input as length-prefixed frames.
+    // Must precede the I/O connect so the relay thread never sees a raw
+    // byte from us; a source that does not know the command answers nothing
+    // and keeps the raw stream.
+    let framed = crate::proxy_pane::negotiate_framed_input(&source_addr, &source_key, forward_id);
     // Connect to the forwarding listener on the source session
     let fwd_addr = format!("127.0.0.1:{}", fwd_port);
     let stream = match TcpStream::connect(&fwd_addr) {
@@ -251,6 +276,7 @@ pub fn handle_pane_forward_inject(
         cols,
         pane_id,
         screen_snapshot,
+        framed,
     ) {
         Ok(p) => p,
         Err(e) => {

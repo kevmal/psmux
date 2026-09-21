@@ -47,11 +47,34 @@
 //! it must not touch the read end, whose file object conhost's blocking
 //! ReadFile holds.
 //!
-//! The writer sits inside the pane writer (`pane::spawn_pane_write_queue`),
-//! so every route into a pane gets both: `send-keys`, `send-paste`,
-//! `send-text`, keys typed at an attached client, and the bracketed-paste
-//! chunks of `write_paste_chunked`.  A multi-byte sequence split across two
-//! writes is held until its tail arrives.
+//! That guarantee holds for tokens of at most 256 bytes, which covers every
+//! sequence psmux writes (the longest, a win32-input record, is 17).  A
+//! control string longer than one read — an OSC or DCS carrying a payload,
+//! or an unterminated `ESC ]` swallowing the rest of a paste — cannot be
+//! protected by pacing: [`split_blocks`] cuts it at 256 bytes like plain
+//! text, the first piece goes out after a drain wait, and conhost cuts it
+//! exactly as it always has.  No psmux path writes such a string into a
+//! pane; one can only arrive from outside (`send-keys -H`, pasted bytes).
+//!
+//! # What a write is
+//!
+//! Each write is taken as whole tokens.  The writer does not hold back an
+//! escape sequence that a write ends inside, because a write ending in a
+//! lone ESC is the Escape key and must go out at once.  Every route into a
+//! pane writes whole units — a key, a `send-keys` string, a paste chunk of
+//! `write_paste_chunked` — and a pane forwarded from another session gets
+//! its input as frames of exactly those units (`forward_frame`), so a TCP
+//! chunk boundary cannot split one.  The one thing held back is a trailing
+//! incomplete UTF-8 sequence, which `write_paste_chunked`'s 512-byte cuts
+//! do produce: it is kept until the next write completes it, or shows it
+//! invalid, in which case the held bytes go out raw ahead of the new data.
+//! `flush` does not release it, and nothing releases it if no write ever
+//! follows.
+//!
+//! The writer sits inside the pane write queue (`pane::spawn_conpty_write_queue`),
+//! so every route into a ConPTY pane gets both: `send-keys`, `send-paste`,
+//! `send-text`, keys typed at an attached client, bracketed-paste chunks,
+//! and framed input from a forwarding target.
 
 use std::io::Write;
 use std::sync::OnceLock;
@@ -104,7 +127,7 @@ pub fn win32_input_enabled() -> bool {
             return false;
         }
         crate::ssh_input::windows_build_number()
-            .map_or(false, |b| b >= CONPTY_WIN32_INPUT_MIN_BUILD)
+            .is_some_and(|b| b >= CONPTY_WIN32_INPUT_MIN_BUILD)
     })
 }
 
@@ -195,7 +218,8 @@ impl Win32InputEncoder {
 /// through its final byte, a string sequence through BEL or ST, SS3 plus its
 /// byte, or ESC plus one byte), a whole UTF-8 sequence, or one byte.  A
 /// sequence the buffer ends inside runs to the end of the buffer; an ESC met
-/// inside another sequence starts a new token.
+/// inside another sequence starts a new token.  Unbounded: [`split_blocks`]
+/// caps what it takes of an oversize token.
 pub fn token_len(buf: &[u8], i: usize) -> usize {
     let rest = buf.len() - i;
     let b = buf[i];
@@ -238,13 +262,15 @@ pub fn token_len(buf: &[u8], i: usize) -> usize {
 }
 
 /// Cuts `buf` into blocks of at most `max` bytes whose boundaries fall only
-/// between tokens.  A single token longer than `max` is its own block.
+/// between tokens.  A token longer than `max` cannot be kept whole in one
+/// conhost read whatever we do, so it is cut at `max` like plain text and
+/// the rest is tokenized on its own; see the module docs.
 pub fn split_blocks(buf: &[u8], max: usize) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut i = 0;
     while i < buf.len() {
-        let n = token_len(buf, i);
+        let n = token_len(buf, i).min(max.max(1));
         if i > start && i + n - start > max {
             out.push(start..i);
             start = i;

@@ -33,6 +33,9 @@ pub struct ProxyMasterPty {
     source_session: String,
     forward_id: u64,
     size: Arc<Mutex<PtySize>>,
+    /// Input goes out as length-prefixed frames (negotiated with the
+    /// source; see `crate::forward_frame`).
+    framed: bool,
 }
 
 impl ProxyMasterPty {
@@ -45,6 +48,7 @@ impl ProxyMasterPty {
         forward_id: u64,
         rows: u16,
         cols: u16,
+        framed: bool,
     ) -> Self {
         Self {
             reader_stream: Arc::new(Mutex::new(reader)),
@@ -54,8 +58,66 @@ impl ProxyMasterPty {
             source_session,
             forward_id,
             size: Arc::new(Mutex::new(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })),
+            framed,
         }
     }
+}
+
+/// The input writer for a forwarded pane: the raw stream, or every write as
+/// one frame when the source agreed to decode them.
+pub fn input_writer(stream: TcpStream, framed: bool) -> Box<dyn Write + Send> {
+    if framed {
+        Box::new(crate::forward_frame::FrameWriter::new(stream))
+    } else {
+        Box::new(stream)
+    }
+}
+
+/// One request on the source session's control connection: `AUTH`, the
+/// command, and the raw text it answers within the read timeout.
+pub fn control_request_raw(control_addr: &str, control_key: &str, cmd: &str) -> io::Result<String> {
+    let msg = format!("AUTH {}\n{}\n", control_key, cmd);
+    let addr: std::net::SocketAddr = control_addr.parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
+    let _ = s.set_nodelay(true);
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    s.write_all(msg.as_bytes())?;
+    s.flush()?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match s.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                   || e.kind() == io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// `control_request_raw` with a leading `OK\n` stripped, the shape the
+/// child-status and kill commands expect.
+pub fn control_request(control_addr: &str, control_key: &str, cmd: &str) -> io::Result<String> {
+    let r = control_request_raw(control_addr, control_key, cmd)?;
+    Ok(r.strip_prefix("OK\n").map_or_else(|| r.clone(), str::to_string))
+}
+
+/// Asks the source to decode this pane's input as frames.  True only on an
+/// explicit `OK` line: an older source does not know the command and
+/// answers nothing, so its input stays raw.
+pub fn negotiate_framed_input(control_addr: &str, control_key: &str, forward_id: u64) -> bool {
+    match control_request_raw(control_addr, control_key, &format!("pane-forward-framed {}", forward_id)) {
+        Ok(r) => framed_reply_accepted(&r),
+        Err(_) => false,
+    }
+}
+
+/// Only the source's explicit `OK` enables framing.
+pub fn framed_reply_accepted(raw_reply: &str) -> bool {
+    raw_reply.trim() == "OK"
 }
 
 impl MasterPty for ProxyMasterPty {
@@ -95,8 +157,9 @@ impl MasterPty for ProxyMasterPty {
     fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
         let mut guard = self.writer_stream.lock()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let framed = self.framed;
         guard.take()
-            .map(|s| -> Box<dyn Write + Send> { Box::new(s) })
+            .map(|s| input_writer(s, framed))
             .ok_or_else(|| anyhow::anyhow!("writer already taken"))
     }
 
@@ -136,27 +199,7 @@ impl ProxyChild {
     }
 
     fn send_control(&self, cmd: &str) -> io::Result<String> {
-        let msg = format!("AUTH {}\n{}\n", self.control_key, cmd);
-        let addr: std::net::SocketAddr = self.control_addr.parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", e)))?;
-        let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(200))?;
-        let _ = s.set_nodelay(true);
-        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-        s.write_all(msg.as_bytes())?;
-        s.flush()?;
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 1024];
-        loop {
-            match s.read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                       || e.kind() == io::ErrorKind::TimedOut => break,
-                Err(_) => break,
-            }
-        }
-        let r = String::from_utf8_lossy(&buf).to_string();
-        Ok(if r.starts_with("OK\n") { r[3..].to_string() } else { r })
+        control_request(&self.control_addr, &self.control_key, cmd)
     }
 }
 
@@ -246,10 +289,11 @@ pub fn create_proxy_pane(
     cols: u16,
     pane_id: usize,
     screen_snapshot: Option<Vec<u8>>,
+    framed: bool,
 ) -> io::Result<crate::types::Pane> {
     let proxy_master = ProxyMasterPty::new(
         reader, writer.try_clone()?, control_addr.clone(),
-        control_key.clone(), source_session, forward_id, rows, cols,
+        control_key.clone(), source_session, forward_id, rows, cols, framed,
     );
     let proxy_child = ProxyChild::new(control_addr, control_key, forward_id, pid);
     let term = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000)));
@@ -262,7 +306,7 @@ pub fn create_proxy_pane(
     let epoch = Instant::now() - Duration::from_secs(2);
     Ok(crate::types::Pane {
         master: Box::new(proxy_master),
-        writer: crate::pane::spawn_pane_write_queue(Box::new(writer)),
+        writer: crate::pane::spawn_pane_write_queue(input_writer(writer, framed)),
         child: Box::new(proxy_child),
         term,
         last_rows: rows,
