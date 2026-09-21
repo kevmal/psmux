@@ -15,6 +15,7 @@ mod rendering;
 mod config;
 mod commands;
 mod pane;
+mod conpty_input;
 mod warm_pane_sync;
 mod popup;
 mod clipboard;
