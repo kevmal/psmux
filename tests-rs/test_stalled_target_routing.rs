@@ -335,6 +335,39 @@ fn multi_target_requests_preserve_the_original_implicit_source() {
 }
 
 #[test]
+fn in_server_relative_pane_refusals_precede_process_or_option_mutation() {
+    let mut a = app();
+    for command in ["respawn-pane -k -t s:.+", "set-option -p -t s:.- @probe WRONG",
+        "swap-pane -s s:.+ -t s:%4", "join-pane -s s:.- -t s:%4"] {
+        let before = active(&a);
+        let count = crate::tree::count_panes(&a.windows[0].root);
+        let error = crate::commands::execute_command_string(&mut a, command).unwrap_err();
+        assert!(error.to_string().contains("unsupported relative or symbolic pane target"));
+        assert_eq!(active(&a), before);
+        assert_eq!(crate::tree::count_panes(&a.windows[0].root), count);
+    }
+}
+
+#[test]
+fn select_pane_relative_targets_resolve_once_to_stable_ids() {
+    let mut a = app();
+    for (raw, expected) in [("s:.+", 2), ("s:.-", 3), ("s:@10.+", 2), ("s:main.-", 3), ("s:+.+", 4)] {
+        let resolved = resolve_relative_pane_target(&a, raw).unwrap();
+        assert_eq!(resolved.pane, Some(expected), "{raw}");
+        assert!(resolved.pane_is_id);
+        assert_eq!(active(&a), (0, 1));
+        let id = crate::commands::resolve_in_server_target(&a, crate::commands::InServerTarget::Pane, raw).unwrap();
+        assert_eq!(id, Some(format!("%{expected}")));
+    }
+    assert!(resolve_relative_pane_target(&a, "other:.+").is_err());
+    assert!(resolve_relative_pane_target(&a, "s:missing.+").is_err());
+    // Local execution has no normalization round trip, so it must refuse.
+    assert!(crate::commands::execute_command_string(&mut a, "select-pane -t s:.+").is_err());
+    assert!(crate::commands::execute_command_string(&mut a, "select-pane -dt s:.-").is_err());
+    assert_eq!(active(&a), (0, 1));
+}
+
+#[test]
 fn raw_window_targets_resolve_to_owning_stable_ids_without_focus_changes() {
     let a = named("work", Some("window_unit"), 7);
     let win = &a.windows[1];

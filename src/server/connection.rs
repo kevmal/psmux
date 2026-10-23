@@ -505,22 +505,26 @@ fn bare_target_rewrite(
     args: &[&str],
     tx: &mpsc::Sender<CtrlReq>,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(kind) = crate::commands::in_server_target_kind(cmd) else { return Ok(None) };
     let end = crate::cli::outer_target_scan_end(cmd, args).min(args.len());
     let Some(i) = args[..end].iter().position(|a| *a == "-t") else { return Ok(None) };
     let Some(t) = args.get(i + 1) else { return Ok(None) };
-    if !crate::cli::bare_target_token(t) {
+    let relative = crate::cli::relative_select_pane_target(cmd, t);
+    let kind = if relative { crate::commands::InServerTarget::Pane }
+        else if let Some(kind) = crate::commands::in_server_target_kind(cmd) { kind }
+        else { return Ok(None) };
+    if !relative && !crate::cli::bare_target_token(t) {
         return Ok(None);
     }
     let (s, r) = mpsc::channel();
     if tx.send(CtrlReq::ResolveTarget { kind, spec: t.to_string(), resp: s }).is_err() {
-        return Ok(None);
+        return if relative { Err("server disconnected before pane resolution".into()) } else { Ok(None) };
     }
     match r.recv_timeout(Duration::from_secs(60)) {
         Ok(Ok(Some(id))) => Ok(Some(args.iter().enumerate()
             .map(|(j, a)| if j == i + 1 { id.clone() } else { a.to_string() })
             .collect())),
         Ok(Err(e)) => Err(e),
+        _ if relative => Err("relative pane target did not resolve".into()),
         _ => Ok(None),
     }
 }
@@ -2668,6 +2672,8 @@ if control_echo || control_quiet || control_noecho {
                 })
             })
             .or(ctrl_target_err);
+        focus_err = focus_err.or_else(|| crate::cli::pane_selector_error(
+            cmd_name, &cmd_args, ctrl_raw_target.as_deref()));
         if focus_err.is_none() {
             if let Some(ref raw) = ctrl_raw_target {
                 let window = targets_existing_window(cmd_name, &filtered_args);
@@ -3142,8 +3148,9 @@ if persistent && client_readonly && !readonly_client_may_run(cmd) {
 // same treatment, as the command's own `-t`.
 let target_line_args: Vec<&str>;
 let probe_args: &[&str] = match global_raw_target.as_deref() {
-    Some(g) if crate::cli::bare_target_token(g)
-        && crate::commands::in_server_target_kind(cmd).is_some()
+    Some(g) if ((crate::cli::bare_target_token(g)
+        && crate::commands::in_server_target_kind(cmd).is_some())
+        || crate::cli::relative_select_pane_target(cmd, g))
         && !args[..crate::cli::outer_target_scan_end(cmd, &args).min(args.len())].contains(&"-t") =>
     {
         target_line_args = ["-t", g].into_iter().chain(args.iter().copied()).collect();
@@ -3232,6 +3239,13 @@ let args = if set_option_command {
 } else {
     without_outer_target(cmd, &args)
 };
+if let Some(error) = crate::cli::pane_selector_error(cmd, &args, raw_target.as_deref()) {
+    let _ = writeln!(write_stream, "ERROR: {}", error);
+    let _ = write_stream.flush();
+    if !persistent { break; }
+    line.clear();
+    continue;
+}
 if set_option_command {
     let parsed_set = parse_set_option_args(&args);
     let window_command = matches!(cmd, "set-window-option" | "setw");
@@ -6904,6 +6918,18 @@ fn dispatch_control_command(
     client_id: u64,
     target_failed: bool,
 ) -> bool {
+    // Nested if-shell/control dispatch must obey the same guard as ingress.
+    // The outer connection normalizes supported select-pane relative targets
+    // to %id before dispatch. A nested path without that normalization fails
+    // closed instead of applying a relative operation to the current pane.
+    if raw_target.is_some_and(|target| crate::cli::relative_select_pane_target(cmd, target)) {
+        let _ = resp_tx.send("\u{0001}ERR\u{0001}unsupported relative or symbolic pane target in nested dispatch".into());
+        return true;
+    }
+    if let Some(error) = crate::cli::pane_selector_error(cmd, args, raw_target) {
+        let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error));
+        return true;
+    }
     match cmd {
         "list-windows" | "lsw" => {
             let format_str = extract_flag_value(&args, "-F");
@@ -8564,6 +8590,29 @@ fn dispatch_control_command(
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue793_followup.rs"]
 mod tests_issue793_followup;
+
+#[cfg(test)]
+mod tests_pane_selector_dispatch {
+    use super::*;
+
+    #[test]
+    fn nested_dispatch_refuses_relative_panes_without_sending_any_request() {
+        for (command, args) in [("respawn-pane", vec!["-k"]),
+            ("set-option", vec!["-p", "@probe", "WRONG"]),
+            ("select-pane", vec![]), ("send-keys", vec!["-l", "WRONG"]),
+            ("resize-pane", vec!["-R"]), ("capture-pane", vec!["-p"]),
+            ("pipe-pane", vec![]), ("display-message", vec!["-p"]),
+            ("swap-pane", vec![]), ("join-pane", vec![])] {
+            let (tx, rx) = mpsc::channel();
+            let sender = TargetedSender::new(&tx, None);
+            let (reply, received) = mpsc::channel();
+            assert!(dispatch_control_command(command, &args, &sender, reply,
+                None, false, Some("s:.+"), 0, false));
+            assert!(received.recv().unwrap().starts_with("\u{0001}ERR\u{0001}unsupported relative or symbolic pane target"));
+            assert!(rx.try_recv().is_err(), "{command} sent a request before refusal");
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue476_bindkey_quoting.rs"]

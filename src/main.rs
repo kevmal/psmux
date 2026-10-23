@@ -1534,6 +1534,13 @@ fn run_main() -> io::Result<()> {
     
     let cmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
 
+    let pane_guard_args: Vec<&str> = cmd_args.iter().skip(1).map(|arg| arg.as_str()).collect();
+    if let Some(error) = crate::cli::pane_selector_error(cmd, &pane_guard_args,
+        std::env::var("PSMUX_TARGET_FULL").ok().as_deref()) {
+        eprintln!("psmux: {}", error);
+        std::process::exit(1);
+    }
+
     // Issue #545: commands that operate on an EXISTING window/pane must fail
     // loudly (nonzero exit + stderr, tmux parity) when the -t target does not
     // resolve, instead of the server-side temp focus silently no-opping and

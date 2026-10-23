@@ -131,8 +131,8 @@ class RelativeTargets(Contract):
             assert self.active(session) == windows[destination], (route, spec, self.active(session))
             self.cases.append(dict(route=route, command="rename/options/select", target=spec, ok=True))
 
-        # A relative pane operation must advance once, without a target-focus
-        # wrapper advancing it first. Repeat with both CLI argument and wire paths.
+        # Supported select-pane +/- forms resolve once to a stable pane id;
+        # commands without a relative-pane resolver must refuse the syntax.
         self.focus(session, windows, 0)
         panes = self.run("list-panes", "-t", f"{session}:{windows[0]}", "-F", "#{pane_id}").stdout.splitlines()
         assert len(panes) == 3
@@ -141,7 +141,7 @@ class RelativeTargets(Contract):
             self.invoke(route, session, "select-pane", spec)
             actual = self.run("display-message", "-p", "-t", session + ":", "#{pane_id}").stdout.strip()
             assert actual == panes[wanted], (route, spec, actual, panes)
-            self.cases.append(dict(route=route, command="select-pane", target=spec, ok=True))
+            self.cases.append(dict(route=route, command="select-pane resolves relative pane once", target=spec, ok=True))
             # kill-pane has no relative-pane resolver. It must reject this
             # syntax, rather than drop +/- and kill the currently active pane.
             before = self.run("list-panes", "-s", "-t", session + ":", "-F",

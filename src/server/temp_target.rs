@@ -30,6 +30,31 @@ pub(crate) fn resolve_window_command_target(app: &AppState, raw: &str) -> Result
     Ok(TempTarget { win: Some(app.windows[pos].id), win_is_id: true, ..Default::default() })
 }
 
+/// Resolve select-pane's supported +/- suffix once, without moving focus.
+/// The request later carries the returned stable pane id, never this syntax.
+pub(crate) fn resolve_relative_pane_target(app: &AppState, raw: &str) -> Result<TempTarget, String> {
+    let raw = crate::cli::strip_exact_match_prefix(raw);
+    let (session, body) = raw.split_once(':').map(|(s, b)| (Some(s), b)).unwrap_or((None, raw));
+    if let Some(session) = session.filter(|s| !s.is_empty()) {
+        if !session_names_this_server(app, session) { return Err(format!("can't find session: {}", session)); }
+    }
+    let (window, relative) = body.rsplit_once('.').unwrap_or(("", body));
+    if !matches!(relative, "+" | "-") { return Err(format!("can't find pane: {}", raw)); }
+    let pos = app.resolve_window_spec(window, false)?.pos()
+        .filter(|pos| *pos < app.windows.len()).ok_or_else(|| format!("can't find window: {}", window))?;
+    let win = &app.windows[pos];
+    let mut panes: Vec<usize> = crate::tree::pane_paths(&win.root).iter()
+        .filter_map(|path| crate::tree::get_active_pane_id_at_path(&win.root, path)).collect();
+    panes.extend(win.floating.iter().map(|pane| pane.id));
+    let current = win.floating_focus.and_then(|index| win.floating.get(index)).map(|pane| pane.id)
+        .or_else(|| crate::tree::get_active_pane_id_at_path(&win.root, &win.active_path));
+    let current = current.and_then(|id| panes.iter().position(|pane| *pane == id))
+        .ok_or_else(|| format!("can't find pane: {}", raw))?;
+    let next = if relative == "+" { (current + 1) % panes.len() }
+        else { (current + panes.len() - 1) % panes.len() };
+    Ok(TempTarget { win: Some(win.id), win_is_id: true, pane: Some(panes[next]), pane_is_id: true, ..Default::default() })
+}
+
 /// Resolve `t` against the current state.  Ok carries the same target in
 /// stable id form (`TempTarget::is_resolved`); Err carries tmux's message.
 pub(crate) fn resolve_temp_target(app: &AppState, t: &TempTarget) -> Result<TempTarget, String> {

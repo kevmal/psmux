@@ -192,6 +192,153 @@ pub fn args_template(command: &str) -> Option<&'static str> {
     args_entry(command).map(|(_, _, template)| *template)
 }
 
+pub(crate) fn relative_select_pane_target(command: &str, target: &str) -> bool {
+    let command = args_entry(command).map(|entry| entry.0).unwrap_or(command);
+    if command != "select-pane" { return false; }
+    let body = target.split_once(':').map(|(_, body)| body).unwrap_or(target);
+    let pane = body.rsplit_once('.').map(|(_, pane)| pane).unwrap_or(body);
+    matches!(pane, "+" | "-")
+}
+
+/// Reject pane selectors that the legacy numeric parser would discard.
+/// This guard is shared by CLI, TCP/control and in-server command ingress:
+/// an unsupported relative/symbolic pane must never become the current pane.
+/// Window-only targets deliberately keep their own complete window resolver.
+pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target: Option<&str>) -> Option<String> {
+    let command = args_entry(command).map(|entry| entry.0).unwrap_or_else(|| canonical_command(command));
+    let template = args_template(command).unwrap_or("");
+    let extra = psmux_extra_flags(command);
+    let mut flags = String::new();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    // Respect getopt's value boundaries, attached values and --. A -t in a
+    // shell command, option value, title or separator is data, not a target.
+    while let Some(token) = args.get(i).copied() {
+        if token == "--" || token == "-" || !token.starts_with('-') { break; }
+        i += 1;
+        for (offset, flag) in token.char_indices().skip(1) {
+            flags.push(flag);
+            let kind = match flag_value_kind(template, flag) {
+                FlagValue::None if template.is_empty() && token == "-t" && flag == 't' => FlagValue::Required,
+                FlagValue::None => flag_value_kind(extra, flag),
+                kind => kind,
+            };
+            if kind == FlagValue::None { continue; }
+            let attached = &token[offset + flag.len_utf8()..];
+            let value = if !attached.is_empty() {
+                Some(attached)
+            } else if let Some(next) = args.get(i).copied() {
+                if kind == FlagValue::Optional && looks_like_another_flag(next) { None }
+                else { i += 1; Some(next) }
+            } else { None };
+            if matches!(flag, 't' | 's') {
+                if let Some(value) = value { targets.push((flag, value)); }
+            }
+            break;
+        }
+    }
+    let pane_command = matches!(command,
+        "capture-pane" | "clear-history" | "clock-mode" | "copy-mode"
+        | "display-message" | "join-pane" | "kill-pane" | "last-pane"
+        | "move-pane" | "new-pane" | "paste-buffer" | "pipe-pane"
+        | "resize-pane" | "respawn-pane" | "select-pane" | "send-keys"
+        | "send-prefix" | "split-window" | "swap-pane" | "zoom-pane"
+        | "run-shell" | "if-shell" | "source-file"
+        | "send-text" | "send-paste" | "send-key" | "send-key-events"
+        | "choose-buffer" | "choose-tree" | "choose-window" | "choose-session"
+        | "find-window" | "customize-mode" | "switch-mode" | "display-menu"
+        | "set-pane-title" | "focus-pane" | "paste-buffer-at" | "paste-buffer-named"
+        | "scroll-up" | "scroll-down" | "pane-scroll" | "pane-mouse"
+        | "mouse-down" | "mouse-down-right" | "mouse-down-middle" | "mouse-drag"
+        | "mouse-up" | "mouse-up-right" | "mouse-up-middle" | "mouse-move"
+        | "copy-drag-begin" | "mouse-key" | "mouse-forward"
+        | "copy-mode-page-up" | "copy-enter" | "copy-move" | "copy-anchor"
+        | "rectangle-toggle" | "copy-yank" | "focus-in" | "focus-out")
+        || (matches!(command, "set-option" | "show-options" | "set-hook" | "show-hooks") && flags.contains('p'));
+    let pane_source = matches!(command, "join-pane" | "move-pane" | "swap-pane" | "break-pane" | "copy-mode");
+    let explicit_target = targets.iter().any(|(flag, _)| *flag == 't');
+    if pane_command && !explicit_target {
+        if let Some(target) = fallback_target { targets.push(('t', target)); }
+    }
+    targets.into_iter().find_map(|(flag, target)| {
+        if !(flag == 't' && pane_command || flag == 's' && pane_source) { return None; }
+        // select-pane's +/- forms are normalized to a stable %id before
+        // dispatch; this preserves the built-in prefix-o pane cycle.
+        if flag == 't' && relative_select_pane_target(command, target) { return None; }
+        let body = target.split_once(':').map(|(_, body)| body).unwrap_or(target);
+        let selector = body.rsplit_once('.').map(|(_, pane)| pane).unwrap_or(body);
+        if selector.starts_with(['+', '-', '{']) || matches!(selector, "!" | "~" | "=") {
+            Some(format!("unsupported relative or symbolic pane target: {} (use an explicit pane id)", target))
+        } else { None }
+    })
+}
+
+#[cfg(test)]
+mod tests_pane_selector_guard {
+    use super::pane_selector_error;
+
+    #[test]
+    fn every_pane_command_and_alias_rejects_relative_targets() {
+        for cmd in ["respawn-pane", "respawnp", "resp", "kill-pane", "killp",
+            "set-option", "set", "show-options", "show-option", "show",
+            "select-pane", "selectp", "last-pane", "lastp", "resize-pane", "resizep",
+            "send-keys", "send", "send-key", "send-prefix", "send-text", "send-paste",
+            "capture-pane", "capturep", "pipe-pane", "pipep", "display-message", "display",
+            "swap-pane", "swapp", "join-pane", "joinp", "move-pane", "movep",
+            "split-window", "splitw", "split-pane", "splitp", "new-pane", "newp",
+            "clear-history", "clearhist", "clock-mode", "copy-mode", "paste-buffer", "pasteb",
+            "zoom-pane", "run-shell", "run", "if-shell", "if", "source-file", "source",
+            "set-hook", "show-hooks"] {
+            let scope = if matches!(cmd, "set-option" | "set" | "show-options" | "show-option" | "show" | "set-hook" | "show-hooks") { vec!["-p"] } else { vec![] };
+            for selector in ["s:.+", "s:.-", "s:.+2", "s:.-2", "s:.!", "s:.{last}", "s:.{top-left}", "s:@2.+", "s:0.-"] {
+                let mut args = scope.clone();
+                args.extend(["-t", selector]);
+                let rejected = !super::relative_select_pane_target(cmd, selector);
+                assert_eq!(pane_selector_error(cmd, &args, None).is_some(), rejected, "{cmd} {selector}");
+                assert_eq!(pane_selector_error(cmd, &scope, Some(selector)).is_some(), rejected, "TARGET {selector} {cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_panes_and_attached_clustered_targets_are_checked() {
+        for cmd in ["swap-pane", "join-pane", "move-pane", "break-pane", "copy-mode"] {
+            assert!(pane_selector_error(cmd, &["-s", "s:.+", "-t", "s:@2.%4"], None).is_some(), "{cmd}");
+            assert!(pane_selector_error(cmd, &["-ss:.-"], None).is_some(), "{cmd}");
+        }
+        assert!(pane_selector_error("set", &["-pts:.+", "@probe", "value"], None).is_some());
+        assert!(pane_selector_error("select-pane", &["-dt", "s:.-"], None).is_none());
+    }
+
+    #[test]
+    fn concrete_targets_and_target_shaped_data_are_preserved() {
+        for target in ["s:%5", "s:@2.%5", "s:0.1", "s:.1", "s:", "%5", "@2.0"] {
+            assert!(pane_selector_error("respawn-pane", &["-kt", target], None).is_none(), "{target}");
+        }
+        for cmd in ["kill-window", "unlink-window", "select-window", "rename-window", "resize-window", "move-window", "swap-window"] {
+            assert!(pane_selector_error(cmd, &["-t", "s:+.+"], None).is_none(), "{cmd}");
+        }
+        assert!(pane_selector_error("set-option", &["-p", "@probe", "-t", "s:.+"], None).is_none());
+        assert!(pane_selector_error("respawn-pane", &["--", "echo", "-t", "s:.+"], None).is_none());
+        assert!(pane_selector_error("select-pane", &["-T", "-t", "s:.+"], None).is_none());
+        assert!(pane_selector_error("paste-buffer", &["-s", "s:.+", "-t", "s:%5"], None).is_none());
+        assert!(pane_selector_error("set-option", &["-w", "-t", "s:+.+", "@probe", "ok"], None).is_none());
+        assert!(pane_selector_error("send-text", &["-ts:.+"], Some("s:%5")).is_none());
+    }
+
+    #[test]
+    fn internal_and_pane_ui_commands_obey_the_same_rule() {
+        for cmd in ["choose-buffer", "chooseb", "choose-tree", "choose-window", "choose-session",
+            "find-window", "findw", "customize-mode", "switch-mode", "display-menu", "menu",
+            "set-pane-title", "focus-pane", "paste-buffer-at", "paste-buffer-named",
+            "scroll-up", "scroll-down", "pane-scroll", "pane-mouse", "mouse-down",
+            "mouse-down-right", "mouse-down-middle", "mouse-drag", "mouse-up",
+            "mouse-up-right", "mouse-up-middle", "mouse-move", "copy-drag-begin", "mouse-key", "mouse-forward"] {
+            assert!(pane_selector_error(cmd, &[], Some("s:.+")).is_some(), "{cmd}");
+        }
+    }
+}
+
 /// Value-taking flags psmux adds to `command` on top of tmux's template.
 fn psmux_extra_flags(command: &str) -> &'static str {
     let Some((name, _, _)) = args_entry(command) else { return "" };

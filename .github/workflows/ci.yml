@@ -77,6 +77,7 @@ jobs:
           $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
           .\tests\test_window_pane_target_safety.ps1 -Binary $exe
           python .\tests\test_relative_target_safety.py --binary $exe
+          python .\tests\test_pane_selector_safety.py --binary $exe
 
       - name: Run full Rust unit tests
         run: cargo test --all-targets

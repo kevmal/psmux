@@ -1676,6 +1676,7 @@ pub fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
 
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     if parts.is_empty() { return Ok(()); }
+
     match parts[0] {
         // Commands that need local (embedded-mode) handling.
         // In server mode the client sends these via TCP directly, so
@@ -1783,6 +1784,10 @@ pub(crate) fn in_server_target_kind(cmd: &str) -> Option<InServerTarget> {
 pub(crate) fn resolve_in_server_target(app: &AppState, kind: InServerTarget, t: &str) -> Result<Option<String>, String> {
     let t = t.trim();
     let plain = crate::cli::strip_exact_match_prefix(t);
+    if kind == InServerTarget::Pane && crate::cli::relative_select_pane_target("select-pane", plain) {
+        let target = crate::server::temp_target::resolve_relative_pane_target(app, plain)?;
+        return Ok(target.pane.map(|id| format!("%{}", id)));
+    }
     if plain.is_empty() || plain.starts_with('%') || plain.starts_with('@')
         || plain == "~" || plain == "{marked}" || plain == "{mouse}" || t == "="
     {
@@ -2322,6 +2327,19 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     let tokens = parse_command_line(cmd);
     let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }
+
+    if let Some(error) = crate::cli::pane_selector_error(parts[0], &parts[1..], None) {
+        app.status_message = Some((error.clone(), std::time::Instant::now(), None));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+    }
+    // This local executor has no request/reply normalization step. The TCP
+    // routes support select-pane +/- by rewriting to %id first; local/nested
+    // execution without that step must refuse, never silently use current.
+    if crate::server::connection::select_pane_target_arg(&parts[1..])
+        .is_some_and(|target| crate::cli::relative_select_pane_target(parts[0], target)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "unsupported relative or symbolic pane target in local command (use an explicit pane id)"));
+    }
 
     // Issue #635: this is the route menus, hooks, confirm dialogs, the command
     // prompt and key bindings take. A value-taking flag with no value must not

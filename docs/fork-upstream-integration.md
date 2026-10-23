@@ -94,11 +94,11 @@ The related command audit found these ownership rules:
 | Commands | Target/focus ownership |
 |---|---|
 | kill-window, unlink-window, window option reads/writes | Validate the whole spec once, pin the carried target to that stable id, apply/execute/restore atomically. |
-| rename-window, rotate-window, layout commands, respawn-window | Operate on current window inside the stable wrapper; no second raw-target resolver. No respawn was executed locally. |
+| rename-window, rotate-window, layout commands, respawn-window | Operate on current window inside the stable wrapper; no second raw-target resolver. No local process was respawned; private rejection probes only. |
 | select-window | Its own complete resolver and persistent focus operation; generic temporary focus is excluded. |
 | resize-window | Its own full-spec resolver; generic temporary focus is excluded. |
 | move/swap/link-window, join/move/break-pane, explicit swap-pane | Resolve both ends using original focus. The sender never temporarily focuses their destination before resolving an implicit source, including dispatch from an if-shell branch. |
-| select-pane | Explicit target selection locates the start; relative/directional selection runs once. Control mode now performs the relative operation instead of silently acknowledging a no-op. |
+| select-pane | Supported +/- selectors are resolved read-only to a stable %id before dispatch; other relative/symbolic selectors are refused. Directional flags remain supported. |
 | send/paste, pane attributes/options, pane resizing | Stable pane wrapper; their scoped operations do not advance a relative window spec again. Existing unsupported raw syntax is not broadened. |
 | capture/display, pane-id kill | Their explicit pane-id paths check identity and do not retarget a vanished pane. |
 
@@ -109,18 +109,60 @@ also protects multi-target requests from accidental wrapping. The internal
 window-option write is not followed by a spurious target-name error.
 
 Window commands accept `:+.+`/`:-.-` as their relative pane's containing window.
-**kill-pane still does not implement relative pane selectors**: it rejects
-`:.+`/`:.-` before the parser can discard the suffix and kill the active pane.
+**Pane-scoped commands reject unsupported relative/symbolic pane selectors**
+before the parser can discard the suffix and operate on the current pane.
 **Control mode still has no move-window dispatcher**; its explicit error and
 unchanged state are tested. Neither limitation is represented as working parity.
 
 `tests/test_relative_target_safety.py` exercises three-window destruction with
 `:+`, `:-`, offsets, `{next}`, `{previous}`, `{start}`, `{end}`, `!`, `{last}`
 and relative composite pane targets through CLI, raw LF TARGET and control
-mode. It also checks rename, option write/read, selection, relative pane
-selection/rejection, cross-window swaps and move-window source identity. It
+mode. It also checks rename, option write/read, selection, stable relative
+pane selection, rejection, cross-window swaps and move-window source identity. It
 uses only private namespaces/config/data and default-registry file snapshots.
 Pure tests exercise resolve/wrap/focus/re-resolve and target disappearance.
+
+### Third review: one pane-selector policy at every ingress
+
+`0fb79a5b` was still blocked: respawn-pane and pane-option writes discarded
+`:.+`/`:.-` and changed the current pane. The correction is a shared grammar
+guard in `cli::pane_selector_error`, used before command dispatch on the CLI,
+one-shot/raw TCP, control mode, nested dispatch and in-server command route.
+CLI preflight matters because a fire-and-forget command cannot reliably return
+a later server error to its caller.
+
+This integration **rejects unsupported relative/symbolic pane selectors**.
+Use `session:%N`, a qualified stable window/pane id, or an existing numeric
+pane index for those commands. This deliberately narrows their accepted
+target grammar: no command may discard a selector and use the current pane.
+The supported select-pane `:.+`/`:.-` forms are resolved read-only to a stable
+`%id` before TCP/control dispatch, including pane attributes/input toggles.
+This preserves the built-in prefix-o cycle. Resolution errors/timeouts never
+dispatch the original relative string. Nested/local execution without this
+normalization step refuses the selector. Direction flags such as
+`select-pane -R` remain available.
+Window-only commands keep the independent full window resolver and stable-id
+fix; their relative window syntax is not reinterpreted as a pane operation.
+
+The guard covers process replacement/deletion, pane options/attributes/hooks,
+input/paste, capture/display, resize/split/new-pane, pipe/history/modes, pane
+swaps/moves/joins, pane UI and internal input/mouse commands, and pane context
+for run-shell/if-shell/source-file. Source `-s` is checked for swap/join/move/
+break-pane and copy-mode. Option scope and target values are read with the
+existing per-command getopt templates, so `-pt...`, clustered/attached values,
+value-taking flags, `--`, shell operands and target-shaped option/title data
+do not bypass or accidentally trigger the guard. Aliases share the same rule.
+
+`tests/test_pane_selector_safety.py` checks every audited command with both
+`:.+` and `:.-` through CLI, raw LF TARGET and control mode, plus representative
+offset/symbolic/composite selectors and every pane source. Rejections must be
+explicit errors and leave pane process identities, layout, focus, options and
+probe input unchanged. Supported relative select navigation and title-only
+attributes must reach the correct stable pane and preserve the real focus.
+Respawn probes permit only an explicit unsupported
+target in the private namespace; they must fail before any process replacement.
+Pure tests also prove that nested dispatch sends no request on refusal, and
+in-server commands return an error before mutating a stub fixture.
 
 ## Validation and safety boundaries
 
@@ -144,7 +186,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-237 focused Rust tests passed after the relative-target correction. They cover passive closes
+244 focused Rust tests passed after the pane-selector correction. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use
