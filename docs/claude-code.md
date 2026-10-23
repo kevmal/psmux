@@ -87,9 +87,13 @@ set -g claude-code-fix-tty off
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `claude-code-fix-tty` | `on` | Sets `PSMUX_CLAUDE_TEAMMATE_MODE=tmux` and defines a `claude` wrapper function that injects `--teammate-mode tmux` when `teammateMode` is not configured in any of your Claude Code settings files (your settings always take priority). The wrapper resolves the real command at call time, preferring `claude.exe`, then npm's `claude.cmd` / `claude.ps1` shims |
+| `claude-code-fix-tty` | `on` | Sets `PSMUX_CLAUDE_TEAMMATE_MODE=tmux`, fills in `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` when absent, and defines a `claude` wrapper only if the user's profile has not defined that name. The wrapper injects `--teammate-mode tmux` only when not already configured, resolving the real command at call time in order: `claude.exe`, `claude.cmd`, `claude.ps1` |
 
-The `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` env var is always set (not gated by any option) since it's required for the feature to work at all.
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is only filled in when the pane would not already have it: a value inherited from the environment that started the server, or one you set with `set-environment -g CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS 0`, is kept as is. With `claude-code-fix-tty off` psmux does not set it at all.
+
+### Your own `claude` or `env` always wins
+
+The `claude` wrapper and the `env` shim are installed after your PowerShell profile has run, and only when the name is still free. If your profile defines `claude` or `env` as a function, filter or alias, psmux leaves it alone, so the pane runs exactly what runs outside psmux. In that case the `--teammate-mode tmux` injection does not happen; add `"teammateMode": "tmux"` to `~/.claude/settings.json` or pass the flag from your own wrapper.
 
 ## Two Agent Systems in Claude Code
 
@@ -256,6 +260,31 @@ This is expected behavior. Opus prefers `isolation: "worktree"` over the teammat
 **What you'll see:** Claude says "Let me launch 3 implementation agents in worktrees": agents run invisibly, no panes appear.
 
 **Workaround:** Add a `CLAUDE.md` instruction telling the model to prefer teammates over worktree isolation. This is best-effort, the model ultimately decides.
+
+### Teammate panes show "The module 'X' could not be loaded"
+
+A teammate pane that opens with
+
+```
+&: The module 'Code' could not be loaded. For more information, run 'Import-Module Code'.
+```
+
+is the signature of a launch line that lost its quoting on the way into the
+pane ([#634](https://github.com/psmux/psmux/issues/634)). Claude Code sends the
+teammate command as one operand,
+`cd '<cwd>' && env <VAR=val ...> '<claude>' <flags>`, and it POSIX quotes every
+value that contains a space. psmux used to scan that assignment run on plain
+whitespace, so a value such as `XDIR='D:\POC Code\todosample'` was read as the
+assignment `XDIR='D:\POC` plus a leftover `Code\todosample'`, and the leftover
+became the program psmux invoked. PowerShell reads `Name\Command` as a module
+qualified call, which is where the module name in the message comes from: it is
+whatever word followed the first space in the value.
+
+The scan is quote aware from psmux 3.3.9, so projects and Claude Code installs
+under paths with spaces (`OneDrive - Contoso`, `POC Code`, `Program Files`) work
+without any workaround. On 3.3.8 and earlier the workaround is to launch the
+team from a path without spaces, or to clear any environment variable whose
+value contains a space from the list Claude Code forwards to teammates.
 
 ### Claude command not found
 

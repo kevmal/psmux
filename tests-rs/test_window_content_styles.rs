@@ -64,7 +64,7 @@ fn leaf(
         copy_cursor_col: None,
         content,
         rows_v2,
-        title: None,
+        title: None, copy_hl: Vec::new(),
     }
 }
 
@@ -85,8 +85,8 @@ fn render_at(
                 layout,
                 area,
                 false,
-                Color::DarkGray,
-                Color::Green,
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Green),
                 false,
                 Color::Reset,
                 active_rect,
@@ -98,6 +98,7 @@ fn render_at(
                 crate::border_lines::border_chars("single"),
                 None,
                 styles,
+                crate::pane_border::PaneBorderIndicators::Colour,
             );
         })
         .unwrap();

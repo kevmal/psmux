@@ -151,12 +151,20 @@ else { F "expected %error, got: $reply" }
 
 # ============================================================
 Hdr "Layer 3: capture-pane (initial pane content for iTerm2)"
-Send-CC $cc "capture-pane -p -t %0 -e -P -J -S - -E -"
+# iTerm2 names the pane ids list-panes gave it, so ask for the real one: pane
+# ids start at %1 here, and a pane that does not exist is now refused with
+# %error as tmux does, instead of silently capturing the active pane.
+$capPane = ((& $PSMUX display-message -t $S -p '#{pane_id}' 2>&1) -join '').Trim()
+Send-CC $cc "capture-pane -p -t $capPane -e -P -J -S - -E -"
 $reply = Read-Reply $cc 3000
-if ($reply -match "%begin" -and $reply -match "%end") { P "capture-pane wraps in %begin/%end" }
-else { F "capture-pane framing missing" }
+if ($reply -match "%begin" -and $reply -match "%end") { P "capture-pane -t $capPane wraps in %begin/%end" }
+else { F "capture-pane framing missing: $reply" }
 $body = $reply -replace "(?ms)^%begin.*?\n", "" -replace "(?ms)\r?\n%end.*$", ""
 if ($body.Length -gt 0) { P "capture-pane returned non-empty body (len=$($body.Length))" }
+Send-CC $cc "capture-pane -p -t %999"
+$reply = Read-Reply $cc 1500
+if ($reply -match "%error \d+ \d+ 1" -and $reply -match "can't find pane") { P "capture-pane -t on a missing pane answers %error (matches tmux)" }
+else { F "missing pane not refused with %error: $reply" }
 
 # ============================================================
 Hdr "Layer 4: %output streaming for send-keys (the real iTerm2 display path)"
@@ -179,33 +187,42 @@ else { F "marker '$marker' not in %output stream" }
 # ============================================================
 Hdr "Layer 5: Live state notifications"
 Send-CC $cc "new-window -n liveA"
-[void](Read-Reply $cc 2000)
-$ev = Drain-Notifications $cc 1500
+# A notification may arrive before the command's %end (tmux makes no ordering
+# promise between the two), so keep what Read-Reply consumed: discarding it
+# lost %window-add once in sweep 2026-10-12_23-41 while the new window's
+# %output %2 was plainly there.
+$ev = (Read-Reply $cc 2000) + (Drain-Notifications $cc 1500)
 if ($ev -match "%window-add @\d+") { P "%window-add on new-window" } else { F "no %window-add: $ev" }
 
 Send-CC $cc "rename-window -t liveA liveA_renamed"
-[void](Read-Reply $cc 1500)
-$ev = Drain-Notifications $cc 1000
+$reply = Read-Reply $cc 1500
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%window-renamed @\d+ liveA_renamed") { P "%window-renamed" } else { F "no %window-renamed" }
 
-# Select first window by index 0 to fire after-select-window
+# Select first window by index 0 to fire after-select-window.
+# The notification may be written before or after the command's %end (tmux
+# makes no promise either way), and Read-Reply consumes everything up to
+# %end, so the reply is kept and searched too. Sweep 2026-09-24_23-37-41
+# lost it that way under load, 28P/1F, with an empty drain.
 Send-CC $cc "select-window -t :0"
-[void](Read-Reply $cc 1500)
-Start-Sleep -Milliseconds 400
-$ev = Drain-Notifications $cc 1000
-if ($ev -match "%session-window-changed \`$\d+ @\d+") { P "%session-window-changed on select-window" }
-else { F "no %session-window-changed: $ev" }
+$reply = Read-Reply $cc 1500
+$ev = $reply + (Drain-Notifications $cc 2000)
+if ($ev -match "%session-window-changed \`$\d+ @\d+") {
+    $where = if ($reply -match "%session-window-changed") { "before %end" } else { "after %end" }
+    P "%session-window-changed on select-window (arrived $where)"
+}
+else { F "no %session-window-changed: reply=[$($reply.Trim())] drain=[$($ev.Trim())]" }
 
 Send-CC $cc "kill-window -t liveA_renamed"
-[void](Read-Reply $cc 1500)
-$ev = Drain-Notifications $cc 1000
+$reply = Read-Reply $cc 1500
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%window-close @\d+") { P "%window-close on kill-window" } else { F "no %window-close: $ev" }
 
 # rename-session
 Send-CC $cc "rename-session -t $S ${S}_renamed"
-[void](Read-Reply $cc 1500)
+$reply = Read-Reply $cc 1500
 Start-Sleep -Milliseconds 400
-$ev = Drain-Notifications $cc 1000
+$ev = $reply + (Drain-Notifications $cc 1000)
 if ($ev -match "%session-renamed ${S}_renamed") { P "%session-renamed" }
 else { F "no %session-renamed: $ev" }
 # Update tracking name

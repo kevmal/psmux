@@ -23,6 +23,7 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -83,8 +84,14 @@ fn option_catalog_registers_mouse_selection_force() {
         .find(|o| o.name == "mouse-selection-force")
         .expect("mouse-selection-force must be in catalog");
     assert_eq!(entry.default, "off");
-    assert_eq!(entry.option_type, "boolean");
-    assert_eq!(entry.scope, "session");
+    assert_eq!(
+        entry.option_type,
+        crate::server::option_catalog::OptionType::Boolean
+    );
+    assert_eq!(
+        entry.scope,
+        crate::server::option_catalog::OptionScope::Session,
+    );
 }
 
 #[test]
@@ -176,8 +183,14 @@ fn option_catalog_default_is_on() {
         .expect("mouse-selection must be in catalog");
     assert_eq!(entry.default, "on",
         "Catalog default for mouse-selection must be 'on' (preserves existing behavior)");
-    assert_eq!(entry.option_type, "boolean");
-    assert_eq!(entry.scope, "session");
+    assert_eq!(
+        entry.option_type,
+        crate::server::option_catalog::OptionType::Boolean
+    );
+    assert_eq!(
+        entry.scope,
+        crate::server::option_catalog::OptionScope::Session,
+    );
 }
 
 #[test]

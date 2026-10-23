@@ -1,8 +1,7 @@
 //! Shared color and style parsing utilities.
 //!
-//! This module consolidates ALL tmux-compatible color/style parsing into a
-//! single place, eliminating duplication between rendering.rs and client.rs.
-//! Both the server-side renderer and the remote client import from here.
+//! This module owns tmux-compatible color and style parsing for the active
+//! client renderer and shared terminal helpers.
 
 use ratatui::prelude::*;
 use ratatui::style::{Style, Modifier};
@@ -424,8 +423,7 @@ pub fn parse_inline_styles(text: &str, base_style: Style) -> Vec<Span<'static>> 
 
 /// Calculate the visual display width of styled spans.
 pub fn spans_visual_width(spans: &[Span]) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
+    spans.iter().map(|s| vt100::str_width(s.content.as_ref())).sum()
 }
 
 /// Truncate a list of styled spans so their total visual width fits within
@@ -433,7 +431,6 @@ pub fn spans_visual_width(spans: &[Span]) -> usize {
 /// trimmed character by character and a trailing ellipsis is NOT added (to
 /// match tmux behaviour).  Returns the mutated vector in place.
 pub fn truncate_spans_to_width(spans: &mut Vec<Span<'static>>, max_width: usize) {
-    use unicode_width::UnicodeWidthChar;
     let mut remaining = max_width;
     let mut keep = 0;
     for (i, span) in spans.iter().enumerate() {
@@ -445,7 +442,7 @@ pub fn truncate_spans_to_width(spans: &mut Vec<Span<'static>>, max_width: usize)
             // Partially truncate this span
             let mut truncated = String::new();
             for ch in span.content.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                let cw = vt100::char_width(ch).unwrap_or(0);
                 if cw > remaining {
                     break;
                 }
@@ -660,7 +657,6 @@ pub fn parse_format_segments(text: &str, base_style: Style) -> Vec<FormatToken> 
 ///
 /// Returns spans whose visible content falls within `[col_start, col_start + max_width)`.
 fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usize) -> Vec<Span<'static>> {
-    use unicode_width::UnicodeWidthChar;
     let mut result = Vec::new();
     let mut col = 0usize;
     let mut remaining = max_width;
@@ -674,7 +670,7 @@ fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usiz
         // This span overlaps with our range
         let mut text = String::new();
         for ch in span.content.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let cw = vt100::char_width(ch).unwrap_or(0);
             if col < col_start {
                 col += cw;
                 continue;
@@ -697,7 +693,6 @@ fn extract_span_range(spans: &[Span<'static>], col_start: usize, max_width: usiz
 /// This is the primary entry point for rendering `status-format[]` lines.
 /// Returns styled spans fitting within `width` plus clickable range regions.
 pub fn layout_format_line(text: &str, width: usize, base_style: Style) -> LayoutResult {
-    use unicode_width::UnicodeWidthStr;
 
     let tokens = parse_format_segments(text, base_style);
 
@@ -761,7 +756,7 @@ pub fn layout_format_line(text: &str, width: usize, base_style: Style) -> Layout
     for token in &tokens {
         match token {
             FormatToken::Text(span) => {
-                let w = UnicodeWidthStr::width(span.content.as_ref());
+                let w = vt100::str_width(span.content.as_ref());
                 match list_state {
                     ListSt::LeftMarker => { list_left_marker.push(span.clone()); }
                     ListSt::RightMarker => { list_right_marker.push(span.clone()); }

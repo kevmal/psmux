@@ -20,6 +20,237 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The pty a pane fixture needs when no process is ever going to use it.
+///
+/// A fixture that only has to hand `Pane` a master, a writer and a child used
+/// to open a real pseudo console and spawn `cmd /c exit` into it. Measured over
+/// one full run of the suite, that is 464 pseudo consoles and 464 processes,
+/// plus the console host Windows starts behind each one, for tests whose
+/// subject is a struct field. Every one of them is also a chance to hit the
+/// spawn-then-close race #695 reports.
+///
+/// `resize` answers Ok because the warm pool probes a spare's liveness with it
+/// (`pane.rs`), reads yield nothing, and writes are discarded: no test in the
+/// suite reads back what was written to a pane's master.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct StubMasterPty {
+    size: std::sync::Mutex<portable_pty::PtySize>,
+}
+
+#[cfg(test)]
+impl portable_pty::MasterPty for StubMasterPty {
+    fn resize(&self, size: portable_pty::PtySize) -> Result<(), anyhow::Error> {
+        *self.size.lock().unwrap_or_else(|e| e.into_inner()) = size;
+        Ok(())
+    }
+    fn get_size(&self) -> Result<portable_pty::PtySize, anyhow::Error> {
+        Ok(*self.size.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    fn try_clone_reader(&self) -> Result<Box<dyn io::Read + Send>, anyhow::Error> {
+        Ok(Box::new(io::empty()))
+    }
+    fn take_writer(&self) -> Result<Box<dyn io::Write + Send>, anyhow::Error> {
+        Ok(Box::new(io::sink()))
+    }
+}
+
+/// The master and the writer for a pane fixture, without a pseudo console.
+#[cfg(test)]
+pub(crate) fn stub_pane_pty(
+    size: portable_pty::PtySize,
+) -> (Box<dyn portable_pty::MasterPty>, Box<dyn crate::pane::PaneInputSink>) {
+    (Box::new(StubMasterPty { size: std::sync::Mutex::new(size) }), Box::new(io::sink()))
+}
+
+/// The child a pane fixture names when no process is ever going to run.
+///
+/// `exited` is what `cmd /c exit` had already become by the time the test body
+/// ran, and `running` is what `cmd /c pause` was: the pools reap a spare whose
+/// child has exited (#450), so a fixture holding a spare has to say running.
+/// There is no pid to report, which is the state those fixtures already
+/// documented as "no live child, so every process probe fails"; the difference
+/// is that it is now true every time rather than most of the time.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct StubChild {
+    running: bool,
+}
+
+#[cfg(test)]
+impl StubChild {
+    pub(crate) fn exited() -> Box<dyn portable_pty::Child + Send + Sync> {
+        Box::new(Self { running: false })
+    }
+
+    pub(crate) fn running() -> Box<dyn portable_pty::Child + Send + Sync> {
+        Box::new(Self { running: true })
+    }
+}
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for StubChild {
+    fn kill(&mut self) -> io::Result<()> {
+        self.running = false;
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(Self { running: self.running })
+    }
+}
+
+#[cfg(test)]
+impl portable_pty::Child for StubChild {
+    fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+        if self.running {
+            Ok(None)
+        } else {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+    }
+    fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+        self.running = false;
+        Ok(portable_pty::ExitStatus::with_exit_code(0))
+    }
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
+/// How long a test pty child is given to get out of its own loader.
+///
+/// Measured on Windows 11 with pwsh behind a ConPTY: a child whose pty is
+/// closed 0ms or 1ms after the spawn dies as 0xC0000142 (STATUS_DLL_INIT_FAILED)
+/// every time, one closed at 3ms survives, and from 8ms on it dies as
+/// 0xC000013A (STATUS_CONTROL_C_EXIT) like any console process whose console
+/// went away. The window is a couple of milliseconds wide; this budget is two
+/// orders above it so a loaded machine still clears it.
+#[cfg(test)]
+const PTY_CHILD_LOADER_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Spawn the child that holds a test pty open, and do not hand it back until it
+/// is past the point where closing that pty would kill it in the loader.
+///
+/// A test helper used to spawn and walk away:
+///
+/// ```ignore
+/// let child = pair.slave.spawn_command(cmd).expect("spawn dummy");
+/// ```
+///
+/// `CreateProcessW` has returned success by then, so the spawn looks fine, but
+/// the child is still loading its DLLs. A short test can finish and drop the
+/// pty inside that window, and the child dies as 0xC0000142. Nothing observed
+/// it: the exit code was never read, so the suite stayed green while Windows
+/// put an error dialog on the screen for a failure no test could attribute.
+///
+/// This waits for one of two proofs that the loader is done. A child that exits
+/// on its own, which is what `cmd /c exit` does, has plainly finished, and its
+/// code is checked. A child meant to stay up, which is what `cmd /c pause`
+/// does, proves it by still being alive after the grace period.
+/// It returns a `Result` because several helpers spawn inside a retry loop and
+/// treat a refusal as a reason to try again rather than to fail; an early bad
+/// exit is reported the same way so those loops keep their shape.
+#[cfg(test)]
+pub(crate) fn spawn_pty_child(
+    slave: &dyn portable_pty::SlavePty,
+    cmd: portable_pty::CommandBuilder,
+) -> io::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+    let mut child = slave
+        .spawn_command(cmd)
+        .map_err(|e| io::Error::other(format!("spawn: {e:?}")))?;
+    let deadline = std::time::Instant::now() + PTY_CHILD_LOADER_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.exit_code();
+                if code != 0 {
+                    return Err(io::Error::other(format!(
+                        "the child exited 0x{code:08X} before the test could use it; \
+                         0xC0000142 means its pty was closed while it was still loading"
+                    )));
+                }
+                return Ok(child);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(child);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(io::Error::other(format!("try_wait: {e:?}"))),
+        }
+    }
+}
+
+/// End every real shell an `AppState` is holding, before the state drops.
+///
+/// Only two test modules reach the production spawn, and both of them do it
+/// with a real shell rather than the dummy the other helpers use. Dropping the
+/// state closes those ptys, and a shell young enough is still in its loader
+/// when that happens, so the test has to end them itself and wait.
+///
+/// Both stores are drained: the windows, whose panes hold a transplanted or
+/// cold spawned shell, and the pool, whose spares were never claimed.
+#[cfg(test)]
+pub(crate) fn kill_app_shells(app: &mut AppState) {
+    fn walk(node: &mut Node) {
+        match node {
+            Node::Leaf(p) => kill_pty_child(&mut *p.child),
+            Node::Split { children, .. } => {
+                for c in children {
+                    walk(c);
+                }
+            }
+        }
+    }
+    for win in &mut app.windows {
+        walk(&mut win.root);
+        for f in &mut win.floating {
+            kill_pty_child(&mut *f.pane.child);
+        }
+    }
+    while let Some(mut spare) = app.warm_pane.take() {
+        kill_pty_child(&mut *spare.child);
+    }
+}
+
+/// End a test pty child and wait for it, so the pty outlives the process using
+/// it.
+///
+/// Killing without waiting is the same race from the other side: `kill` only
+/// asks, and a pty dropped before the ask lands leaves the child to die in its
+/// loader instead.
+///
+/// Takes the child by reference rather than by box so that both shapes in
+/// the suite fit: a pane's child carries `Send + Sync`, a warm pane's does
+/// not.
+#[cfg(test)]
+pub(crate) fn kill_pty_child(child: &mut dyn portable_pty::Child) {
+    // Look before ending it. A child that is already gone died on its own, and
+    // the code says how: 0xC0000142 means its pty was closed while it was
+    // still loading, which is the failure the suite used to swallow whole.
+    if let Ok(Some(status)) = child.try_wait() {
+        let code = status.exit_code();
+        assert!(
+            code != 0xC000_0142,
+            "a test shell died as 0xC0000142 before its test could end it,              which means its pty was closed while it was still loading"
+        );
+        return;
+    }
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("a test pty child did not report exit within 5s of kill()");
+}
+
 /// Resolve a `-c` start-dir to one a freshly spawned pane shell can actually
 /// enter, falling back to the user's home directory when it cannot.
 ///
@@ -63,6 +294,45 @@ pub fn usable_start_dir(dir: &str) -> Option<std::path::PathBuf> {
     }
 
     None
+}
+
+/// Render a directory the way `#{pane_current_path}` renders one read out of a
+/// live process, so a directory psmux was HANDED (`split-window -c <dir>`) and
+/// one psmux READ back out of the pane's process compare and print alike.
+///
+/// Windows accepts `/` and `\` interchangeably and tolerates a trailing
+/// separator; the PEB reading never has one except on a drive root (`C:\`),
+/// which must keep it or the value stops being a usable path. Case is left
+/// exactly as given: `C:\Users` is what the user typed and what the reading
+/// comes back as, and lowercasing it to compare would mean printing something
+/// nobody asked for.
+pub fn normalize_dir_for_display(dir: &str) -> String {
+    let mut s = if cfg!(windows) { dir.replace('/', "\\") } else { dir.to_string() };
+    if cfg!(windows) {
+        // `C:\` (and `\\server\share\`) keep their trailing separator; anything
+        // else loses it.  A bare `\` or `/` is a path in its own right.
+        while s.len() > 1 && s.ends_with('\\') && !s.ends_with(":\\") {
+            s.pop();
+        }
+    } else {
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// True when two directory strings name the same directory as far as this
+/// platform is concerned: separator- and trailing-separator-insensitive
+/// everywhere, and case-insensitive on Windows, where `C:\USERS` and
+/// `C:\Users` are one directory.
+pub fn same_dir(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_dir_for_display(a), normalize_dir_for_display(b));
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
 }
 
 /// Expand `~` to the user's home directory in a shell command string,
@@ -145,7 +415,32 @@ pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> 
 // resolve_last_session_name and resolve_default_session_name are in session.rs
 
 #[derive(Serialize, Deserialize)]
-pub struct WinInfo { pub id: usize, pub name: String, pub active: bool, #[serde(default)] pub activity: bool, #[serde(default)] pub bell: bool, #[serde(default)] pub last: bool, #[serde(default)] pub tab_text: String, #[serde(default)] pub idx: usize }
+pub struct WinInfo {
+    pub id: usize,
+    pub name: String,
+    pub active: bool,
+    #[serde(default)] pub activity: bool,
+    #[serde(default)] pub bell: bool,
+    #[serde(default)] pub last: bool,
+    #[serde(default)] pub tab_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ps_status: Option<crate::program_status::Status>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ps_panes: Vec<crate::program_status::PaneInfo>,
+    #[serde(default)] pub idx: usize,
+    /// This window's OWN `window-status-*-style`, when it set one (#648).
+    ///
+    /// The five window status styles used to travel once per frame as server
+    /// wide strings, so a per window override had nowhere to live. They travel
+    /// per window now, and ONLY when the window overrode them: a default
+    /// configuration still adds nothing to the frame, and the client keeps
+    /// patching the server wide style when a field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub ws_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub wsc_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub wsa_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub wsb_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub wsl_style: Option<String>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneInfo { pub id: usize, pub title: String }
@@ -168,7 +463,7 @@ pub enum LayoutSimple {
 
 pub fn list_windows_json(app: &AppState) -> io::Result<String> {
     let mut v: Vec<WinInfo> = Vec::new();
-    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, bell: w.bell_flag, last: i == app.last_window_idx, tab_text: String::new(), idx: app.win_display_index(i) }); }
+    for (i, w) in app.windows.iter().enumerate() { v.push(WinInfo { id: w.id, name: w.name.clone(), active: i == app.active_idx, activity: w.activity_flag, bell: w.bell_flag, last: app.last_window_pos() == Some(i), tab_text: String::new(), ps_status: crate::program_status::window_status(w), ps_panes: crate::program_status::window_records(w), idx: app.win_display_index(i), ws_style: None, wsc_style: None, wsa_style: None, wsb_style: None, wsl_style: None }); }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
 }
@@ -186,7 +481,8 @@ pub fn list_windows_tmux(app: &AppState) -> String {
     let mut lines = Vec::new();
     for (i, w) in app.windows.iter().enumerate() {
         let flag = if i == app.active_idx { "*" } else if w.activity_flag { "#" } else { "-" };
-        let pane_count = count_panes(&w.root);
+        // The window's floats are panes of it, the way tmux counts them.
+        let pane_count = count_panes(&w.root) + w.floating.len();
         let (width, height) = if let Some(p) = active_pane(&w.root, &w.active_path) {
             (p.last_cols, p.last_rows)
         } else { (120, 30) };
@@ -206,6 +502,13 @@ pub fn list_tree_json(app: &AppState) -> io::Result<String> {
     for (i, w) in app.windows.iter().enumerate() {
         let mut panes = Vec::new();
         collect_panes(&w.root, &mut panes);
+        // The window's floats are panes of it, so `choose-tree` lists them.
+        // tmux walks one pane list per window and a float is in it, which is
+        // why its tree shows a float and this one did not.
+        panes.extend(w.floating.iter().map(|fp| PaneInfo {
+            id: fp.pane.id,
+            title: if fp.title.is_empty() { fp.pane.title.clone() } else { fp.title.clone() },
+        }));
         v.push(WinTree { id: w.id, name: w.name.clone(), active: i == app.active_idx, panes, idx: app.win_display_index(i) });
     }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
@@ -333,22 +636,75 @@ pub fn quote_arg(s: &str) -> String {
 /// were, and cannot collide with a real path, because the pre-existing filter
 /// this replaces already assumed no positional starts with a dash.
 pub fn parse_claim_args(args: &[&str]) -> (Vec<String>, Option<String>) {
-    let mut priority: Option<String> = None;
-    let mut positionals: Vec<String> = Vec::new();
+    let parsed = parse_claim_args_full(args);
+    (parsed.positionals, parsed.priority)
+}
+
+/// Everything a `claim-session` line carries.
+#[derive(Debug, Default, PartialEq)]
+pub struct ClaimArgs {
+    /// `[0]` session name, `[1]` optional client CWD.
+    pub positionals: Vec<String>,
+    /// `-p`: the scheduling class the claiming client resolved (#608).
+    pub priority: Option<String>,
+    /// `-e`: file holding the claiming client's environment block (#659).
+    pub env_file: Option<String>,
+    /// `-n`: the `new-session -n NAME` window name (#674).
+    ///
+    /// The name belongs to the claim itself, not to a follow up request.
+    /// tmux names the initial window and turns `automatic-rename` off for it
+    /// before the session is ever visible (cmd-new-session.c), and psmux's
+    /// cold spawn path does the same. Carrying it here is what makes the warm
+    /// path match: a claim that answers OK has already applied the name, so
+    /// nothing can be observed under the standby's pool name and no second
+    /// request can fail and leave the name lost.
+    pub window_name: Option<String>,
+    /// `-E`: the same environment block as `-e`, inline as hex, so a current
+    /// standby does not have to open a file the client has just written
+    /// (`client_env::own_environment_hex`). `-e` is still sent for a standby
+    /// that predates this flag; it parses `-E` as an unknown flag and its value
+    /// as a third positional, which it ignores.
+    pub env_inline: Option<String>,
+}
+
+/// Split a `claim-session` line into its positionals and its flags.
+///
+/// Every flag takes a value, and the value of a flag is NEVER a positional:
+/// the CWD is optional, so a stray value sliding into index 1 would be
+/// silently mistaken for the working directory. [`parse_claim_args`] is the
+/// two-field view of this, kept so the #608 wire tests read the same parser
+/// rather than a copy that can drift.
+pub fn parse_claim_args_full(args: &[&str]) -> ClaimArgs {
+    let mut parsed = ClaimArgs::default();
     let mut i = 0usize;
     while i < args.len() {
         let a = args[i];
         if a == "-p" {
-            priority = args.get(i + 1).map(|s| (*s).to_string());
+            parsed.priority = args.get(i + 1).map(|s| (*s).to_string());
+            i += 2;
+            continue;
+        }
+        if a == "-e" {
+            parsed.env_file = args.get(i + 1).map(|s| (*s).to_string());
+            i += 2;
+            continue;
+        }
+        if a == "-n" {
+            parsed.window_name = args.get(i + 1).map(|s| (*s).to_string());
+            i += 2;
+            continue;
+        }
+        if a == "-E" {
+            parsed.env_inline = args.get(i + 1).map(|s| (*s).to_string());
             i += 2;
             continue;
         }
         if !a.starts_with('-') {
-            positionals.push(a.to_string());
+            parsed.positionals.push(a.to_string());
         }
         i += 1;
     }
-    (positionals, priority)
+    parsed
 }
 
 /// Quote an argument for the wire only when the server's quote-aware
@@ -366,10 +722,75 @@ pub fn quote_arg_if_needed(s: &str) -> String {
         || s.chars().any(char::is_whitespace)
         || s.contains('"')
         || s.contains('\'')
+        // An argv element ending in `;` is data on the CLI route (only a
+        // lone `;` separates there, cli::split_cli_command_list), but bare on
+        // the wire the server's splitter now reads `word;` as the end of a
+        // command, as tmux's command string lexer does (#734 follow up).
+        // Quoted it stays one argument. A lone `;` is a separator either way
+        // and a modified `;` key (`M-;`) is left raw for bind-key.
+        || (s.len() > 1 && s.ends_with(';') && !s.ends_with("\\;")
+            && !crate::config::is_modified_semicolon_key(s))
     {
         quote_arg(s)
     } else {
         s.to_string()
+    }
+}
+
+/// An argv as one wire line whose arguments the server reads back unchanged:
+/// each argument that needs it is quoted ([`quote_arg_if_needed`]), so one
+/// holding `cmd1 \; cmd2` stays one argument instead of being cut at the
+/// separator by the server's line splitter.
+pub fn quoted_wire_line<S: AsRef<str>>(argv: &[S]) -> String {
+    argv.iter().map(|a| quote_arg_if_needed(a.as_ref())).collect::<Vec<_>>().join(" ")
+}
+
+/// The wire line for a CLI `bind-key` argv (`argv[0]` is the command name).
+///
+/// tmux keeps every argument of the bound command as its own argument, so
+/// `bind-key Y if-shell 'cond' 'set -g @k yes' 'set -g @k no'` binds an
+/// if-shell with three arguments. Joining argv with spaces flattened it to
+/// `if-shell cond set -g @k yes set -g @k no`, which no longer means anything.
+/// So each argument that needs it is quoted, EXCEPT when the bound command is
+/// one single argument: that one is a command string (tmux parses a lone
+/// argument as a command list, `bind x "split-window -h"`), and goes raw.
+pub fn bind_key_wire_line<S: AsRef<str>>(argv: &[S]) -> String {
+    let argv: Vec<&str> = argv.iter().map(|s| s.as_ref()).collect();
+    // Skip bind-key's own flags to find the key; what follows is the command.
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i] {
+            "-T" | "-N" => i += 2,
+            a if a.starts_with('-') && a.len() > 1 && a != "--" => i += 1,
+            "--" => { i += 1; break; }
+            _ => break,
+        }
+    }
+    let tail_start = i + 1; // argv[i] is the key
+    let single_tail = argv.len() == tail_start + 1;
+    let words: Vec<String> = argv.iter().enumerate().map(|(n, a)| {
+        if n == 0 || (single_tail && n == tail_start) {
+            a.to_string()
+        } else {
+            quote_arg_if_needed(a)
+        }
+    }).collect();
+    if words.len() <= tail_start {
+        return words.join(" ");
+    }
+    // A bound command LIST (`bind x 'a; b'`, `bind x a \; b`) has to reach
+    // the server as one statement: bare on the wire, the server's line
+    // splitter cut it at the `;`, bound the first command and RAN the rest
+    // at once (tmux binds the whole list). A brace block keeps it together;
+    // bind_command_list unwraps it again on the server.
+    let head = words[..tail_start].join(" ");
+    let tail = words[tail_start..].join(" ");
+    let subs = crate::config::split_chained_commands_pub(&tail);
+    let balanced = crate::config::block_depth_map(&tail.chars().collect::<Vec<_>>()).is_some();
+    if subs.len() > 1 && balanced {
+        format!("{} {{ {} }}", head, subs.join(" ; "))
+    } else {
+        format!("{} {}", head, tail)
     }
 }
 
@@ -397,7 +818,9 @@ pub fn parse_cat_file_sink(cmd: &str) -> Option<(String, bool)> {
     let trimmed = cmd.trim();
     // PowerShell aliases are case-insensitive, so `CAT`/`Cat` hit the same
     // Get-Content trap as `cat` — match the word the same way.
-    if trimmed.len() < 3 || !trimmed[..3].eq_ignore_ascii_case("cat") {
+    // `get`, not `[..3]`: byte 3 of `caé ...` falls inside the é, and the
+    // slice used to panic the server on a pipe-pane command (#712 audit).
+    if !trimmed.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("cat")) {
         return None;
     }
     let rest = &trimmed[3..];
@@ -573,6 +996,135 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", b));
     }
     out
+}
+
+/// The longest prefix of `s` that is at most `max_bytes` bytes long and ends
+/// on a char boundary.
+///
+/// `&s[..max_bytes]` panics when byte `max_bytes` falls inside a multi byte
+/// character (#712: the -CC relay thread died on a box drawing line), so every
+/// byte budgeted cut of text that can hold non ASCII goes through here.
+pub fn str_prefix_within(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The window of `s` a prompt `cols` wide shows with the cursor visible, and
+/// the column that cursor falls in.
+///
+/// A prompt keeps its cursor as a byte offset, so the column it belongs in is
+/// the display WIDTH of the text before it and not the offset itself: eight
+/// box drawing characters are 24 bytes and 8 columns, and drawing the cursor
+/// at column 24 put it 16 past the text (#741).
+///
+/// The window follows tmux. When the cursor would fall past the right edge,
+/// the text scrolls so the cursor stays inside instead of being drawn outside
+/// the prompt (`status.c:937` to `:944`, tag 3.7c, where `pcursor` is
+/// `utf8_strwidth(prompt_buffer, prompt_index)` and the drawing starts
+/// `offset` columns in). A character straddling the left edge of the window is
+/// dropped whole, as tmux's per character redraw drops it.
+///
+/// Returns `(text to draw, column of the cursor within it)`.
+pub fn prompt_window(s: &str, cursor: usize, cols: usize) -> (&str, usize) {
+    // A prompt with no room at all. Reachable: the caller hands over the box
+    // width less the two columns of its ": " prefix.
+    if cols == 0 {
+        return ("", 0);
+    }
+    let before = str_prefix_within(s, cursor);
+    // Measured the way the pane's grid measures, which `grid_cells` explains.
+    // The prompt used to add up `UnicodeWidthChar` per character, which
+    // disagreed with the grid of the same psmux: a heart with a variation
+    // selector is one cell of two columns in a pane (#533) while the prompt
+    // counted one column, so the cursor sat on top of the next character.
+    let pcursor = grid_width(before);
+    // One column is kept for the cursor itself, so a cursor at the end of a
+    // full line still has somewhere to sit.
+    let offset = if pcursor >= cols { pcursor - cols + 1 } else { 0 };
+    let start = cell_start_at_least(s, offset);
+    let col = grid_width(&s[..start]);
+    let shown = str_prefix_within_cols(&s[start..], cols);
+    // `col` is where the shown text really starts. It is `offset` unless a
+    // wide character straddled the edge and was dropped, which starts the
+    // text one column later; the cursor is measured from the same origin as
+    // the text drawn at column 0, so it stays right after what precedes it
+    // instead of one blank cell further (#741 follow up). tmux's
+    // `pcursor - offset` is one column off its own redraw in that case.
+    (shown, pcursor.saturating_sub(col))
+}
+
+/// The longest prefix of `s` whose display width is at most `max_cols`
+/// columns (wide CJK and emoji count 2). For titles cut to a box width,
+/// where a byte budget would both split characters and miscount columns.
+pub fn str_prefix_within_cols(s: &str, max_cols: usize) -> &str {
+    let mut used = 0usize;
+    for (i, w) in grid_cells(s) {
+        if used + w > max_cols {
+            return &s[..i];
+        }
+        used += w;
+    }
+    s
+}
+
+/// Where each cell of `s` starts, and how many columns it takes, counted the
+/// way the pane's grid counts.
+///
+/// The prompt is drawn into the same terminal as the pane, so it has to count
+/// the same way the pane does, or the two disagree inside one psmux. The
+/// grid folds an emoji cluster into one cell the way tmux's
+/// `screen_write_combine` does: a variation selector sequence (#533, #750), a
+/// ZWJ sequence, a skin tone pair and a regional indicator pair are each one
+/// cell of two columns (#749). `vt100::str_cells` walks the very rule the
+/// grid writes with (`vt100::width::join`), so there is one opinion and not
+/// two to keep in step.
+fn grid_cells(s: &str) -> Vec<(usize, usize)> {
+    vt100::str_cells(s)
+}
+
+/// Columns `s` takes in the grid's reckoning.
+fn grid_width(s: &str) -> usize {
+    grid_cells(s).iter().map(|(_, w)| w).sum()
+}
+
+/// Byte offset of the first cell of `s` at or past `cols` columns in, or the
+/// end of the string when it is narrower than that.
+///
+/// This is where a scrolled prompt starts drawing. A cell straddling that
+/// edge goes with the part scrolled off, which is what tmux's per character
+/// redraw does with it.
+fn cell_start_at_least(s: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 0;
+    }
+    let mut at = 0usize;
+    for (i, w) in grid_cells(s) {
+        if at >= cols {
+            return i;
+        }
+        at += w;
+    }
+    s.len()
+}
+
+/// Remove the whole character that ends at byte offset `cursor` (Backspace
+/// in a line editor whose cursor is a byte offset). `cursor` inside a
+/// character is first floored to a boundary. Returns false at offset 0.
+pub fn str_remove_char_before(s: &mut String, cursor: usize) -> bool {
+    let cur = str_prefix_within(s, cursor).len();
+    match s[..cur].chars().next_back() {
+        Some(ch) => {
+            s.remove(cur - ch.len_utf8());
+            true
+        }
+        None => false,
+    }
 }
 
 /// Decode the output of [`hex_encode`].  `None` for an odd length or any
@@ -937,6 +1489,113 @@ pub fn psmux_drawn_terminal() -> bool {
             .is_some()
 }
 
+/// tmux's `vis(3)` encoder, the `VIS_OCTAL|VIS_CSTYLE` subset tmux actually
+/// uses (compat/vis.c:57-120, driven from utf8.c utf8_strvis).
+///
+/// Valid UTF-8 passes through untouched, printable ASCII passes through, and
+/// anything else becomes a C escape (`\r`, `\a`, `\b`, `\f`, `\v`, `\0`, plus
+/// `\t` and `\n` when those are being escaped) or a three digit octal escape
+/// (`\033` for ESC, `\177` for DEL).
+///
+/// `escape_tab` / `escape_nl` are tmux's `VIS_TAB` / `VIS_NL`: unset, a tab or
+/// newline counts as visible and is copied through.
+///
+/// One deliberate deviation from tmux: a backslash is never doubled. tmux
+/// doubles it unless `VIS_NOSLASH` is set, which on Windows would rewrite
+/// every path shaped window name (`C:\src` becomes `C:\\src`, measured against
+/// tmux 3.4). Control characters, which is what #647 is about, are encoded
+/// identically.
+fn vis_encode(src: &str, escape_tab: bool, escape_nl: bool) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !c.is_ascii() {
+            // utf8.c:690-709: a complete, valid UTF-8 character is copied
+            // verbatim and never visually encoded. A Rust `&str` is UTF-8 by
+            // construction, so every non-ASCII char takes this branch.
+            out.push(c);
+            continue;
+        }
+        let b = c as u8;
+        let visible = b.is_ascii_graphic()
+            || b == b' '
+            || (b == b'\t' && !escape_tab)
+            || (b == b'\n' && !escape_nl);
+        if visible {
+            out.push(c);
+            continue;
+        }
+        match b {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x08 => out.push_str("\\b"),
+            0x07 => out.push_str("\\a"),
+            0x0b => out.push_str("\\v"),
+            b'\t' => out.push_str("\\t"),
+            0x0c => out.push_str("\\f"),
+            0x00 => {
+                out.push_str("\\0");
+                // compat/vis.c:104-107: a following octal digit would be read
+                // as part of the escape, so pad it out to three digits.
+                if matches!(chars.peek(), Some(n) if ('0'..='7').contains(n)) {
+                    out.push_str("00");
+                }
+            }
+            _ => out.push_str(&format!("\\{b:03o}")),
+        }
+    }
+    out
+}
+
+/// The log `display-message -v` prints before its result. tmux's
+/// FORMAT_VERBOSE logs every step of the parse (format.c format_log); psmux
+/// logs the first and last of those lines, which are the template and the
+/// result exactly as tmux words them:
+///
+///   # expanding format: #{session_name}
+///   # result is: s
+pub fn display_verbose_trace(template: &str, result: &str) -> String {
+    format!("# expanding format: {}\n# result is: {}\n", template, result)
+}
+
+/// Encode a string the way tmux encodes the stdout of `display-message -p`.
+///
+/// `display-message` prints through `server_client_print(tc, 0, evb)`
+/// (cmd-display-message.c:152), and the `parse == 0` arm always runs
+/// `utf8_stravisx(&msg, data, size, VIS_OCTAL|VIS_CSTYLE|VIS_NOSLASH)`
+/// (server-client.c:3089-3091). `VIS_TAB` and `VIS_NL` are absent, so a tab or
+/// a newline in a format result still reaches stdout literally and a multi
+/// line `#{...}` value still prints as multiple lines; ESC, CR, BEL and every
+/// other control byte become printable escapes. Measured against tmux 3.4:
+///
+///   display-message -p "A<TAB>B"  => 41 09 42     (tab kept)
+///   display-message -p "A<CR>B"   => 41 5C 72 42  (`A\rB`)
+///   display-message -p "A<ESC>B"  => 41 5C 30 33 33 42  (`A\033B`)
+///   display-message -p "A<DEL>B"  => `A\177B`
+///   display-message -p "A<U+2713>B" => 41 E2 9C 93 42  (UTF-8 kept)
+pub fn visual_escape_message(src: &str) -> String {
+    vis_encode(src, false, false)
+}
+
+/// Sanitize a name the way tmux sanitizes window, session and buffer names.
+///
+/// tmux runs every externally supplied name through `clean_name`
+/// (tmux.c:303-317), which visually encodes it with
+/// `VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL`. A name therefore can never contain a
+/// raw control byte, so `#{window_name}` is always safe to drop into a tab or
+/// newline separated record, which is what #647 (WIN-03) asks for. Measured
+/// against tmux 3.4:
+///
+///   rename-window "w<TAB>x"  then #{window_name} => `w\tx`
+///   rename-window "w<ESC>y"  then #{window_name} => `w\033y`
+pub fn clean_name(src: &str) -> String {
+    vis_encode(src, true, true)
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue647_format_sanitize.rs"]
+mod tests_issue647_format_sanitize;
+
 #[cfg(test)]
 #[path = "../tests-rs/test_run_shell_format_and_start_dir.rs"]
 mod tests_run_shell_format_and_start_dir;
@@ -950,6 +1609,10 @@ mod tests_issue537_popup_attach;
 mod tests_nested_client_color_query;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue597_reply_fallback.rs"]
+mod tests_issue597_reply_fallback;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_deps_base64_parity.rs"]
 mod tests_deps_base64_parity;
 
@@ -960,3 +1623,23 @@ mod tests_issue560_quote_arg_control_bytes;
 #[cfg(test)]
 #[path = "../tests-rs/test_pipe_pane_cat_file_sink.rs"]
 mod tests_pipe_pane_cat_file_sink;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_str_prefix_within.rs"]
+mod tests_issue712_str_prefix_within;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue741_prompt_cursor_column.rs"]
+mod tests_issue741_prompt_cursor_column;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue741_prompt_window_edges.rs"]
+mod tests_issue741_prompt_window_edges;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_util_audit.rs"]
+mod tests_issue712_util_audit;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue750_prompt_emoji_width.rs"]
+mod test_issue750_prompt_emoji_width;

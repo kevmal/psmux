@@ -63,6 +63,20 @@ else {
 # intended behavior (no-command respawn gives the default shell) on a pane
 # that is still alive: a fresh long-lived `cat` pane.
 Write-Host "`n[Test 2] respawn-pane with no -- command still respawns the default shell" -ForegroundColor Yellow
+# The marker file appears when `cmd /c echo` has RUN, but the pane only closes
+# once that process has EXITED and the server has reaped it, which is a few
+# hundred ms later. Targeting $id in that window finds a still-live pane, and
+# `respawn-pane -k` on a live pane legitimately succeeds at rc 0, which is not
+# the case this arm pins. Wait for the id to actually leave the pane list
+# (2026-09-09 sweep: 3P/1F under load, 4P/0F standalone, i.e. a race, not a
+# product change).
+$gone = $false
+for ($i = 0; $i -lt 50; $i++) {
+    $ids = & $PSMUX list-panes -s -t $SESSION -F '#{pane_id}' 2>&1 | Out-String
+    if ($ids -notmatch [regex]::Escape($id)) { $gone = $true; break }
+    Start-Sleep -Milliseconds 100
+}
+if (-not $gone) { Write-Host "     (pane $id still listed after 5s; the gone-pane check below reflects that)" -ForegroundColor DarkGray }
 $out = & $PSMUX respawn-pane -k -t $id 2>&1
 if ($LASTEXITCODE -ne 0 -and "$out" -match "can't find pane") {
     Write-Pass "gone pane $id correctly rejected (rc=$LASTEXITCODE, tmux parity)"

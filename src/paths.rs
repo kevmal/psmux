@@ -45,10 +45,17 @@ fn windows_profile_dir() -> Option<String> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
-        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
-        // isize handle to match every other CloseHandle declaration in the
-        // crate (clashing_extern_declarations); cast at the call site.
         fn CloseHandle(h: isize) -> i32;
+    }
+    // Advapi32, not kernel32: `OpenProcessToken` is documented under
+    // Advapi32.lib / Advapi32.dll, and it is not in kernel32.lib.
+    // platform.rs:1142 already declares it under advapi32.
+    #[link(name = "advapi32")]
+    extern "system" {
+        // isize handles to match the declarations in platform.rs
+        // (clashing_extern_declarations, reported on PR 682); cast at the
+        // call site.
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
     }
     #[link(name = "userenv")]
     extern "system" {
@@ -56,14 +63,14 @@ fn windows_profile_dir() -> Option<String> {
     }
     const TOKEN_QUERY: u32 = 0x0008;
     unsafe {
-        let mut token: *mut c_void = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess() as isize, TOKEN_QUERY, &mut token) == 0 {
             return None;
         }
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
-        let ok = GetUserProfileDirectoryW(token, buf.as_mut_ptr(), &mut len);
-        CloseHandle(token as isize);
+        let ok = GetUserProfileDirectoryW(token as *mut c_void, buf.as_mut_ptr(), &mut len);
+        CloseHandle(token);
         if ok == 0 || len == 0 {
             return None;
         }
@@ -72,17 +79,26 @@ fn windows_profile_dir() -> Option<String> {
     }
 }
 
+/// Validate and normalize a PSMUX_DATA_DIR override value. Panics on a
+/// relative or empty value: silently resolving against the CWD would scatter
+/// the registry across working directories. Kept separate from the env read so
+/// the rejection can be tested without ever placing an invalid value in the
+/// process-global environment, which unlocked readers may observe mid-test.
+fn normalize_data_dir_override(raw: &std::ffi::OsStr) -> String {
+    let path = std::path::PathBuf::from(raw);
+    assert!(
+        path.is_absolute() && !path.as_os_str().is_empty(),
+        "PSMUX_DATA_DIR must be an absolute non-empty path"
+    );
+    path.to_string_lossy().trim_end_matches(['/', '\\']).to_string()
+}
+
 /// psmux data directory, without a trailing separator. Fallible variant for
 /// call sites that early-exit when home is missing (`.ok()?` /
 /// `Err(_) => return …`). `None` when no home directory is available.
 pub fn psmux_dir_opt() -> Option<String> {
     if let Some(raw) = std::env::var_os("PSMUX_DATA_DIR") {
-        let path = std::path::PathBuf::from(raw);
-        assert!(
-            path.is_absolute() && !path.as_os_str().is_empty(),
-            "PSMUX_DATA_DIR must be an absolute non-empty path"
-        );
-        return Some(path.to_string_lossy().trim_end_matches(['/', '\\']).to_string());
+        return Some(normalize_data_dir_override(&raw));
     }
     let home = home_dir();
     if home.is_empty() {
@@ -187,6 +203,36 @@ pub fn pid_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.pid", psmux_dir(), session.as_ref())
 }
 
+/// Path to the remembered host palette, shared by every server in this data
+/// root.
+///
+/// A server learns its terminal's colours only when a client attaches and
+/// reports them, and the palette is planted in every pane child's environment at
+/// spawn time. So the spares a fresh server pre spawned are holding the wrong
+/// palette the instant that first report arrives, and retiring them (#473
+/// follow up) costs the user's first split a whole shell startup: measured 18 ms
+/// without the report against 335 ms median and 807 ms worst with it.
+///
+/// The palette of a given terminal is the same every time, so remembering the
+/// last one and spawning spares with it makes that first report agree and the
+/// retirement never happen. A wrong guess is self correcting: the report differs,
+/// the spares are retired exactly as before, and the new value is remembered.
+pub fn host_colors_file() -> String {
+    format!("{}\\host_colors", psmux_dir())
+}
+
+/// Path to a standby's `.held` marker (issue #734).
+///
+/// A `__warm__` standby is internal: CLI routing never picks it. tmux has no
+/// standby, but it does have the empty server that `start-server` plus
+/// `set -g exit-empty off` leaves behind, and a client may query that server
+/// before it has any session. The standby writes this file while it is
+/// unclaimed with `exit-empty` off, which is exactly that state, and routing
+/// then treats it as the namespace's live, empty server.
+pub fn held_file(session: impl AsRef<str>) -> String {
+    format!("{}\\{}.held", psmux_dir(), session.as_ref())
+}
+
 /// Path to a session's `.spawnlock` file (the warm-pool spawn lock).
 pub fn spawnlock_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
@@ -253,6 +299,19 @@ mod tests {
     #[test]
     fn psmux_dir_is_home_relative_dot_psmux() {
         let _lock = crate::util::lock_test_env();
+        // What the data dir resolves to when nothing overrides it, so clear the
+        // override for the duration (restored on drop, panic included): the
+        // suite is meant to run with PSMUX_DATA_DIR at a scratch directory.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(v) = self.0.take() {
+                    std::env::set_var("PSMUX_DATA_DIR", v);
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("PSMUX_DATA_DIR"));
+        std::env::remove_var("PSMUX_DATA_DIR");
         // The test environment always has a home, so the data dir resolves to
         // {home}\.psmux and the two accessors agree.
         let dir = psmux_dir();

@@ -48,6 +48,7 @@
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_warm_chain_runaway.ps1
 
 $ErrorActionPreference = 'Continue'
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $PSMUX = (Get-Command psmux -ErrorAction Stop).Source
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $NS = 'wchainrb'
@@ -80,12 +81,9 @@ function Query-LiveSessionName($port, $key) {
         $writer.NewLine = "`n"; $writer.AutoFlush = $true
         $writer.WriteLine("AUTH $key")
         $writer.Write("display-message -p '#{session_name}'`n")
-        Start-Sleep -Milliseconds 200
-        $buf = New-Object byte[] 4096
-        $sb = New-Object System.Text.StringBuilder
-        try { while ($stream.DataAvailable) { $n = $stream.Read($buf,0,$buf.Length); if ($n -le 0) {break}; $sb.Append([System.Text.Encoding]::UTF8.GetString($buf,0,$n)) | Out-Null } } catch {}
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $raw = (Read-TcpReplyToEof -Stream $stream -TimeoutMs 500).Trim()
         $client.Close()
-        $raw = $sb.ToString().Trim()
         $lines = @($raw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
         if ($lines.Count -eq 0) { return $null }
         if ($lines[0] -eq "OK" -and $lines.Count -gt 1) { return $lines[1] }
@@ -176,9 +174,16 @@ if ($liveWarmCount -le 1) { P "at most one genuinely-live warm server observed (
 else { F "multiple ($liveWarmCount) simultaneously live-verified warm servers observed -- possible duplicate-warm-spawn regression" }
 
 # Check 4: total process count stays bounded relative to requested concurrency
-# (no unbounded/runaway growth -- allow N plus a small multiple for transient
-# warm replenish children).
-$bound = $N + 30
+# (no unbounded/runaway growth). The bound is derived, not guessed: at the
+# instant of the sample each of the N claimants may own one server plus one
+# replacement standby it has just spawned and not yet handed on, so 2N is the
+# most a healthy pool can show. A runaway chain (the bug this suite guards)
+# grows past that without limit, and checks 1 to 3 above catch its shape
+# exactly. The old bound of N + 30 was a guess and flapped on the timing of the
+# sample alone: 69, 69, 74, 72, 74, 68, 72 and 73 on master builds across
+# 2026-10-03 (sweep 2026-10-03_14-07-51 failed at 73 with every other check
+# passing, and three reruns of the suite alone gave 0 and 1).
+$bound = 2 * $N
 if ($procs.Count -le $bound) { P "psmux.exe process count bounded ($($procs.Count) <= $bound for N=$N concurrent claimants)" }
 else { F "psmux.exe process count unbounded: $($procs.Count) processes for $N claimants (bound was $bound)" }
 

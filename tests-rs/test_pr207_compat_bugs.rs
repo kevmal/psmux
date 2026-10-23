@@ -25,6 +25,7 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -117,7 +118,7 @@ fn show_buffer_with_b_flag_retrieves_named_buffer() {
     let mut app = mock_app_with_window();
     app.control_port = None;
     // Add positional buffers
-    app.paste_buffers.insert(0, "STACK_TOP".to_string());
+    app.paste_add("STACK_TOP".to_string());
     // Add named buffer
     app.named_buffers.insert("myname".to_string(), "NAMED_CONTENT".to_string());
     // show-buffer -b myname should show NAMED_CONTENT
@@ -149,7 +150,7 @@ fn paste_buffer_command_exists_and_runs() {
     // Control: paste-buffer should at least not crash
     let mut app = mock_app_with_window();
     app.control_port = None;
-    app.paste_buffers.insert(0, "test_data".to_string());
+    app.paste_add("test_data".to_string());
     // This calls paste_latest which writes to the active pane's PTY.
     // In test mode without a real PTY, it may fail gracefully.
     let result = execute_command_string(&mut app, "paste-buffer");
@@ -161,7 +162,7 @@ fn paste_buffer_command_exists_and_runs() {
 fn paste_buffer_alias_pasteb() {
     let mut app = mock_app_with_window();
     app.control_port = None;
-    app.paste_buffers.insert(0, "alias_test".to_string());
+    app.paste_add("alias_test".to_string());
     let result = execute_command_string(&mut app, "pasteb");
     let _ = result;
     // Should not panic or return an unknown-command error

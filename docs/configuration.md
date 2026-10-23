@@ -21,6 +21,34 @@ psmux -f NUL
 
 This sets the `PSMUX_CONFIG_FILE` environment variable internally, which the server checks before searching the default locations.
 
+### Commands in the config file
+
+The config file may hold any command, not only options and bindings, and its lines run in order, as
+`source-file` runs a file (see [Reloading Configuration at Runtime](#reloading-configuration-at-runtime)).
+The options and bindings before the file's first command apply before the session's first window is
+made. From that command on, the lines run one after another once the window exists: a `run-shell`
+without `-b` holds the lines after it until the shell command ends, as in tmux, and a `run-shell` that
+calls back into psmux is answered while it runs.
+
+Each psmux session is a server of its own, and each loads the config when it starts. That makes three
+differences from tmux, which runs the config once, before any session exists:
+
+- A command that acts on a session, such as `split-window`, `rename-window` or `send-keys`, acts on
+  the session that is starting. tmux has no session at that point and fails it.
+- A `new-session` in the config makes that session, detached. Of the config's commands, the session
+  it makes runs only `run-shell` and the buffer commands (`set-buffer`, `load-buffer`,
+  `delete-buffer`): in tmux it would share one server with the session that ran the config, and with
+  it the buffers and whatever the shell commands set. Its options and bindings apply as in any
+  session. Every session that starts runs the line, so with `new-session -d -s work` the sessions
+  after the first report `duplicate session: work`.
+- An option set after the first command, such as `default-shell`, applies to the windows and panes
+  made after it, not to the session's first pane. Put options that the first pane needs before the
+  first command.
+
+`psmux new-session -d` returns once the session exists, which may be before the config's commands have
+run. A command that fails is reported in `config-warnings.log` and on the status line, at its file and
+line.
+
 ## Basic Config Example
 
 Create `~/.psmux.conf`:
@@ -40,7 +68,8 @@ set -g status-left "[#S] "
 set -g status-right "%H:%M %d-%b-%y"
 set -g status-style "bg=green,fg=black"
 
-# Cursor style: block, underline, or bar
+# Cursor shape. Leave both out, as most configs do, and psmux asks for no
+# shape, so the cursor you had before starting it is the cursor you keep.
 set -g cursor-style bar
 set -g cursor-blink on
 
@@ -57,7 +86,18 @@ bind-key -T prefix v split-window -v
 
 ## Choosing a Shell
 
-psmux launches **PowerShell 7 (pwsh)** by default. You can change this:
+psmux launches **PowerShell 7 (pwsh)** by default, whatever shell you typed `psmux` into.
+Like tmux, it does not look at the launching shell; it looks at the environment. If the
+`SHELL` environment variable names a shell psmux can start (an absolute path to an
+`.exe`, `.cmd`, `.bat` or `.com` that exists, or a bare name such as `powershell` that
+resolves on `PATH`), that shell becomes the initial `default-shell`, exactly as tmux seeds
+`default-shell` from `$SHELL`. A `SHELL` that is not a Windows path, does not exist, or
+points at psmux itself is ignored and the usual walk (`pwsh`, then `powershell`, then
+`cmd`) applies. One consequence worth knowing: a login Git Bash (the Windows Terminal
+Git Bash profile runs `bash.exe -i -l`) hands Windows children
+`SHELL=C:\Program Files\Git\usr\bin\bash.exe`, so `psmux` typed into that tab opens bash
+panes, just as tmux would. Setting `default-shell` in your config overrides both. You can
+change this:
 
 ```tmux
 # Use cmd.exe
@@ -122,13 +162,15 @@ Details worth knowing:
 
 ## All Set Options
 
+As in tmux, a name that is neither in this table, nor in tmux's own options table, nor a `@user` option is refused: `set-option` and `show-options` fail with `invalid option: NAME`, and `-q` makes that a silent success that sets nothing. In a config file it is reported as `unknown option 'NAME'` and skipped. A tmux option psmux does not implement (`visual-silence`, `lock-command` and so on) is accepted and read back as text. Use `set-environment`, not `set-option`, for environment variables.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `prefix` | Key | `C-b` | Prefix key |
 | `prefix2` | Key | `none` | Secondary prefix key (optional) |
 | `base-index` | Int | `0` | First window number |
 | `pane-base-index` | Int | `0` | First pane number |
-| `escape-time` | Int | `500` | Escape delay (ms) |
+| `escape-time` | Int | `500` | Escape delay (ms); fork retains its pre-upgrade default (upstream: 10) |
 | `repeat-time` | Int | `500` | How long a key bound with `bind-key -r` keeps repeating without the prefix, in ms. Range `0` to `2000000`; `0` disables repeat |
 | `history-limit` | Int | `2000` | Scrollback lines per pane |
 | `priority` | Str | `above-normal` | Scheduling class for psmux's own processes: `normal`, `above-normal`, `high`. Pane shells and the programs you run are never raised. See [Process Priority](#process-priority) |
@@ -139,8 +181,10 @@ Details worth knowing:
 | `mouse-selection` | Bool | `on` | psmux's client-side drag selection. Set `off` to let in-pane TUI apps (opencode, nvim, etc.) handle their own mouse selection without psmux drawing on top |
 | `mouse-selection-force` | Bool | `off` | Keep psmux drag selection active in apps that request mouse tracking. Plain clicks are replayed to the app; drags are copied by psmux |
 | `scroll-enter-copy-mode` | Bool | `on` | Enter copy mode on mouse scroll (set `off` to disable) |
+| `ctrl-wheel-zoom` | Bool | `off` | Windows Terminal only: Ctrl+Wheel zooms the terminal font one step per notch instead of scrolling the pane. psmux has mouse reporting on, so Windows Terminal forwards Ctrl+Wheel to it; with this on, psmux sends Windows Terminal its default zoom keys (Ctrl+Numpad Plus / Minus) back. Does nothing over SSH, in other terminals, or when `experimental.scrollToZoom` is `false` in that terminal's settings |
+| `mouse-drag-enter-copy-mode` | Bool | `off` | Enter copy mode and select there on a left-button drag in a pane that does not track the mouse (tmux's `MouseDragStart` → `copy-mode -M`) instead of the psmux client-side selection overlay |
 | `pwsh-mouse-selection` | Bool | `off` | tmux-like release-copy selection with word/line multi-click and pane-clipped extraction |
-| `paste-detection` | Bool | `on` | Detect Ctrl+V paste from console host and send as bracketed paste (set `off` to let Ctrl+V reach child apps like neovim) |
+| `paste-detection` | Bool | `on` | Reassemble a terminal's Ctrl+V paste into one bracketed paste. A Ctrl+V the terminal does not paste on reaches bindings and the pane as C-v either way (set `off` to forward every key as typed) |
 | `choose-tree-preview` | Bool | `off` | Open `choose-session` / `choose-tree` pickers with the live preview pane already visible (saves pressing `p`). See [preview.md](preview.md) |
 | `bold-is-bright` | Bool | `on` | Restore standard SGR codes for the 16 basic colors so the outer terminal renders `bold` as bright (matches a bare shell). Set `off` to keep explicit 256-indexed low colors byte-accurate. See [Bold Is Bright](#bold-is-bright-color-rendering) |
 | `status` | Bool/Int | `on` | Show status bar (number = line count) |
@@ -149,6 +193,7 @@ Details worth knowing:
 | `status-left-length` | Int | `10` | Max width of status-left |
 | `status-right-length` | Int | `40` | Max width of status-right |
 | `focus-events` | Bool | `off` | Pass focus events to apps |
+| `program-status` | Bool | `off` | psmux extension. Accept OSC 7501 program status reports and answer its capability query. Off, OSC 7501 is ignored and the query draws no reply. See [program-status.md](program-status.md) |
 | `alternate-screen` | Bool | `on` | Honour the DEC 47 / 1049 alternate screen. Set `off` so full screen program output lands in the scrollback instead of being discarded on exit. See [Alternate Screen](#alternate-screen) |
 | `mode-keys` | Str | `emacs` | `vi` or `emacs` |
 | `status-keys` | Str | | Editing style at the command prompt. Only the literal `vi` is checked; any other value (including unset) keeps emacs style editing |
@@ -169,24 +214,28 @@ Details worth knowing:
 | `exit-empty` | Bool | `on` | Exit server when all windows closed |
 | `set-titles` | Bool | `off` | Update terminal title |
 | `set-titles-string` | Str | | Terminal title format |
-| `default-shell` | Str | `pwsh` | Shell to launch |
+| `default-shell` | Str | `$SHELL` if usable, else `pwsh` | Shell to launch (then `powershell`, then `cmd`) |
 | `default-command` | Str | | Alias for default-shell |
-| `word-separators` | Str | `" -_@"` | Copy-mode word delimiters |
+| `word-separators` | Str | ASCII punctuation except `_` | Characters that split words in copy mode, besides whitespace. The default is every printable ASCII character that is neither a letter nor a digit, minus the underscore, as in tmux |
 | `activity-action` | Str | `other` | Action on window activity: `any`, `none`, `current`, `other` |
 | `silence-action` | Str | `other` | Action on window silence: `any`, `none`, `current`, `other` |
 | `bell-action` | Str | `any` | Bell action: controls audible bell forwarding and status bar flag (`any`, `none`, `current`, `other`) |
 | `visual-bell` | Bool | `off` | Visual bell indicator |
 | `allow-passthrough` | Str | `off` | Allow terminal passthrough sequences (`on`/`off`/`all`) |
+| `extended-keys` | Choice | `off` | Whether a pane may ask for extended keys, as in tmux (`off`/`on`/`always`). Extended keys from the terminal are always decoded. With `on`, a program that writes `CSI > 4 ; 1 m` or `CSI > 4 ; 2 m` (Neovim does) gets modified keys such as `C-Space` in the extended form; `always` puts every pane in mode 1. `#{pane_key_mode}` shows `VT10x`, `Ext 1` or `Ext 2`. A pane that reads console records keeps win32 input mode records |
+| `extended-keys-format` | Choice | `xterm` | The format of extended keys written to a pane: `xterm` is `CSI 27;m;k~`, `csi-u` is `CSI k;mu` |
 | `allow-rename` | Bool | `on` | Allow programs to set window title via escape sequences |
 | `allow-set-title` | Bool | `off` | Allow programs to set pane title via OSC 0/2 escape sequences (see [pane-titles.md](pane-titles.md)) |
 | `allow-predictions` | Bool | `off` | Preserve PSReadLine prediction settings (see below) |
 | `default-terminal` | Str | | Terminal type string (sets `TERM` env var in panes) |
-| `update-environment` | Str | *(tmux defaults)* | Space-separated list of env vars to refresh on client attach |
+| `update-environment` | Str | *(tmux defaults)* | Space-separated glob patterns; at new-session and on every attach each matching variable of the client's environment is copied into the session environment, and a pattern nothing matches is recorded as a `-NAME` removal (tmux environ_update) |
 | `warm` | Bool | `on` | Pre-spawn shells for instant window/pane creation (see [warm-sessions.md](warm-sessions.md)) |
 | `copy-command` | Str | | Shell command for clipboard pipe |
-| `set-clipboard` | Str | `on` | Clipboard interaction (`on`/`off`/`external`) |
-| `main-pane-width` | Int | `0` | Main pane width in main-vertical layout |
-| `main-pane-height` | Int | `0` | Main pane height in main-horizontal layout |
+| `codepoint-widths` | Str | | Comma separated overrides for how many columns Unicode codepoints occupy (see [Codepoint widths](#codepoint-widths)) |
+| `terminal-overrides` | Str | | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
+| `set-clipboard` | Str | `on` | Clipboard interaction (`on`/`off`/`external`). A copy mode yank reaches the Windows clipboard on every value, with OSC 52 to the outer terminal unless `off`. An application's own OSC 52 creates a paste buffer only on `on`, as in tmux; on `external` psmux still forwards it to the outer terminal and the Windows clipboard, where tmux ignores it; `off` ignores it |
+| `main-pane-width` | String | `80` | Main pane width in the main-vertical layout, in cells or a percentage such as `30%` |
+| `main-pane-height` | String | `24` | Main pane height in the main-horizontal layout, in cells or a percentage such as `30%` |
 | `session-group` | Str | | Name of the session group this session joins. `none` or an empty value clears it. See [Session Groups](#session-groups) |
 | `command-alias` | Str | | Define your own command alias as `alias=expansion`. See [Command Aliases](#command-aliases) |
 
@@ -207,20 +256,24 @@ Details worth knowing:
 | `pane-border-style` | Str | | Inactive border style |
 | `pane-active-border-style` | Str | `fg=green` | Active border style |
 | `pane-border-hover-style` | Str | `fg=yellow` | Border style while the mouse hovers a draggable pane border |
+| `pane-border-indicators` | Str | `colour` | How the active pane is marked on its borders: `off` (no cue), `colour`, `arrows`, `both`. See [Pane Border Indicators](#pane-border-indicators) |
 | `pane-border-lines` | Str | `single` | Border glyph set: `single`, `double`, `heavy`, `simple`, `number`, `spaces`, `none`. See [Pane Border Lines](#pane-border-lines) |
 | `pane-border-format` | Str | | Pane border format string (e.g. `#{pane_index}: #{pane_title}`) |
 | `pane-border-status` | Str | | Pane border status position (`top`/`bottom`/`off`) |
 | `copy-mode-line-number-style` | Str | `fg=brightblack` | Style of the copy-mode line number gutter |
 | `copy-mode-current-line-number-style` | Str | `fg=yellow,bold` | Style of the line number on the copy-mode cursor row |
+| `copy-mode-match-style` | Str | `bg=cyan,fg=black` | Style of search matches in copy mode |
+| `copy-mode-current-match-style` | Str | `bg=magenta,fg=black` | Style of the search match under the copy-mode cursor |
+| `copy-mode-mark-style` | Str | `bg=red,fg=black` | Style of the line marked with `X` (set-mark); the marked cell has its colours swapped |
 | `window-style` | Str | | Style applied to the contents of panes that are not the active pane (tmux `options-table.c` wording), and the fallback for the active pane; fills only cells whose colour is the terminal default. Also accepts `dim=N` (0 to 100 percent) |
 | `window-active-style` | Str | | Style applied to the contents of the active pane; each of `fg` and `bg` falls back to `window-style` when this option does not name it. Explicit application colours always win. Also accepts `dim=N` |
-| `popup-border-style` | Str | `fg=yellow` | Border style of `display-popup` overlays |
-| `popup-border-lines` | Str | `single` | Popup border glyph set: `single`, `double`, `heavy`, `rounded` |
-| `popup-style` | Str | | Accepted and stored, but never read. See [Accepted but Not Functional](#accepted-but-not-functional) |
+| `popup-border-style` | Str | `fg=yellow` | Border style of `display-popup` overlays. `display-popup -S` overrides its colours for one popup |
+| `popup-border-lines` | Str | `single` | Popup border glyph set: `single`, `double`, `heavy`, `simple`, `rounded`, `padded`, `none`. `display-popup -b` overrides it for one popup, `-B` draws no border |
+| `popup-style` | Str | | Colours of the popup content area: cells the program leaves at the terminal default take them. `display-popup -s` overrides its colours for one popup |
 | `clock-mode-colour` | Str | | Colour of the `clock-mode` digits |
 | `clock-mode-style` | Str | | Accepted and stored, but never read. See [Accepted but Not Functional](#accepted-but-not-functional) |
-| `window-status-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Inactive tab format. Equivalent to tmux's `#I:#W#F`, written out so a flagless window still reserves one space |
-| `window-status-current-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Active tab format. Same shape as `window-status-format` |
+| `window-status-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Inactive tab format. See [program-attention opt-in](program-status.md#opt-in-to-attention-indicators) |
+| `window-status-current-format` | Str | `#I:#W#{?window_flags,#{window_flags}, }` | Active tab format. |
 | `window-status-separator` | Str | `" "` | Tab separator |
 | `window-status-style` | Str | | Inactive tab style |
 | `window-status-current-style` | Str | | Active tab style |
@@ -290,6 +343,28 @@ set -g pane-border-lines none
 
 `number` is accepted for tmux compatibility and renders the same as `single`. Any unrecognised value also falls back to `single`.
 
+### Pane Border Indicators
+
+`pane-border-indicators` controls how the focused pane is marked on its borders.
+
+| Value | What the borders next to the active pane look like |
+| --- | --- |
+| `off` | No active-pane cue at all. Every separator keeps `pane-border-style`, and no arrows are drawn. |
+| `colour` (default) | A two-pane divider is split between `pane-border-style` and `pane-active-border-style`. With more than two panes the separators adjacent to the active pane use `pane-active-border-style`. |
+| `arrows` | The separators adjacent to the active pane use `pane-active-border-style`, plus inward-pointing markers on those separators and on the focused floating pane's border. No colour split. |
+| `both` | The `colour` split plus the `arrows` markers. |
+
+`pane-active-border-style` therefore applies in every mode except `off`, which is
+a genuine no-cue mode. When a floating pane owns focus, the tiled active cues are
+suppressed so the highlight follows the pane that actually has focus.
+
+```tmux
+set -g pane-border-indicators arrows
+```
+
+`pane-border-indicators` is a global/default setting; per-window values are
+unsupported.
+
 ### Copy Mode Line Numbers
 
 Copy mode can draw a line number gutter down the left edge. It is off by default:
@@ -320,6 +395,79 @@ set -g copy-mode-line-number-style "fg=brightblack"
 # The line number on the cursor row
 set -g copy-mode-current-line-number-style "fg=yellow,bold"
 ```
+
+The gutter does not move what the mouse points at: a click or a drag in copy
+mode selects the cell under the pointer whichever mode is set.
+
+### Cursor
+
+**With neither option set, which is how most configurations run, psmux asks
+the terminal for no cursor shape at all, so the cursor you had before starting
+psmux is the cursor you see inside it, blinking or steady as you had it.** A
+program running in a pane can still ask for its own shape, exactly as it would
+outside psmux, and psmux passes that through. This is what tmux does as well:
+its `cursor-style` defaults to `default`, and it sends a shape only once
+something has asked for one.
+
+When psmux does change the cursor, it puts it back on the way out, shape and
+blinking both, rather than resetting the terminal to its own default. It asks
+the terminal at attach what it is drawing (DECRQSS for the shape, DECRQM for
+DEC private mode 12) and writes that back when the session ends. A terminal
+that will not answer gets the plain reset instead, which is where tmux stops.
+
+`cursor-style` is the shape psmux asks for when you do want it to pick:
+
+```tmux
+# Steady shapes
+set -g cursor-style block
+set -g cursor-style underline
+set -g cursor-style bar
+
+# The same three, blinking. tmux spells them this way and carries no separate
+# blink option, so a configuration written for tmux works unchanged
+set -g cursor-style blinking-block
+set -g cursor-style blinking-underline
+set -g cursor-style blinking-bar
+
+# Back to asking for nothing
+set -g cursor-style default
+```
+
+`cursor-blink` adds or removes the blink of whichever shape is named, so it is
+another way to spell the same six:
+
+```tmux
+# A blinking bar, two ways
+set -g cursor-style blinking-bar
+set -g cursor-style bar
+set -g cursor-blink on
+
+# A steady bar, two ways
+set -g cursor-style bar
+set -g cursor-style blinking-bar
+set -g cursor-blink off
+```
+
+Set, `cursor-blink` decides; left alone, the shape's own name decides.
+
+It can also be set on its own, with no `cursor-style` at all:
+
+```tmux
+# Blink the cursor the terminal already draws, whatever shape that is
+set -g cursor-blink on
+```
+
+A shape is asked for with DECSCUSR, which says whether it blinks, so there is
+nothing more to send for it. Without a shape there is no such code, and the
+blink goes out as DEC private mode 12 instead, which asks for the blink alone.
+Either way it is sent only because you asked: leave both options out and
+nothing is sent at all.
+
+That last form is the one terminals differ on. Windows Terminal acts on mode
+12; WezTerm 20240203 records it, and reports it back when asked, but goes on
+drawing the cursor it was drawing. Both of them act on the blink a DECSCUSR
+code carries, so naming a shape is the form that works everywhere:
+`set -g cursor-style blinking-bar`, or `bar` with `cursor-blink on`.
 
 ### Popup and Window Styling
 
@@ -373,9 +521,9 @@ set -g window-style "bg=colour52,dim=40"
 set -g window-active-style "bg=colour52"
 ```
 
-`popup-border-lines` accepts `single` (the default), `double`, `heavy` and `rounded`. The values `none` and `simple` are accepted but render as plain single lines, because a popup always draws a border.
+`popup-border-lines` accepts the tmux set: `single` (the default), `double`, `heavy`, `simple` (`+`, `-` and `|`), `rounded`, `padded` (blank cells) and `none`. With `none`, or `display-popup -B`, the popup has no frame and its command gets the whole `-w` by `-h` area. As in tmux, only the colours of `popup-border-style` and `popup-style` are used, a popup has no title unless `display-popup -T` gives one, and the `-S` and `-s` flags of `display-popup` win over the options for that popup.
 
-> **Note:** `popup-style` and `clock-mode-style` are accepted and stored but never read. See [Accepted but Not Functional](#accepted-but-not-functional).
+> **Note:** `clock-mode-style` is accepted and stored but never read. See [Accepted but Not Functional](#accepted-but-not-functional).
 
 ### Bell
 
@@ -475,23 +623,23 @@ This option is independent of `mouse` (which controls whether mouse events are r
 
 ### Paste Detection (Ctrl+V Passthrough)
 
-On Windows, the console host intercepts Ctrl+V, reads the clipboard, and injects the content as character events. psmux detects this pattern and reassembles it into a single bracketed paste for child applications. This is the `paste-detection` option and it is enabled by default.
+On Windows, a terminal that pastes on Ctrl+V (Windows Terminal does by default) takes the key itself and hands psmux the clipboard as a burst of character events. psmux detects this pattern and reassembles it into a single bracketed paste for child applications. This is the `paste-detection` option and it is enabled by default.
 
-If you use TUI applications like **neovim** or **vim** where Ctrl+V has a different meaning (visual block mode), the paste detection will intercept the keypress before it reaches the application. To let Ctrl+V pass through to the child app:
+If the terminal does **not** paste on Ctrl+V (for example Windows Terminal with its `ctrl+v` paste action removed), the key reaches psmux as an ordinary key and is treated like one, as in tmux: a binding such as `bind -n C-v split-window -h` runs and pastes nothing, and with no binding the pane receives C-v, so **neovim** and **vim** get visual block mode. psmux waits a moment after the press to tell this apart from a terminal that delivers the press and then the pasted characters.
+
+If the terminal itself pastes on Ctrl+V, the key never reaches psmux or the application, and only the terminal's own setting can change that. To stop psmux from reassembling character bursts into bracketed pastes:
 
 ```tmux
-# Disable paste detection so Ctrl+V reaches child apps
+# Forward every key as typed, with no paste reassembly
 set -g paste-detection off
 ```
 
-With paste detection off, you can still paste using:
+You can paste using:
 
 * **Ctrl+Shift+V** (Windows Terminal default paste shortcut)
 * **Right click** (paste in most terminals)
 * **Prefix + ]** (psmux paste from buffer)
 * **`psmux send-keys C-v`** from another terminal
-
-> **Note:** `unbind-key -n C-v` alone is not sufficient to stop Ctrl+V interception because the paste detection operates outside the key binding system. You must use `set -g paste-detection off`.
 
 ### Live Preview in Choosers
 
@@ -593,7 +741,7 @@ bind-key M-s split-window -h \; select-pane -L
 bind-key D split-window -v -p 30 \; split-window -h \; select-pane -t 0
 ```
 
-In config files, escape the semicolon with `\;` so it is not treated as a comment delimiter.
+Each command ends at a newline or a `;`, in a config file as at the command prompt, so `set -g @a on ; set -g @b on` sets both. A `;` inside quotes, inside a `{ }` block or after a `#` that starts a comment is not a separator. Write `\;` where the semicolon has to stay inside a command's arguments, which is how a key binding holds a list of commands, as above. A plain `;` ends the `bind-key` itself: `bind-key x split-window ; select-pane -L` binds `split-window` and runs `select-pane -L` at once, as in tmux.
 
 ### Case-Sensitive Key Bindings
 
@@ -624,8 +772,8 @@ bind-key C-Space send-prefix
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `prediction-dimming` | Bool | `off` | Dim predictive/speculative text |
-| `cursor-style` | Str | `bar` | Cursor shape: `block`, `underline`, or `bar` |
-| `cursor-blink` | Bool | `on` | Cursor blinking |
+| `cursor-style` | Str | `default` | The cursor shape psmux asks the terminal for. `block`, `underline` and `bar` are steady; `blinking-block`, `blinking-underline` and `blinking-bar` blink; `default` asks for no shape at all. See [Cursor](#cursor) |
+| `cursor-blink` | Bool | `off` | Adds or removes the blink of the shape above: `on` makes a steady shape blink, `off` stops a blinking one. Set on its own, with no shape named, it asks the terminal for the blink alone and leaves the shape as it was. See [Cursor](#cursor) |
 | `env-shim` | Bool | `on` | Inject Unix-compatible `env` function in PowerShell panes |
 | `claude-code-fix-tty` | Bool | `on` | Patch Node.js process.stdout.isTTY for Claude Code |
 | `claude-code-force-interactive` | Bool | `on` | Set CLAUDE_CODE_FORCE_INTERACTIVE=1 in panes |
@@ -784,7 +932,7 @@ Notes:
 - Only the first matching branch runs. Once one has, later `%elif` and `%else` branches are skipped.
 - `%hidden` assignments inside a skipped branch are not applied.
 - The two ways to read a `%hidden` variable are not interchangeable. `$NAME` and `${NAME}` are substituted only on ordinary config lines, so they do **not** work inside a `%if` condition. Use the format form `#{NAME}` there, which resolves through the same session environment.
-- `%hidden` writes into the session environment, so the name is also visible to `show-environment` and is inherited by new panes. It is not a private compile-time constant.
+- `%hidden` writes a hidden entry into the global environment, as tmux does: it is usable as `$NAME` and `#{NAME}`, it is listed only by `show-environment -gh`, and it is never passed to new panes.
 
 ## Accepted but Not Functional
 
@@ -794,10 +942,8 @@ setting that was never wired up.
 
 | Option | Status |
 |---|---|
-| `terminal-overrides` | An explicit no-op. The config file path parses it and throws the value away; the runtime `set-option` path keeps it in the user options map. Neither is ever read, because terminfo overrides have no meaning on Windows, where psmux talks to ConPTY rather than to a terminfo database. Use `default-terminal` to control the `TERM` value panes see |
 | `lock-after-time` | Accepted and stored. Session locking is not implemented, so the timer never runs. `lock-client`, `lock-server` and `lock-session` exist as commands but nothing locks on a timer |
 | `lock-command` | Accepted and stored. Never read, for the same reason |
-| `popup-style` | Accepted and stored. Popup borders are styled by `popup-border-style`; the popup body itself is not styled yet |
 | `clock-mode-style` | Accepted and stored. Use `clock-mode-colour`, which is read |
 
 Setting any of these produces no warning, because the values are stored verbatim in the user options
@@ -835,15 +981,17 @@ hatch you want for one invocation rather than forever.
 | Variable | Effect |
 |---|---|
 | `PSMUX_CURSOR_STYLE` | Cursor shape: `bar`, `block`, `underline`, or `default`. Normally set for you by `set -g cursor-style` |
-| `PSMUX_CURSOR_BLINK` | Cursor blink. `0` disables it. Normally set for you by `set -g cursor-blink` |
+| `PSMUX_CURSOR_BLINK` | Cursor blink. `1`, `on` or `true` enables it, anything else disables it, and leaving it unset is not the same as `0`: see `cursor-blink` above. Normally set for you by `set -g cursor-blink` |
 | `PSMUX_DIM_PREDICTIONS` | Dim PSReadLine prediction text for this shell only. The option form is `prediction-dimming` |
 | `PSMUX_HOST_COLORS` | Supplies the host terminal's palette so psmux can answer OSC 4, 10 and 11 colour queries. psmux normally queries the host itself; set this when the host misreports or when the query cannot run |
+| `PSMUX_XTVERSION_NAME` | The terminal name psmux reports when a pane asks XTVERSION (`ESC [ > q`). Defaults to `tmux`, matching the identity a pane already sees in `$TMUX` and in the first line of `psmux -V`. Set it to `psmux` to be announced under psmux's own name |
 
 ### Windows and transport escape hatches
 
 | Variable | Effect |
 |---|---|
 | `PSMUX_NO_PASSTHROUGH` | Set to `1` to disable the experimental ConPTY passthrough flag on Windows build 22621 and newer. Use this if pane creation fails with `ERROR_INVALID_PARAMETER` |
+| `PSMUX_CONPTY_DIR` | Point at a directory holding a `conpty.dll` and the `OpenConsole.exe` beside it, and every pane is hosted by that console host instead of the inbox `conhost.exe`. psmux ships neither file and loads nothing unless you name the directory. A directory that does not exist, or a DLL that will not load, falls back to the system ConPTY with a logged reason. This is an escape hatch for a host whose inbox console has a defect you cannot otherwise get around, and it has costs of its own: see the console host seam in `docs/diagnostics.md` for the measurements. The host is chosen once per server, so a new session takes the value from the shell that creates it: a standby server started with a different value is not claimed, and the session starts cold instead |
 | `PSMUX_PIPE_VT` | Forces pipe mode VT handling for Cygwin and MSYS style PTYs. `1` forces it on, `0` forces it off. Left unset, psmux detects the pipe itself |
 | `PSMUX_BARE_ENV` | Spawn panes with a bare environment instead of inheriting yours. Useful when a broken inherited variable stops shells from starting |
 | `PSMUX_FORCE_MOUSE` | Overrides the ConPTY mouse safety gate. On Windows builds below 22523 psmux refuses to enable mouse reporting, because on Windows 10 era conhost the first click could fast fail the console host and take the pane down with it. Some later builds under that threshold, Windows Server 2022 (20348) among them, handle mouse perfectly well but still need psmux to write the enable sequence itself. Set to `1` there to get the mouse back. Set to `0` to force it off on a newer build whose console host misbehaves. Accepts `1`, `on`, `true`, `yes` and their negatives. If your session dies the moment you click, unset it |
@@ -889,10 +1037,17 @@ psmux set-environment MY_VAR value
 # Unset an env var
 psmux set-environment -gu MY_VAR
 
-# Show all environment variables
+# Keep a variable OUT of new panes, even one the server inherited
+psmux set-environment -r MY_VAR
+
+# Show the session environment, the global one, or one variable
 psmux show-environment
 psmux show-environment -g
+psmux show-environment MY_VAR      # MY_VAR=value, -MY_VAR, or "unknown variable: MY_VAR" (exit 1)
+psmux show-environment -s          # shell syntax: NAME="value"; export NAME;
 ```
+
+As in tmux there are two scopes. The global environment (`-g`) is the server's start environment (the environment of the shell that started the session) plus anything set with `-g`; the session environment holds what was set without `-g`, and `new-session -e`. A new pane gets the global environment with the session one laid over it, without names removed by `-r` or marked hidden with `-h`. Because psmux runs one server per session, "global" means global to that session's server, so `set-environment -g` affects the session it is sent to rather than every session.
 
 Environment variables set this way are injected at the process level when new panes spawn, so they are completely invisible (no commands echoed in the shell).
 
@@ -948,6 +1103,43 @@ psmux source-file ~/.psmux.conf
 ```
 
 This re-executes every line in the config file, applying any changes to options, key bindings, hooks, and styles immediately.
+
+### What source-file does to key bindings
+
+Like tmux, `source-file` only runs the file's commands: bindings made before it stay. A `bind` typed at
+the CLI survives, and files sourced one after another (a plugin manager's, for example) all keep
+their bindings.
+
+The file's commands run in order, each once the one before it has finished, as tmux runs them: a
+`split-window` after a `new-window` splits the new window. The options and bindings before the file's
+first command apply at once; everything from that command on waits its turn. `psmux source-file`
+returns once the commands have run and prints what they print. Every problem in the file is an
+error, as in tmux: a command that fails, a nested file that cannot be read, an unknown option or a
+bad value. `source-file` prints each on stderr and exits 1, and the rest of the file still runs.
+With `-q`, a file that does not exist is skipped without a word.
+
+`source-file` takes one or more paths, as tmux does, and reads them in the order given:
+`source-file ~/.psmux.conf ~/.psmux.local.conf`. Quote a path that has a space in it. A path that
+cannot be read is reported and the others are still read. An older line that names one file with
+spaces and no quotes, such as `source-file C:\Users\Ann Lee\x.conf`, still reads that file.
+
+A file may source other files, and a path may be a glob. A nested file's commands run where its
+`source-file` line stands, before the rest of the outer file, down to 50 levels as in tmux (deeper
+is `too many nested files`). A file that would source a file already being sourced, itself or one
+further out, is an error. When the `source-file` line always runs, `source-file` refuses the whole
+file before any of its lines take effect; one in a key binding, a `%if` block or an `if-shell` block
+is checked only if and when it runs, so a reload key such as `bind r { source-file ~/.tmux.conf }` is
+fine. tmux has no such check and runs a self-sourcing file until the nesting limit.
+
+One deliberate difference from tmux: sourcing the config file the server **started with** (the `-f`
+file or `PSMUX_CONFIG_FILE`, otherwise the first of `~/.psmux.conf`, `~/.psmuxrc`, `~/.tmux.conf`,
+`~/.config/psmux/psmux.conf` that existed) is a reload, and it starts from the default bindings. The
+reason is [#195](https://github.com/psmux/psmux/issues/195): a config that stops saying `unbind-key -a`
+gets the default bindings back when it is reloaded. tmux keeps them unbound until the server restarts.
+The comparison ignores case and slash direction, so `source-file ~/.PSMUX.conf` is the same reload.
+Because the reload starts from the defaults, bindings made outside the config (at the CLI, or by a
+file the config does not source) are dropped by it; re-source those files from the config if you want
+them to survive a reload.
 
 ## Window and Pane Numbering
 
@@ -1046,7 +1238,15 @@ set -g exit-empty on
 
 With `destroy-unattached on`, the server process terminates as soon as the last client detaches. This is useful for single-use sessions.
 
-With `exit-empty off`, the server stays alive even after all sessions are closed, allowing new sessions to be created without restarting.
+With `exit-empty off`, an empty server stays alive. The tmux idiom for holding a private server before it has a session works as it does in tmux:
+
+```powershell
+psmux -S $sock start-server ';' set-option -g exit-empty off
+psmux -S $sock display-message -p "#{socket_path}`t#{pid}"   # answers before any session exists
+psmux -S $sock new-session -d -s work                        # lands in that same server process
+```
+
+psmux keeps one process per session, so its empty server is the namespace's standby server, made visible while it is unclaimed with `exit-empty off`. The first `new-session` in that namespace becomes that process, whatever flags it carries (`-f` is ignored, as tmux ignores it for a running server). With `exit-empty on` (the default), a plain `start-server` leaves nothing to query, as in tmux, where the server exits at once. Unlike tmux, killing the last session of a namespace still ends that session's process even with `exit-empty off`.
 
 ## Dead Panes and Respawn
 
@@ -1070,9 +1270,14 @@ psmux respawn-pane -c "C:\Projects"
 
 # Respawn with a specific command
 psmux respawn-pane -- python app.py
+
+# Give the new process extra environment (repeatable, this process only)
+psmux respawn-pane -k -e AGENT_ID=bob -e ROLE=review -- claude
 ```
 
 This is useful for monitoring: if a long-running process crashes, you can see its final output and restart it without losing the pane layout.
+
+A respawn behaves like tmux's: the pane keeps its id and its scrollback history, so the new process starts below everything its predecessor printed (`capture-pane -S -` and copy mode still reach it). The rows that were on screen when the old process died are cleared rather than moved into history, the cursor goes back to the top left, copy mode is left, and a process that died on the alternate screen leaves the pane on the normal one. Use `clear-history` after the respawn when you want a clean slate.
 
 ### Background Processes and `@kill-descendants`
 
@@ -1163,3 +1368,111 @@ set -g allow-predictions on
 ```
 
 Without `allow-predictions on`, psmux resets PSReadLine's prediction settings during initialization, which disables ListView mode.
+
+## Codepoint widths
+
+Some characters have no single correct display width. Unicode marks a large
+group, including box drawing characters, many symbols, and the characters
+`tig` draws its commit graph with, as **East Asian Ambiguous**: one column in a
+Western context, two in a CJK one.
+
+psmux resolves ambiguous characters to **one** column, which is what tmux does.
+If your terminal draws them as two, the two of you disagree about where every
+following cell on the line begins, and characters can be left painted on screen
+after the text around them is erased.
+
+`codepoint-widths` lets you settle the disagreement. It is a server option, so
+it is written with `set -s`, and it takes a comma separated list of overrides:
+
+```tmux
+# One codepoint, written in hex
+set -s codepoint-widths "U+2502=2"
+
+# A range, inclusive at both ends (note the U+ on BOTH sides)
+set -s codepoint-widths "U+2500-U+257F=2"
+
+# A literal character works too
+set -s codepoint-widths "|=2"
+
+# Several entries at once
+set -s codepoint-widths "U+2500-U+257F=2,U+25CF=2"
+```
+
+The width must be `0`, `1` or `2`. An entry that is malformed, out of range, or
+names a codepoint that does not exist is ignored, and the remaining entries
+still apply.
+
+Because it is an array option, `-a` appends rather than replaces:
+
+```tmux
+set -s codepoint-widths "U+2500-U+257F=2"
+set -sa codepoint-widths "U+25CF=2"     # both entries now apply
+set -su codepoint-widths                # back to the default (no overrides)
+```
+
+A change takes effect immediately, for text drawn after it. Text already on
+screen keeps the width it was drawn with, so redraw the pane or restart the
+program to see an override applied to content that is already there.
+
+Read the current value back with:
+
+```powershell
+psmux show-options -s codepoint-widths
+```
+
+If you are unsure whether your terminal treats a character as one column or
+two, print a row of them and see where it wraps: in an 80 column window, 80 of
+them filling exactly one line means one column each, and wrapping after 40
+means two.
+
+## Terminal overrides
+
+`terminal-overrides` is the tmux option for adjusting what psmux assumes about
+the terminal a client is attached from. psmux has no terminfo database: the
+client writes VT sequences directly. So of all the capabilities tmux knows,
+psmux honours the two that change what the client sends on its own account:
+
+| Capability | Effect |
+|---|---|
+| `smcup` | Entering the host terminal's alternate screen (`ESC[?1049h`) when a client attaches |
+| `rmcup` | Leaving it again (`ESC[?1049l`) when the client detaches or exits |
+
+Every other capability is accepted, kept, shown by `show-options`, and ignored.
+
+The common use is keeping the client on the host terminal's main screen, for
+example an SSH client on a phone where the alternate screen cannot be scrolled:
+
+```tmux
+set -ga terminal-overrides ',*:smcup@:rmcup@'
+```
+
+With that set the client never sends `ESC[?1049h` or `ESC[?1049l`. Like tmux,
+it clears the screen when it starts drawing and again when it detaches, so the
+prompt comes back on a clean screen. psmux redraws the screen in place, so
+pane output does not pile up in the host terminal's scrollback; use copy mode
+for a pane's history.
+
+How entries are read, the same way tmux reads them:
+
+- It is an array option. Each element is `pattern:cap:cap...`. `set -g`
+  replaces the whole array, `set -ga` adds elements (a leading comma is
+  optional), and `set -gu` empties it.
+- The pattern is matched against the `TERM` of the attaching client with
+  shell style wildcards (`*`, `?`, `[...]`). Elements are applied in order, so
+  a later element wins over an earlier one.
+- `cap@` removes a capability, `cap=value` sets it, and `::` is a literal colon
+  inside a field. A capability set to an empty value counts as removed.
+- Native Windows consoles usually have no `TERM` at all. An unset `TERM` is
+  matched as the empty string, which is what tmux's own client sends, so `*`
+  applies to it and a pattern such as `xterm*` does not.
+
+The option is read by the server, from the config file or from a `set` at
+runtime, and each client decides when it attaches. A change made while a
+client is attached applies from the next attach.
+
+Read it back with:
+
+```powershell
+psmux show-options -g terminal-overrides
+# terminal-overrides[0] *:smcup@:rmcup@
+```

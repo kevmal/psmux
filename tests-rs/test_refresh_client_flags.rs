@@ -60,8 +60,43 @@ fn connect_authenticated(addr: std::net::SocketAddr) -> TcpStream {
 /// Every control-only refresh-client flag is rejected on the one-shot CLI
 /// path with tmux's "not a control client" error carrying the flag name —
 /// the text the CLI propagates to its exit path.
+///
+/// All four take a VALUE in tmux (cmd-refresh-client.c `.args` is
+/// `A:B:cC:Df:r:F:lLRSt:U`), so they are exercised the way a real client
+/// sends them. The bare forms are a different error entirely — see
+/// `bare_control_only_flags_are_a_parse_error` below.
 #[test]
 fn control_only_flags_are_rejected_with_the_tmux_error_text() {
+    for (flag, value) in [
+        ("-C", "80,24"),
+        ("-B", "sub:%1:#{pane_id}"),
+        ("-A", "%1:on"),
+        ("-f", "no-pause"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (tx, _rx) = mpsc::channel::<CtrlReq>();
+        let handler = spawn_handler(listener.try_clone().unwrap(), tx);
+
+        let mut client = connect_authenticated(listener.local_addr().unwrap());
+        write!(client, "refresh-client {flag} {value}\n").unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).expect("read response");
+        handler.join().expect("handler thread");
+
+        assert_eq!(
+            resp,
+            format!("ERROR: refresh-client {flag}: not a control client\n"),
+            "the one-shot CLI path must reject {flag} instead of silently dropping it"
+        );
+    }
+}
+
+/// Issue #635: the same four flags with NO value never reach the
+/// control-client check at all. tmux's args_parse_flags fails the parse first
+/// ("-C expects an argument") and the command never runs, so the server must
+/// answer that instead of acting on a flag whose value the caller forgot.
+#[test]
+fn bare_control_only_flags_are_a_parse_error() {
     for flag in ["-C", "-B", "-A", "-f"] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let (tx, _rx) = mpsc::channel::<CtrlReq>();
@@ -76,8 +111,8 @@ fn control_only_flags_are_rejected_with_the_tmux_error_text() {
 
         assert_eq!(
             resp,
-            format!("ERROR: refresh-client {flag}: not a control client\n"),
-            "the one-shot CLI path must reject {flag} instead of silently dropping it"
+            format!("ERROR: {flag} expects an argument\n"),
+            "a dangling {flag} must fail the parse, not fall through to the command"
         );
     }
 }

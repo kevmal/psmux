@@ -1,25 +1,11 @@
-//! TUI rendering — pane tree rendering, separator drawing, cursor positioning.
-//!
-//! Style/color parsing is in `style.rs`; this module re-exports it for
-//! backward compatibility so `use crate::rendering::*` still works.
+//! Shared terminal styling, cursor, pane-border, and layout helpers.
 
 use std::io::{self, Write};
 use std::env;
 use ratatui::prelude::*;
-use ratatui::widgets::*;
 use ratatui::style::{Style, Modifier};
-use unicode_width::UnicodeWidthStr;
 use crossterm::style::Print;
 use crossterm::execute;
-use portable_pty::PtySize;
-
-use crate::types::{AppState, Mode, Node, LayoutKind};
-use crate::tree::split_with_gaps;
-
-// Re-export style utilities so existing `use crate::rendering::*` still works.
-pub use crate::style::{
-    map_color, parse_tmux_style, parse_inline_styles,
-};
 
 // ─── Extended underline styles (issue #589) ─────────────────────────────────
 
@@ -137,15 +123,201 @@ pub fn has_conpty_passthrough() -> bool {
     })
 }
 
-/// Resolve the DECSCUSR code (0-6) from the PSMUX_CURSOR_STYLE / PSMUX_CURSOR_BLINK
-/// configuration.  Returns 0 ("default") when no explicit style is configured.
+/// The DECSCUSR code this client last asserted on the real terminal, 0 for
+/// "none asserted, the terminal's own shape stands".
+///
+/// tmux keeps the same thing per tty, `tty->cstyle`, and reads it when it
+/// stops the tty: `tty_stop_tty` (tty.c) sends the reset only when the style
+/// it last sent was not SCREEN_CURSOR_DEFAULT. Teardown here asks the same
+/// question, and the two places that write a shape, the attach below and the
+/// client's frame loop, both record it.
+static LAST_CURSOR_CODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What this client asserted through DEC private mode 12: 0 nothing, 1 on,
+/// 2 off. Mode 12 has no "back to the terminal's default" the way DECSCUSR 0
+/// is for the shape, only the two states, so putting it back needs to know
+/// which one was there first (`HOST_BLINK_BEFORE`).
+static BLINK_ASSERTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What mode 12 was before this client touched it, as the terminal answered
+/// DECRQM at attach: 0 nobody said, 1 set, 2 reset.
+static HOST_BLINK_BEFORE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What the cursor's shape was before this client touched it, as the terminal
+/// answered DECRQSS at attach, or 255 when it did not say. 0 is a real answer:
+/// it is the terminal's own default, which is what most terminals report.
+static HOST_SHAPE_BEFORE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+/// Record what the terminal said its cursor shape was before this client
+/// touched it.
+pub fn note_host_shape_before(code: Option<u8>) {
+    HOST_SHAPE_BEFORE.store(code.unwrap_or(255), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The DECSCUSR code teardown should write to put the shape back, `None` when
+/// this client never asserted one.
+///
+/// The terminal is asked at attach what it was drawing, so the usual answer is
+/// that shape. A terminal that will not say leaves 0, the reset to its own
+/// default, which is what tmux settles for: `tty_stop_tty` (tty.c) sends `Se`,
+/// defined as `ESC [ 2 q` by the cstyle feature, or `Ss 0` for a terminal
+/// without it, neither of which is where the user was.
+pub(crate) fn shape_restore() -> Option<u8> {
+    if !SHAPE_EVER_ASSERTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let before = HOST_SHAPE_BEFORE.load(std::sync::atomic::Ordering::Relaxed);
+    Some(if before == 255 { 0 } else { before })
+}
+
+/// Whether this client ever asserted a cursor SHAPE, which is a different
+/// question from whether it is holding one now (`LAST_CURSOR_CODE`).
+///
+/// A shape is a DECSCUSR code, and every code says whether it blinks, so
+/// writing one moves the terminal's blinking whether or not that was the
+/// point. The reset that takes the shape back, `ESC [ 0 q`, moves it again: it
+/// returns the terminal to ITS default, which on Windows Terminal blinks, and
+/// a user who had the blinking off is not back where they started. So once a
+/// shape has gone out, the blink has to be put back explicitly, even after the
+/// shape has been let go of again.
+static SHAPE_EVER_ASSERTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this client wrote DEC private mode 12.
+pub(crate) fn note_blink_asserted(on: bool) {
+    BLINK_ASSERTED.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record what the terminal said mode 12 was before this client touched it.
+pub fn note_host_blink_before(state: Option<bool>) {
+    let v = match state { Some(true) => 1, Some(false) => 2, None => 0 };
+    HOST_BLINK_BEFORE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The mode 12 write that puts the terminal's blinking back where this client
+/// found it, `None` when it never moved it.
+///
+/// Two things move it: mode 12 itself, and any DECSCUSR shape, since a shape's
+/// code says whether it blinks and the reset that takes the shape back returns
+/// the terminal to its own default rather than to what the user had. So either
+/// one owes this.
+///
+/// The terminal is asked at attach what mode 12 was, so the usual answer is
+/// the state it had. A terminal that does not answer DECRQM leaves that
+/// unknown: for a blink this client set, the opposite of what it set undoes
+/// it, and for a shape there is nothing honest left to say, so it says
+/// nothing.
+pub(crate) fn blink_restore() -> Option<bool> {
+    let asserted = BLINK_ASSERTED.load(std::sync::atomic::Ordering::Relaxed);
+    let shape = SHAPE_EVER_ASSERTED.load(std::sync::atomic::Ordering::Relaxed);
+    if asserted == 0 && !shape {
+        return None;
+    }
+    match HOST_BLINK_BEFORE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ if asserted != 0 => Some(asserted != 1),
+        _ => None,
+    }
+}
+
+/// The blink `cursor-blink` asks for on its own, for a `cursor-style` that
+/// names no shape, and `None` when the shape carries it or nobody asked.
+///
+/// A shape goes out as a DECSCUSR code that already says whether it blinks.
+/// Without a shape there is no code to carry it, and DEC private mode 12 is
+/// the only thing that can, so an explicit `cursor-blink` is sent that way and
+/// an unset one is sent not at all.
+pub fn blink_only_mode() -> Option<bool> {
+    if configured_cursor_code() != 0 {
+        return None;
+    }
+    cursor_blink_option()
+}
+
+/// Write the blink on its own, as DEC private mode 12. `None` writes nothing.
+pub fn apply_blink_only<W: Write>(out: &mut W, blink: Option<bool>) -> io::Result<()> {
+    let Some(on) = blink else { return Ok(()) };
+    execute!(out, Print(if on { "\x1b[?12h" } else { "\x1b[?12l" }))?;
+    note_blink_asserted(on);
+    Ok(())
+}
+
+/// Record a DECSCUSR code this client just wrote to the terminal.
+pub(crate) fn note_cursor_code(code: u8) {
+    LAST_CURSOR_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
+    if code != 0 {
+        SHAPE_EVER_ASSERTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Forget what this client asserted. Only the tests need it: a client asserts
+/// over one attach and tears down once, while the tests share one process and
+/// one pair of statics.
+#[cfg(test)]
+pub(crate) fn forget_cursor_state_for_test() {
+    LAST_CURSOR_CODE.store(0, std::sync::atomic::Ordering::Relaxed);
+    BLINK_ASSERTED.store(0, std::sync::atomic::Ordering::Relaxed);
+    HOST_BLINK_BEFORE.store(0, std::sync::atomic::Ordering::Relaxed);
+    SHAPE_EVER_ASSERTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    HOST_SHAPE_BEFORE.store(255, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `cursor-blink` is on, or `None` when nobody set it.
+///
+/// `set -g cursor-blink <value>` takes the words the option is documented
+/// with and stores `1` or `0` in `PSMUX_CURSOR_BLINK` (config.rs,
+/// server/options.rs). The variable is read back the way that value was
+/// parsed, so a shell that exports the word rather than the digit,
+/// `PSMUX_CURSOR_BLINK=off`, does not come out meaning the opposite of what it
+/// says. Everything that is not a yes is a no, which is what the option's own
+/// parser does.
+pub(crate) fn cursor_blink_option() -> Option<bool> {
+    env::var("PSMUX_CURSOR_BLINK")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "on" | "true"))
+}
+
+/// Whether an unset `cursor-blink` blinks, mirroring its catalog default.
+///
+/// It is `off`, which is what makes a bare `block`, `underline` or `bar` mean
+/// the steady shape tmux means by those words. Named rather than inlined so
+/// the fallback below reads as two separate reasons, and so a test can hold it
+/// against the catalog.
+pub(crate) const CURSOR_BLINK_DEFAULT_BLINKS: bool = false;
+
+/// Resolve the DECSCUSR code (1-6) from the PSMUX_CURSOR_STYLE /
+/// PSMUX_CURSOR_BLINK configuration, or 0 for "no opinion".
+///
+/// 0 is a state, not a shape: it is what `cursor-style default` means, it is
+/// the default of the option, and it is also what an unset or unrecognised
+/// value resolves to. tmux spells the same state `SCREEN_CURSOR_DEFAULT`
+/// (tmux.h) and treats it as a third value beside block, underline and bar.
 ///
 /// Used as the fallback cursor shape when ConPTY doesn't forward DECSCUSR from
 /// the child process (Windows 10 without passthrough mode).
 pub fn configured_cursor_code() -> u8 {
-    let style = env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "bar".to_string());
-    let blink = env::var("PSMUX_CURSOR_BLINK").unwrap_or_else(|_| "1".to_string()) != "0";
-    match style.as_str() {
+    let style = env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "default".to_string());
+    // tmux has no `cursor-blink`: it spells the blink into the value, as
+    // `blinking-block`, `blinking-underline` and `blinking-bar`
+    // (options-table.c, tmux.1). psmux has carried the blink as its own
+    // option since its first commit and users have it in their configs, so
+    // both spellings have to work. The prefix names the SHAPE; who decides the
+    // blink depends on whether the option was set at all.
+    let named_blink = style.strip_prefix("blinking-");
+    let shape = named_blink.unwrap_or(style.as_str());
+    let blink = match cursor_blink_option() {
+        // Set: it decides. It is the setting that speaks about nothing but
+        // blinking, so `cursor-style blinking-bar` with `cursor-blink off` is
+        // a steady bar.
+        Some(on) => on,
+        // Not set: a value that names the blink supplies it, and otherwise
+        // `cursor-blink`'s own default stands. With that default off, a bare
+        // `block` is the steady block tmux means by the word, and
+        // `blinking-block` is the blinking one.
+        None => named_blink.is_some() || CURSOR_BLINK_DEFAULT_BLINKS,
+    };
+    match shape {
         "block" => if blink { 1 } else { 2 },
         "underline" => if blink { 3 } else { 4 },
         "bar" | "beam" => if blink { 5 } else { 6 },
@@ -154,492 +326,169 @@ pub fn configured_cursor_code() -> u8 {
     }
 }
 
+/// Assert the configured cursor shape on the real terminal, once, at attach.
+///
+/// Writes nothing when nothing asked for a shape. tmux never sends one of its
+/// own either: `tty_start_tty` (tty.c) sends the alternate screen, the keypad
+/// mode, a clear, `cnorm`, the mouse mode resets and bracketed paste, and no
+/// DECSCUSR at all. A terminal keeps the cursor its user configured because
+/// nothing overwrote it, which cannot be had by sending a reset instead.
 pub fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {
     let code = configured_cursor_code();
+    if code == 0 {
+        // No shape. An explicit `cursor-blink` still has something to say,
+        // and mode 12 is the only way to say it without naming a shape.
+        return apply_blink_only(out, blink_only_mode());
+    }
     execute!(out, Print(format!("\x1b[{} q", code)))?;
+    note_cursor_code(code);
     Ok(())
 }
 
-// ─── Pane tree rendering ────────────────────────────────────────────────────
+// ─── Pane border intersections ─────────────────────────────────────────────
 
-pub fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
-    let dim_preds = app.prediction_dimming;
-    let border_style = parse_tmux_style(&app.pane_border_style);
-    let active_border_style = parse_tmux_style(&app.pane_active_border_style);
-    let copy_cursor = if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) { app.copy_pos } else { None };
-    // Same resolver as the live client renderer (src/client.rs), so the two
-    // paths agree on the tmux `tty_default_colours` fallback (#619).
-    let window_styles = crate::client::WindowContentStyles {
-        inactive: app.user_options.get("window-style")
-            .filter(|s| !s.is_empty())
-            .map(|s| parse_tmux_style(s)),
-        active: app.user_options.get("window-active-style")
-            .filter(|s| !s.is_empty())
-            .map(|s| parse_tmux_style(s)),
-        inactive_dim: app.user_options.get("window-style")
-            .map(|s| crate::style::parse_style_dim(s)).unwrap_or(0),
-        active_dim: app.user_options.get("window-active-style")
-            .map(|s| crate::style::parse_style_dim(s)).unwrap_or(0),
-    };
-    let border_status = app.user_options.get("pane-border-status").cloned().unwrap_or_else(|| "off".to_string());
-    // tmux ships a non-empty default for pane-border-format, so enabling
-    // `pane-border-status top` alone shows the pane title on the border. psmux
-    // stored it empty, which made the label gate (below) skip rendering, so the
-    // border drew blank. Fall back to the tmux default when unset/empty (#414).
-    let border_format = app.user_options.get("pane-border-format")
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "#{pane_index} \"#{pane_title}\"".to_string());
-    // pane-border-lines (#pane-border-lines): choose the glyph set for the
-    // separators drawn between panes. `none` suppresses them entirely.
-    let border_lines_name = app.user_options.get("pane-border-lines")
-        .cloned()
-        .unwrap_or_else(|| crate::border_lines::DEFAULT.to_string());
-    let bchars = crate::border_lines::border_chars(&border_lines_name);
-    let win = &mut app.windows[app.active_idx];
-    let active_rect = compute_active_rect(&win.root, &win.active_path, area);
-    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_styles, &border_status, &border_format, &mut 0, bchars);
-    let buf_area = f.buffer_mut().area;
-    let mask = border_mask_from_node(&win.root, area, buf_area);
-    fix_border_intersections(f.buffer_mut(), bchars, &mask);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BorderOrientation {
+    Horizontal,
+    Vertical,
 }
 
-/// Post-pass: fix border intersection characters where horizontal and vertical
-/// separator lines meet. Converts plain '│' and '─' to proper junction
-/// characters ('┼', '├', '┤', '┬', '┴') at intersection points.
+/// Final separator orientation at each drawn buffer cell.
+#[derive(Default)]
+pub struct BorderGeometry {
+    cells: std::collections::BTreeMap<usize, BorderOrientation>,
+}
+
+impl BorderGeometry {
+    pub(crate) fn set_vertical(&mut self, idx: usize) {
+        self.cells.insert(idx, BorderOrientation::Vertical);
+    }
+
+    pub(crate) fn set_horizontal(&mut self, idx: usize) {
+        self.cells.insert(idx, BorderOrientation::Horizontal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, idx: &usize) -> bool {
+        self.cells.contains_key(idx)
+    }
+
+    pub(crate) fn contains_vertical(&self, idx: usize) -> bool {
+        self.has_orientation(idx, BorderOrientation::Vertical)
+    }
+
+    pub(crate) fn contains_horizontal(&self, idx: usize) -> bool {
+        self.has_orientation(idx, BorderOrientation::Horizontal)
+    }
+
+    fn has_orientation(&self, idx: usize, orientation: BorderOrientation) -> bool {
+        self.cells.get(&idx) == Some(&orientation)
+    }
+}
+
+/// Replace straight separator glyphs at oriented crossings.
 ///
-/// `sep_cells` is the sorted, deduplicated list of cell indices psmux actually
-/// drew separators on (indexed like `buf.content`, i.e. `row * buf.area.width +
-/// col` relative to `buf.area`). Both the candidate cell and the crossing
-/// neighbour must be in `sep_cells` before a junction glyph is pushed, so
-/// box-drawing characters printed by child programs inside pane content (which
-/// are never in the list) are left untouched.
-pub fn fix_border_intersections(buf: &mut Buffer, bchars: Option<crate::border_lines::BorderChars>, sep_cells: &[usize]) {
-    // `none` (bchars == None) draws no separators, and `spaces` has no distinct
-    // junction glyphs, so intersection-fixing is a no-op for both.
-    let Some(bc) = bchars else { return; };
-    if !bc.has_junctions { return; }
-    let vert = bc.vertical;
-    let horiz = bc.horizontal;
-
-    let w = buf.area.width as usize;
-    let h = buf.area.height as usize;
-    if w == 0 || h == 0 { return; }
-
-    let is_sep = |i: usize| sep_cells.binary_search(&i).is_ok();
-
-    // Collect fixes first so detection sees only original characters.
-    let mut fixes: Vec<(usize, char)> = Vec::new();
-
-    // Walk only the drawn separator cells rather than scanning the whole buffer.
-    for &idx in sep_cells {
-        if idx >= buf.content.len() { continue; }
-        let row = idx / w;
-        let col = idx % w;
-        let ch = buf.content[idx].symbol().chars().next().unwrap_or(' ');
-
-        if ch == vert {
-            // Cell already has vertical (up+down). Check for horizontal neighbours.
-            let has_left = col > 0 && {
-                let li = row * w + (col - 1);
-                li < buf.content.len() && is_sep(li)
-                    && buf.content[li].symbol().starts_with(horiz)
-            };
-            let has_right = col + 1 < w && {
-                let ri = row * w + (col + 1);
-                ri < buf.content.len() && is_sep(ri)
-                    && buf.content[ri].symbol().starts_with(horiz)
-            };
-            match (has_left, has_right) {
-                (true, true)  => fixes.push((idx, bc.cross)),
-                (true, false) => fixes.push((idx, bc.right_tee)),
-                (false, true) => fixes.push((idx, bc.left_tee)),
-                _ => {}
-            }
-        } else if ch == horiz {
-            // Cell already has horizontal (left+right). Check for vertical neighbours.
-            let has_up = row > 0 && {
-                let ui = (row - 1) * w + col;
-                ui < buf.content.len() && is_sep(ui)
-                    && buf.content[ui].symbol().starts_with(vert)
-            };
-            let has_down = row + 1 < h && {
-                let di = (row + 1) * w + col;
-                di < buf.content.len() && is_sep(di)
-                    && buf.content[di].symbol().starts_with(vert)
-            };
-            match (has_up, has_down) {
-                (true, true)  => fixes.push((idx, bc.cross)),
-                (true, false) => fixes.push((idx, bc.bottom_tee)),
-                (false, true) => fixes.push((idx, bc.top_tee)),
-                _ => {}
-            }
-        }
-    }
-
-    for (idx, ch) in fixes {
-        buf.content[idx].set_char(ch);
-    }
-}
-
-/// Collect the buffer-cell indices where psmux draws a pane separator,
-/// mirroring the separator geometry in [`render_node`]'s `Node::Split` arm
-/// (`split_with_gaps` → `rects[i].x + width` / `rects[i].y + height`, spanning
-/// the split's own `area`).
-///
-/// Indices match `Buffer::content` (`(y - buf_area.y) * buf_area.width +
-/// (x - buf_area.x)`). The result is sorted and deduplicated so callers can
-/// iterate the drawn cells directly and test membership with `binary_search`
-/// (see [`fix_border_intersections`]) — no whole-buffer array needed.
-pub fn border_mask_from_node(root: &Node, area: Rect, buf_area: Rect) -> Vec<usize> {
-    let mut cells = Vec::new();
-    mark_node_borders(root, area, buf_area, &mut cells);
-    cells.sort_unstable();
-    cells.dedup();
-    cells
-}
-
-fn mark_node_borders(node: &Node, area: Rect, buf_area: Rect, cells: &mut Vec<usize>) {
-    let Node::Split { kind, sizes, children } = node else { return; };
-    let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-        sizes.clone()
-    } else { vec![100 / children.len().max(1) as u16; children.len()] };
-    let is_horizontal = *kind == LayoutKind::Horizontal;
-    let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-    for (i, child) in children.iter().enumerate() {
-        if i < rects.len() {
-            mark_node_borders(child, rects[i], buf_area, cells);
-        }
-    }
-
-    let w = buf_area.width as usize;
-    for i in 0..children.len().saturating_sub(1) {
-        if i >= rects.len() { break; }
-        if is_horizontal {
-            let sep_x = rects[i].x + rects[i].width;
-            if sep_x < buf_area.x + buf_area.width && sep_x >= buf_area.x {
-                for y in area.y..area.y + area.height {
-                    if y >= buf_area.y && y < buf_area.y + buf_area.height {
-                        // Guards above bound y/x to buf_area, so idx < w*h.
-                        cells.push((y - buf_area.y) as usize * w + (sep_x - buf_area.x) as usize);
-                    }
-                }
-            }
-        } else {
-            let sep_y = rects[i].y + rects[i].height;
-            if sep_y < buf_area.y + buf_area.height && sep_y >= buf_area.y {
-                for x in area.x..area.x + area.width {
-                    if x >= buf_area.x && x < buf_area.x + buf_area.width {
-                        cells.push((sep_y - buf_area.y) as usize * w + (x - buf_area.x) as usize);
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub fn render_node(
-    f: &mut Frame,
-    node: &mut Node,
-    active_path: &Vec<usize>,
-    cur_path: &mut Vec<usize>,
-    area: Rect,
-    dim_preds: bool,
-    border_style: Style,
-    active_border_style: Style,
-    copy_cursor: Option<(u16, u16)>,
-    active_rect: Option<Rect>,
-    window_styles: crate::client::WindowContentStyles,
-    border_status: &str,
-    border_format: &str,
-    pane_idx: &mut usize,
+/// The returned indices identify every junction, including space-mode
+/// junctions whose glyph does not change.
+pub fn fix_border_intersections(
+    buf: &mut Buffer,
     bchars: Option<crate::border_lines::BorderChars>,
-) {
-    match node {
-        Node::Leaf(pane) => {
-            let is_active = *cur_path == *active_path;
-            // window-style / window-active-style for this pane, with the tmux
-            // per attribute fallback applied for the active pane (#619).
-            let ws = window_styles.for_pane(is_active);
-            let ws_dim = window_styles.dim_for_pane(is_active);
-            // When pane-border-status is enabled, reserve 1 row for the
-            // border label so it doesn't overlap pane content (#288).
-            let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 1;
-            let inner = if has_border_label {
-                if border_status == "top" {
-                    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
-                } else {
-                    Rect::new(area.x, area.y, area.width, area.height - 1)
-                }
-            } else {
-                area
-            };
-            let target_rows = inner.height.max(1);
-            let target_cols = inner.width.max(1);
-            if pane.last_rows != target_rows || pane.last_cols != target_cols {
-                let _ = pane.master.resize(PtySize { rows: target_rows, cols: target_cols, pixel_width: 0, pixel_height: 0 });
-                if let Ok(mut parser) = pane.term.lock() {
-                    parser.screen_mut().set_size(target_rows, target_cols);
-                }
-                pane.last_rows = target_rows;
-                pane.last_cols = target_cols;
-            }
-            let parser_guard = pane.term.lock();
-            let Ok(parser) = parser_guard else { return; };
-            let screen = parser.screen();
-            let (cur_r, cur_c) = screen.cursor_position();
-            let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);
-            for r in 0..target_rows {
-                let mut spans: Vec<Span> = Vec::with_capacity(target_cols as usize);
-                let mut c = 0;
-                while c < target_cols {
-                    if let Some(cell) = screen.cell(r, c) {
-                        let mut fg = vt_to_color(cell.fgcolor());
-                        let mut bg = vt_to_color(cell.bgcolor());
-                        // Apply window-style / window-active-style defaults for unset colors
-                        if let Some(ws) = ws {
-                            if fg == Color::Reset { if let Some(wfg) = ws.fg { fg = wfg; } }
-                            if bg == Color::Reset { if let Some(wbg) = ws.bg { bg = wbg; } }
-                        }
-                        // tmux `tty_attributes` dims the resolved colours by the
-                        // window style's `dim=N` percentage (#619 item 4).
-                        if ws_dim != 0 {
-                            fg = crate::style::dim_colour_percent(fg, ws_dim);
-                            bg = crate::style::dim_colour_percent(bg, ws_dim);
-                        }
-                        if dim_preds && !screen.alternate_screen()
-                            && (r > cur_r || (r == cur_r && c >= cur_c))
-                        {
-                            fg = dim_color(fg);
-                        }
-                        let mut style = Style::default().fg(fg).bg(bg);
-                        if cell.dim() { style = style.add_modifier(Modifier::DIM); }
-                        if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
-                        if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
-                        style = with_underline(
-                            style,
-                            cell.underline_style().sgr_subparam(),
-                            match cell.underline_color() {
-                                vt100::Color::Default => None,
-                                c => Some(vt_to_color(c)),
-                            },
-                        );
-                        if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
-                        if cell.blink() { style = style.add_modifier(Modifier::SLOW_BLINK); }
-                        if cell.strikethrough() { style = style.add_modifier(Modifier::CROSSED_OUT); }
-                        // ratatui-crossterm 0.1.0 omits SGR 8 from
-                        // ModifierDiff, so Modifier::HIDDEN never
-                        // reaches the terminal.  Render hidden cells
-                        // as spaces instead.
-                        let text = if cell.hidden() {
-                            " ".to_string()
-                        } else {
-                            cell.contents().to_string()
-                        };
-                        let w = UnicodeWidthStr::width(text.as_str()) as u16;
-                        if w == 0 {
-                            spans.push(Span::styled(" ", style));
-                            c += 1;
-                        } else if w >= 2 {
-                            // Wide char at the last column would overflow the pane boundary
-                            if c + w > target_cols {
-                                spans.push(Span::styled(" ", style));
-                                c += 1;
-                            } else {
-                                spans.push(Span::styled(text, style));
-                                c += 2;
-                            }
-                        } else {
-                            spans.push(Span::styled(text, style));
-                            c += 1;
-                        }
-                    } else {
-                        spans.push(Span::raw(" "));
-                        c += 1;
-                    }
-                }
-                lines.push(Line::from(spans));
-            }
-            f.render_widget(Clear, inner);
-            let para = Paragraph::new(Text::from(lines));
-            f.render_widget(para, inner);
-            if is_active {
-                let (cr, cc) = copy_cursor.unwrap_or_else(|| screen.cursor_position());
-                let cr = cr.min(target_rows.saturating_sub(1));
-                let cc = cc.min(target_cols.saturating_sub(1));
-                let cx = inner.x + cc;
-                let cy = inner.y + cr;
-                // Respect the child's cursor-visibility state.
-                // TUI apps like Claude draw their own cursor via cell
-                // inverse-video and hide the real terminal cursor —
-                // honour that so we don't place a stray cursor at
-                // ConPTY's parking position.
-                if !screen.hide_cursor() {
-                    f.set_cursor_position((cx, cy));
-                }
-            }
-            // Pane border format/status overlay
-            if has_border_label {
-                let pane_label = border_format.replace("#{pane_index}", &pane_idx.to_string())
-                    .replace("#P", &pane_idx.to_string())
-                    .replace("#{pane_title}", &pane.title);
-                let label_width = UnicodeWidthStr::width(pane_label.as_str()) as u16;
-                if label_width > 0 && area.width >= label_width {
-                    let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
-                    let label_area = Rect::new(area.x, label_y, label_width.min(area.width), 1);
-                    let label_style = if is_active { active_border_style } else { border_style };
-                    f.render_widget(Paragraph::new(Line::from(Span::styled(pane_label, label_style))), label_area);
-                }
-            }
-            *pane_idx += 1;
-        }
-        Node::Split { kind, sizes, children } => {
-            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-                sizes.clone()
-            } else { vec![100 / children.len().max(1) as u16; children.len()] };
-            let is_horizontal = *kind == LayoutKind::Horizontal;
-            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-            for (i, child) in children.iter_mut().enumerate() {
-                cur_path.push(i);
-                if i < rects.len() {
-                    render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_styles, border_status, border_format, pane_idx, bchars);
-                }
-                cur_path.pop();
-            }
-            // Draw separator lines. `pane-border-lines none` (bchars == None)
-            // suppresses them entirely.
-            let Some(bc) = bchars else { return; };
-            let (v_char, h_char) = (bc.vertical, bc.horizontal);
-            let buf = f.buffer_mut();
-            for i in 0..children.len().saturating_sub(1) {
-                if i >= rects.len() { break; }
-                let both_leaves = matches!(&children[i], Node::Leaf(_))
-                    && matches!(children.get(i + 1), Some(Node::Leaf(_)));
+    borders: &BorderGeometry,
+) -> Vec<usize> {
+    let Some(bc) = bchars else { return Vec::new(); };
+    let width = buf.area.width as usize;
+    if width == 0 { return Vec::new(); }
+    let mut junctions = Vec::new();
 
-                if is_horizontal {
-                    let sep_x = rects[i].x + rects[i].width;
-                    if sep_x < buf.area.x + buf.area.width {
-                        if both_leaves {
-                            let left_active = cur_path.len() < active_path.len()
-                                && active_path[..cur_path.len()] == cur_path[..]
-                                && active_path[cur_path.len()] == i;
-                            let right_active = cur_path.len() < active_path.len()
-                                && active_path[..cur_path.len()] == cur_path[..]
-                                && active_path[cur_path.len()] == i + 1;
-                            let left_sty = if left_active { active_border_style } else { border_style };
-                            let right_sty = if right_active { active_border_style } else { border_style };
-                            let mid_y = area.y + area.height / 2;
-                            for y in area.y..area.y + area.height {
-                                let sty = if y < mid_y { left_sty } else { right_sty };
-                                let idx = (y - buf.area.y) as usize * buf.area.width as usize + (sep_x - buf.area.x) as usize;
-                                if idx < buf.content.len() {
-                                    buf.content[idx].set_char(v_char);
-                                    buf.content[idx].set_style(sty);
-                                }
-                            }
-                        } else {
-                            for y in area.y..area.y + area.height {
-                                let active = active_rect.map_or(false, |ar| {
-                                    y >= ar.y && y < ar.y + ar.height
-                                    && (sep_x == ar.x + ar.width || sep_x + 1 == ar.x)
-                                });
-                                let sty = if active { active_border_style } else { border_style };
-                                let idx = (y - buf.area.y) as usize * buf.area.width as usize + (sep_x - buf.area.x) as usize;
-                                if idx < buf.content.len() {
-                                    buf.content[idx].set_char(v_char);
-                                    buf.content[idx].set_style(sty);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    let sep_y = rects[i].y + rects[i].height;
-                    if sep_y < buf.area.y + buf.area.height {
-                        if both_leaves {
-                            let top_active = cur_path.len() < active_path.len()
-                                && active_path[..cur_path.len()] == cur_path[..]
-                                && active_path[cur_path.len()] == i;
-                            let bot_active = cur_path.len() < active_path.len()
-                                && active_path[..cur_path.len()] == cur_path[..]
-                                && active_path[cur_path.len()] == i + 1;
-                            let top_sty = if top_active { active_border_style } else { border_style };
-                            let bot_sty = if bot_active { active_border_style } else { border_style };
-                            let mid_x = area.x + area.width / 2;
-                            for x in area.x..area.x + area.width {
-                                let sty = if x < mid_x { top_sty } else { bot_sty };
-                                let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize + (x - buf.area.x) as usize;
-                                if idx < buf.content.len() {
-                                    buf.content[idx].set_char(h_char);
-                                    buf.content[idx].set_style(sty);
-                                }
-                            }
-                        } else {
-                            for x in area.x..area.x + area.width {
-                                let active = active_rect.map_or(false, |ar| {
-                                    x >= ar.x && x < ar.x + ar.width
-                                    && (sep_y == ar.y + ar.height || sep_y + 1 == ar.y)
-                                });
-                                let sty = if active { active_border_style } else { border_style };
-                                let idx = (sep_y - buf.area.y) as usize * buf.area.width as usize + (x - buf.area.x) as usize;
-                                if idx < buf.content.len() {
-                                    buf.content[idx].set_char(h_char);
-                                    buf.content[idx].set_style(sty);
-                                }
-                            }
-                        }
-                    }
-                }
+    for (&idx, &orientation) in &borders.cells {
+        if orientation != BorderOrientation::Vertical {
+            continue;
+        }
+        if idx >= buf.content.len() { continue; }
+        let col = idx % width;
+        let left = col > 0
+            && borders.has_orientation(idx - 1, BorderOrientation::Horizontal);
+        let right = col + 1 < width
+            && borders.has_orientation(idx + 1, BorderOrientation::Horizontal);
+        let glyph = match (left, right) {
+            (true, true) => Some(bc.cross),
+            (true, false) => Some(bc.right_tee),
+            (false, true) => Some(bc.left_tee),
+            (false, false) => None,
+        };
+        if let Some(glyph) = glyph {
+            junctions.push(idx);
+            if bc.has_distinct_junction_glyphs {
+                buf.content[idx].set_char(glyph);
             }
         }
     }
-}
 
-// ─── Layout helpers ─────────────────────────────────────────────────────────
-
-/// Compute the rectangle of the active pane by following the active_path through the tree.
-fn compute_active_rect(node: &Node, active_path: &[usize], area: Rect) -> Option<Rect> {
-    compute_active_rect_pub(node, active_path, area)
-}
-
-/// Public version of `compute_active_rect` for use outside the rendering module
-/// (e.g. accessibility caret updates).
-pub fn compute_active_rect_pub(node: &Node, active_path: &[usize], area: Rect) -> Option<Rect> {
-    match node {
-        Node::Leaf(_) => Some(area),
-        Node::Split { kind, sizes, children } => {
-            if active_path.is_empty() || children.is_empty() { return None; }
-            let idx = active_path[0];
-            if idx >= children.len() { return None; }
-            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-                sizes.clone()
-            } else {
-                vec![100 / children.len().max(1) as u16; children.len()]
-            };
-            let is_horizontal = *kind == LayoutKind::Horizontal;
-            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-            if idx < rects.len() {
-                compute_active_rect(&children[idx], &active_path[1..], rects[idx])
-            } else {
-                None
+    for (&idx, &orientation) in &borders.cells {
+        if orientation != BorderOrientation::Horizontal {
+            continue;
+        }
+        if idx >= buf.content.len() { continue; }
+        let row = idx / width;
+        let up = row > 0
+            && borders.has_orientation(idx - width, BorderOrientation::Vertical);
+        let down = row + 1 < buf.area.height as usize
+            && borders.has_orientation(idx + width, BorderOrientation::Vertical);
+        let glyph = match (up, down) {
+            (true, true) => Some(bc.cross),
+            (true, false) => Some(bc.bottom_tee),
+            (false, true) => Some(bc.top_tee),
+            (false, false) => None,
+        };
+        if let Some(glyph) = glyph {
+            junctions.push(idx);
+            if bc.has_distinct_junction_glyphs {
+                buf.content[idx].set_char(glyph);
             }
         }
     }
+    junctions.sort_unstable();
+    junctions
 }
 
-// ─── Status bar convenience wrappers (delegate to style.rs) ─────────────────
+/// ratatui resets the cells hidden behind a wide character to `Cell::EMPTY`,
+/// but the host paints the wide character's background there.  When a later
+/// wide character overwrites only the left half, the host keeps that
+/// background on the right half, and the diff never repaints it because the
+/// new blank equals the reset cell.  Recording the covering style makes the
+/// diff write that column.
+///
+/// This runs on every frame, so it walks the buffer row by row and settles a
+/// one byte symbol (ASCII, the bulk of any screen) as one column before
+/// anything else, unless the cell forces its own width.
+pub fn style_wide_trailing_cells(buf: &mut Buffer) {
+    use ratatui::buffer::{CellDiffOption, CellWidth};
 
-/// Expand simple status variables using AppState context.
-pub fn expand_status(fmt: &str, app: &AppState, time_str: &str) -> String {
-    let window = &app.windows[app.active_idx];
-    let win_idx = app.win_display_index(app.active_idx);
-    crate::style::expand_status(fmt, &app.session_name, &window.name, win_idx, time_str)
-}
-
-/// Parse a status format string with AppState context into styled spans.
-pub fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'static>> {
-    let window = &app.windows[app.active_idx];
-    let win_idx = app.win_display_index(app.active_idx);
-    crate::style::parse_status(fmt, &app.session_name, &window.name, win_idx, time_str)
+    let width = (buf.area.width as usize).max(1);
+    for row in buf.content.chunks_mut(width) {
+        let mut index = 0;
+        while index < row.len() {
+            let cell = &row[index];
+            let cell_width = if cell.symbol().len() == 1
+                && matches!(cell.diff_option, CellDiffOption::None)
+            {
+                1
+            } else {
+                (cell.cell_width() as usize).max(1)
+            };
+            let end = (index + cell_width).min(row.len());
+            if cell_width > 1 {
+                let style = cell.style();
+                for hidden in row[index + 1..end]
+                    .iter_mut()
+                    .filter(|cell| cell.symbol() == " ")
+                {
+                    hidden.set_style(style);
+                }
+            }
+            index = end;
+        }
+    }
 }
 
 // ─── UI layout helpers ──────────────────────────────────────────────────────
@@ -664,3 +513,15 @@ pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let final_h = middle.height.min(clamped_h);
     Rect { x, y: middle.y, width, height: final_h }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue735_cursor_style_default.rs"]
+mod test_issue735_cursor_style_default;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_wide_char_background_residue.rs"]
+mod test_wide_char_background_residue;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue800_wide_trailing_bytes.rs"]
+mod test_issue800_wide_trailing_bytes;

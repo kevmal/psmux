@@ -92,25 +92,143 @@ fn pane_current_command_and_path_share_a_walk() {
 }
 
 #[test]
-fn an_expired_entry_is_re_walked() {
+fn an_expired_entry_is_re_walked_but_not_on_the_caller() {
     // A cache that never expires would pass every other test here and silently
-    // freeze the window title on whatever was running when the pane opened.
-    // A 1ms bound makes a foreign refresh landing inside the window negligible,
-    // so this can assert an exact count.
+    // freeze the window title on whatever was running when the pane opened, so
+    // expiry must still trigger a real walk.
+    //
+    // It must not be this thread's walk. A render-path caller is the server's
+    // event loop, the same thread that writes keystrokes into ConPTY, and the
+    // walk costs 9-11ms on a normal desktop. Paying it inline stalled the
+    // keystroke path once a second per pane. The refresh therefore runs on a
+    // background thread and the caller is served the entry it already had.
     let _g = lock();
     let short = Duration::from_millis(1);
     let _ = process_table(Duration::ZERO); // seed a known-fresh entry
+    let seeded_at = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(30));
 
     let before = walks();
-    let _ = process_table(short);
-    let taken = walks() - before;
-
+    let served = process_table(short).expect("a stale entry is still served");
     assert_eq!(
-        taken, 1,
-        "an entry older than the freshness bound must be re-walked; took {}",
-        taken
+        walks() - before,
+        0,
+        "an expired entry must be refreshed off the calling thread; this thread \
+         walked {} times and so would stall a frame",
+        walks() - before
     );
+    assert!(
+        served.len() > 10,
+        "the stale entry served while the refresh runs must still be the real \
+         table; got {} entries",
+        served.len()
+    );
+
+    // And the refresh must actually land. Generous deadline: this waits on a
+    // thread spawn plus a whole-system enumeration.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut refreshed = false;
+    while std::time::Instant::now() < deadline {
+        let at = {
+            let g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_ref().map(|(at, _)| *at)
+        };
+        if at.is_some_and(|at| at > seeded_at) {
+            refreshed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        refreshed,
+        "the background refresh never replaced the expired entry — the window \
+         title would freeze on whatever was running when the pane opened"
+    );
+}
+
+#[test]
+fn a_very_old_entry_is_still_served_without_a_caller_walk() {
+    // The tempting rule is "past some age, walk inline after all". It is wrong,
+    // and it is wrong in the most visible place: the oldest entry is the one
+    // found by the first keystroke after a pause, which is exactly the keystroke
+    // whose latency a user notices. An earlier revision of this code bounded the
+    // staleness at 2s and the measured result was a single 17ms stall on the
+    // first character typed after an idle window.
+    //
+    // So age must never promote the caller to a walker. It only decides whether
+    // a refresh is kicked off behind the answer.
+    let _g = lock();
+    {
+        let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let ancient = std::time::Instant::now() - Duration::from_secs(600);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
+        *g = Some((ancient, table));
+    }
+    let before = walks();
+    let served = process_table(RENDER_PATH_TTL).expect("a cached entry is always served");
+    assert_eq!(
+        walks() - before,
+        0,
+        "a ten minute old entry still must not make the caller walk; it did, and \
+         the first keystroke after an idle pause pays for it"
+    );
+    assert_eq!(
+        served.len(),
+        1,
+        "the caller should have been handed the entry that was cached, not a \
+         fresh walk"
+    );
+
+    // The refresh still has to land, or the table would be frozen.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut fresh = false;
+    while std::time::Instant::now() < deadline {
+        let n = {
+            let g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_ref().map(|(_, t)| t.len()).unwrap_or(0)
+        };
+        if n > 10 {
+            fresh = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fresh,
+        "the background refresh never replaced the ancient entry, so the table \
+         is now frozen"
+    );
+}
+
+#[test]
+fn a_cold_cache_walks_inline() {
+    // With nothing cached there is nothing to serve, so the caller must walk
+    // rather than hand back an empty table and make every format expand to
+    // nothing on the first frame.
+    //
+    // The cache is global, so a background refresh another test started can
+    // refill it between invalidate() and the call (CI saw 0 walks once): that
+    // call was warm, not cold. Retry until a call really starts cold. Every
+    // call, warm or cold, must hand back a full table.
+    let _g = lock();
+    let mut cold_walked = false;
+    for _ in 0..20 {
+        invalidate();
+        let before = walks();
+        let served = process_table(RENDER_PATH_TTL).expect("snapshot should succeed");
+        let taken = walks() - before;
+        assert!(taken <= 1, "one lookup took {} walks", taken);
+        assert!(
+            served.len() > 10,
+            "a lookup after invalidate returned only {} entries",
+            served.len()
+        );
+        if taken == 1 {
+            cold_walked = true;
+            break;
+        }
+    }
+    assert!(cold_walked, "a cold cache must be filled inline");
 }
 
 #[test]
@@ -193,7 +311,12 @@ fn foreground_is_shell_classifies_live_processes() {
 
     let _g = lock();
     let classify = |pid, expected| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Generous on purpose: this waits on the OS to spawn a process and
+        // publish it in the process table, which has no bound under load. The
+        // loop breaks the instant the verdict is right, so a healthy machine
+        // never pays for the headroom; a loaded one stops reporting a product
+        // failure it does not have. Seen at 3s while a full sweep was running.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut verdict = None;
         loop {
             let present = process_table(Duration::ZERO)
@@ -237,5 +360,150 @@ fn foreground_is_shell_classifies_live_processes() {
         ping_verdict,
         Some(false),
         "ping must classify as a non-shell"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The other half of the policy: an EXPLICIT QUERY must not be one refresh
+// behind.
+//
+// `#{pane_current_command}` is expanded both on the render path and as the
+// whole answer to a one-shot `display-message -p` / `list-panes -F`. Serving
+// the one-shot route a stale table made it report the PREVIOUS foreground
+// process: `pwsh` two seconds after a command started, and the command two
+// seconds after it exited, with a second query 300ms later always correct.
+// tmux reads the tty's foreground process group at query time and is never
+// stale, so the query route walks inline when the entry has expired.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_explicit_query_walks_inline_when_the_entry_expired() {
+    let _g = lock();
+    {
+        let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let ancient = std::time::Instant::now() - Duration::from_secs(600);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
+        *g = Some((ancient, table));
+    }
+    let before = walks();
+    let served = process_table_bounded(RENDER_PATH_TTL)
+        .expect("an explicit query must still get a table");
+    assert_eq!(
+        walks() - before,
+        1,
+        "an explicit query found an expired entry and did NOT walk; it would be \
+         served the previous foreground process, which is the whole bug"
+    );
+    assert!(
+        served.len() > 10,
+        "the query was handed the ancient placeholder ({} entries) instead of a \
+         fresh enumeration",
+        served.len()
+    );
+}
+
+#[test]
+fn an_explicit_query_reuses_an_entry_inside_the_ttl() {
+    // Freshness is bounded, not unconditional: a command reply may reuse a
+    // snapshot younger than the TTL. That bound is what keeps the worst case at
+    // one inline walk per TTL no matter how often the format is asked, so a
+    // `list-panes -F '#{pane_current_command}'` in a loop cannot turn into a
+    // walk per invocation.
+    let _g = lock();
+    let _ = process_table(Duration::ZERO); // seed a known-fresh entry
+    let before = walks();
+    let _ = process_table_bounded(RENDER_PATH_TTL).expect("a fresh entry is served");
+    assert_eq!(
+        walks() - before,
+        0,
+        "an entry younger than the TTL must be reused by the query route too"
+    );
+}
+
+#[test]
+fn the_render_path_still_never_walks_on_the_caller() {
+    // The companion assertion to the two above, stated against the pair so a
+    // future "just make them both fresh" simplification fails here: adding the
+    // inline walk back to the render path is the keystroke-latency regression
+    // this cache exists to prevent.
+    let _g = lock();
+    {
+        let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let ancient = std::time::Instant::now() - Duration::from_secs(600);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
+        *g = Some((ancient, table));
+    }
+    let before = walks();
+    let served = process_table(RENDER_PATH_TTL).expect("a cached entry is always served");
+    assert_eq!(
+        walks() - before,
+        0,
+        "the render path walked inline on an expired entry; that is the 9-11ms \
+         stall on the keystroke path"
+    );
+    assert_eq!(
+        served.len(),
+        1,
+        "the render path should have been served the cached entry as is"
+    );
+}
+
+#[test]
+fn pane_current_command_query_route_sees_a_process_the_cache_does_not() {
+    // End-to-end on the real resolver that `#{pane_current_command}` calls,
+    // with the staleness made deterministic instead of timing-dependent: the
+    // cache is seeded with an ancient table that does NOT contain the live
+    // child, so the stale route cannot possibly name it and the fresh route
+    // must.
+    use std::process::{Command, Stdio};
+
+    let _g = lock();
+    let mut root = Command::new("cmd.exe")
+        .args(["/c", "ping.exe", "-n", "60", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cmd");
+    let root_pid = root.id();
+
+    // Wait for the descendant to exist, off a fresh enumeration.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut have_child = false;
+    while std::time::Instant::now() < deadline {
+        let t = process_table(Duration::ZERO).expect("snapshot");
+        if t.iter().any(|(_, ppid, name)| *ppid == root_pid && name.starts_with("ping")) {
+            have_child = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(have_child, "cmd never spawned its ping child; cannot run the scenario");
+
+    // An ancient table that knows the root but none of its children.
+    {
+        let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let ancient = std::time::Instant::now() - Duration::from_secs(600);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(root_pid, 0u32, "cmd.exe".to_string())]));
+        *g = Some((ancient, table));
+    }
+    let stale = get_deepest_foreground_process_name(root_pid);
+    let fresh = get_deepest_foreground_process_name_fresh(root_pid);
+
+    let _ = root.kill();
+    let _ = root.wait();
+
+    assert_eq!(
+        stale, None,
+        "the render path is defined to answer off the snapshot it has; it \
+         invented {stale:?} instead"
+    );
+    let fresh = fresh.expect(
+        "the query route returned nothing while a ping child was live — it was \
+         served the stale table, which is exactly the one-refresh-behind bug",
+    );
+    assert!(
+        fresh.to_ascii_lowercase().starts_with("ping"),
+        "the query route must name the live descendant; got {fresh:?}"
     );
 }

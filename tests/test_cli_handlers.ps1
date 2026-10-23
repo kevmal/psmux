@@ -95,15 +95,18 @@ Test-Assert "'info' alias returns same as 'server-info'" ($aliasStr -match 'psmu
 # ============================================================
 Write-Host "`n[Test Group 2] command-prompt (CLI acceptance)" -ForegroundColor Magenta
 
-# Test 2.1: command-prompt doesn't error
-$cpResult = & $exe -t test-cli command-prompt 2>&1
+# The prompt opens on a client (tmux cmd-command-prompt.c status_prompt_set),
+# and this session is detached: tmux answers "no current client", rc 1. The
+# attached client path is covered by tests/test_cli_command_prompt.ps1.
+# Test 2.1: command-prompt with no client is refused like tmux, not dropped
+$cpResult = (& $exe -t test-cli command-prompt -b 2>&1 | Out-String)
 $cpExitCode = $LASTEXITCODE
-Test-Assert "command-prompt accepted without error" ($cpExitCode -eq 0 -or $cpExitCode -eq $null) "Exit code: $cpExitCode"
+Test-Assert "command-prompt with no attached client: 'no current client', rc 1" ($cpExitCode -eq 1 -and $cpResult -match 'no current client') "Exit code: $cpExitCode Output: $cpResult"
 
-# Test 2.2: command-prompt with -I flag accepted
-$cpIResult = & $exe -t test-cli command-prompt -I test 2>&1
+# Test 2.2: the -I flag is parsed (no flag error), then the same refusal
+$cpIResult = (& $exe -t test-cli command-prompt -b -I test 2>&1 | Out-String)
 $cpIExitCode = $LASTEXITCODE
-Test-Assert "command-prompt -I accepted" ($cpIExitCode -eq 0 -or $cpIExitCode -eq $null) "Exit code: $cpIExitCode"
+Test-Assert "command-prompt -I parsed, then 'no current client'" ($cpIExitCode -eq 1 -and $cpIResult -match 'no current client' -and $cpIResult -notmatch 'unknown flag|invalid') "Exit code: $cpIExitCode Output: $cpIResult"
 
 # ============================================================
 # TEST GROUP 3: refresh-client / refresh

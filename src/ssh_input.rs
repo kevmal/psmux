@@ -332,7 +332,8 @@ pub fn is_ssh_session() -> bool {
 /// The fix: use the same VT input parser as SSH sessions to properly decode
 /// X10/SGR mouse sequences from stdin.
 pub fn needs_vt_input() -> bool {
-    is_ssh_session()
+    vt_input_forced(std::env::var("PSMUX_VT_INPUT").ok().as_deref())
+        || is_ssh_session()
         || std::env::var("TERMINAL_EMULATOR")
             .map_or(false, |v| v.contains("JetBrains"))
         // WezTerm on Windows is a ConPTY-based VT terminal that writes VT mouse
@@ -343,6 +344,37 @@ pub fn needs_vt_input() -> bool {
         // env vars it always sets and route it through the VT input path.
         || std::env::var("TERM_PROGRAM").map_or(false, |v| v == "WezTerm")
         || std::env::var_os("WEZTERM_PANE").is_some()
+        // Alacritty on Windows (#787) is the same kind of host: it writes keys
+        // to the ConPTY as VT bytes and has no win32-input-mode. On the console
+        // route conhost turns its Ctrl+J (0x0a) into Ctrl+Enter, so a C-j prefix
+        // never arms (the VT parser reads 0x0a as C-j, #642), and the colour
+        // query drain gets no settle window, so the torn tail of a late reply
+        // reaches the pane as `55` and Alt+\ (#646). Alacritty sets no
+        // TERM_PROGRAM. The variable it always sets on Windows is
+        // ALACRITTY_LOG (alacritty/src/logging.rs:204, v0.17.0), since
+        // ALACRITTY_WINDOW_ID is set on Unix only.
+        || std::env::var_os("ALACRITTY_LOG").is_some()
+}
+
+/// `PSMUX_VT_INPUT=1` puts the client on the VT input route on any host
+/// (issue #766).
+///
+/// A host that writes VT text into the client's pseudoconsole (node-pty,
+/// xterm.js web front ends, anything that is not Windows Terminal's
+/// win32-input-mode) loses the paste boundaries on the console input route:
+/// conhost strips `ESC[200~` and `ESC[201~` and hands over plain key records,
+/// identical to typed ones, so a CR written right after a paste can only be
+/// told apart by timing. With VT input on, conhost passes the markers
+/// through and the VT parser forwards the paste exactly as written, the way
+/// tmux's `tty_keys_paste` does. Measured with the reporter's probe: paste
+/// at +14 ms in one piece, a CR written 50 ms later after `ESC[201~`.
+/// Windows Terminal is not a candidate: it writes win32-input-mode key
+/// reports, which only the console input route decodes.
+pub(crate) fn vt_input_forced(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
 }
 
 /// Returns the Windows build number (e.g. 19045 for Win10 22H2, 22631 for
@@ -541,12 +573,77 @@ pub fn keepalive_reasserts_mouse_input() -> bool {
 /// How long a bare Escape is held back waiting for the key a terminal sent
 /// along with it.
 ///
-/// This is the local-path twin of the SSH reader's `ESC_TIMEOUT_MS`, and it is
+/// This is the local-path twin of the SSH reader's escape timeout, and it is
 /// the same idea as tmux's `escape-time`: `tty-keys.c` treats a lone `\033`
 /// with nothing behind it as a *partial* key and arms a timer, delivering a
 /// plain Escape only when that timer fires.  50 ms matches what the SSH path
 /// has used since #397.
+///
+/// It is a CEILING, not the wait itself: the wait is `escape-time` capped at
+/// this value (see [`escape_wait_ms`]), and on the console route an Escape
+/// that is a real key press is not held at all (see
+/// [`EscCoalesce::feed_with`]).
 pub(crate) const ESC_COALESCE_MS: u64 = 50;
+
+/// The server's `escape-time`, pushed to the client with every state frame.
+/// Until the first frame arrives it reads as the default.
+static ESCAPE_TIME_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(crate::types::DEFAULT_ESCAPE_TIME_MS);
+
+/// Record the server's `escape-time` (client side).
+pub fn set_escape_time(ms: u64) {
+    ESCAPE_TIME_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long an ambiguous Escape may be held: tmux's rule, `escape-time` with
+/// 0 read as 1 ms (tty-keys.c: `if (delay == 0) delay = 1`), capped at
+/// [`ESC_COALESCE_MS`] so a large escape-time (tmux 3.4's old 500 ms default)
+/// never turns into a half second hold.  The default is tmux 3.5's 10 ms
+/// ([`crate::types::DEFAULT_ESCAPE_TIME_MS`]).
+pub fn escape_wait_ms() -> u64 {
+    escape_wait_for(ESCAPE_TIME_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`escape_wait_ms`] for a given `escape-time`, without the global.
+pub(crate) fn escape_wait_for(escape_time_ms: u64) -> u64 {
+    escape_time_ms.clamp(1, ESC_COALESCE_MS)
+}
+
+/// Ceiling on the parameter bytes collected for one `CSI` sequence.  A real
+/// key sequence is a handful of bytes; anything longer is a stream that merely
+/// starts like one, and must not keep the held Escape alive indefinitely.
+pub(crate) const CSI_MAX_PARAM_LEN: usize = 32;
+
+/// How close behind an ordinary character a `[` has to arrive before it is read
+/// as more of that character's run rather than the opening of an extended key.
+///
+/// A console hands over a pasted clipboard in one burst of character records,
+/// exactly the shape an unparsed `CSI u` sequence arrives in, so a paste that
+/// happens to contain the characters `[13;2u` would otherwise be decoded into a
+/// Shift+Enter and six characters of the user's own text would vanish.  What
+/// tells the two apart is what comes IN FRONT of the `[`: the console dropped
+/// the sequence's ESC, so a real sequence opens its burst, while inside a paste
+/// the `[` follows the characters before it by microseconds.
+///
+/// 20 ms is the same window the client's paste detector uses (`src/client.rs`),
+/// and is far longer than the gap inside any burst and far shorter than the gap
+/// between two keys a person pressed.
+pub(crate) const TEXT_BURST_MS: u64 = 20;
+
+/// How long a CR keeps looking for the LF that completes it (issue #598).
+///
+/// A pasted CRLF is one line ending, so the LF must not decode as `C-j` and end
+/// the client's text run.  The two bytes routinely arrive in different console
+/// reads when sshd's ConPTY hands over a fragmented paste, measured at gaps of
+/// 20 ms and more, so [`TEXT_BURST_MS`] cannot decide this pair and the window
+/// has to be much wider than a burst.
+///
+/// It is bounded at all only to keep issue #642 honest: a `C-j` pressed a
+/// moment after Enter still decodes.  A CR and an LF genuinely typed this close
+/// together are indistinguishable from a line ending on a byte stream, the same
+/// unavoidable collision #642 records for Ctrl+J and Ctrl+Enter, and a pasted
+/// CRLF is the overwhelmingly more common of the two.
+pub(crate) const CRLF_PAIR_MS: u64 = 250;
 
 /// Folds a bare Escape that is immediately followed by Enter into one
 /// `Alt+Enter` event (issue #611).
@@ -565,6 +662,47 @@ pub(crate) const ESC_COALESCE_MS: u64 = 50;
 /// `input_key_write` then emits the `\033` prefix and the key's own bytes back
 /// to back.  `encode_key_event` already turns `Alt+Enter` into a single
 /// `\x1b\r`, so producing one merged event is all that is needed here.
+///
+/// It is also where an EXTENDED KEY is put back together, for a related but
+/// distinct reason.  A terminal that encodes Shift+Enter as `CSI 13;2u` — the
+/// modifyOtherKeys / fixterms "CSI u" form, which is what `set -s
+/// extended-keys` asks a terminal for and what a Windows Terminal `sendInput`
+/// keybinding writes — hands psmux nothing but literal characters: conhost's
+/// input parser does not know `CSI u`, so it flushes the unrecognised sequence
+/// into the console input buffer one `KEY_EVENT` per byte.  Measured under
+/// Windows Terminal on Windows 11 26200 with `examples/csi_u_diag.rs`, which
+/// reads the records straight from the console, one press of Shift+Enter
+/// delivers seven of them in a single `ReadConsoleInputW`:
+///
+/// ```text
+///   DOWN vk=0x00 scan=0x00 uChar=0x001b        <- ESC
+///   DOWN vk=0x00 scan=0x00 uChar=0x005b  '['
+///   DOWN vk=0x00 scan=0x00 uChar=0x0031  '1'
+///   DOWN vk=0x00 scan=0x00 uChar=0x0033  '3'
+///   DOWN vk=0x00 scan=0x00 uChar=0x003b  ';'
+///   DOWN vk=0x00 scan=0x00 uChar=0x0032  '2'
+///   DOWN vk=0x00 scan=0x00 uChar=0x0075  'u'
+/// ```
+///
+/// and the ESC does not survive the trip: with no virtual key code to name it
+/// and a `uChar` inside the control range, crossterm sends that record to
+/// `ToUnicodeEx`, which answers nothing for a synthesised record, and the event
+/// is discarded (`event/sys/windows/parse.rs`).  So psmux is handed six bare
+/// characters, its paste heuristic sees three or more ASCII characters inside
+/// 20 ms and bundles them into a bracketed paste, and the child application
+/// receives the TEXT `[13;2u` instead of a newline.
+///
+/// The `[` is therefore the only introducer left to work with, and the batch is
+/// what makes that safe: every byte of the sequence is ALREADY in the queue
+/// when the `[` is handed over, so [`recover_csi_u`] pulls without ever
+/// waiting.  A `[` a person typed has nothing behind it, the pull comes back
+/// empty on the first try, and the character goes straight through — no hold,
+/// no added latency on a character that is ordinary in every editor.
+///
+/// tmux never has this problem, because it reads its client tty as bytes and
+/// parses the sequence itself in `tty-keys.c`.  Reassembly is unconditional
+/// there and here: `extended-keys` governs what tmux WRITES to a pane, never
+/// what it accepts from the terminal.
 pub struct EscCoalesce {
     /// When the held Escape arrived.  `None` when nothing is held.
     pending: Option<Instant>,
@@ -575,8 +713,13 @@ pub struct EscCoalesce {
     /// Off on Unix: crossterm's own VT parser already folds `\x1b\r` into
     /// Alt+Enter there, so holding Escape back would only add latency.
     enabled: bool,
-    /// Length of the hold window.
-    window: Duration,
+    /// Length of the hold window.  `None` follows the live `escape-time`
+    /// ([`escape_wait_ms`]); tests pin it with [`EscCoalesce::with_window`].
+    window: Option<Duration>,
+    /// When the last ordinary character was handed to the client as text.
+    /// A `[` arriving within [`TEXT_BURST_MS`] of one is part of that run,
+    /// which is to say a paste, and never opens an extended key.
+    last_text: Option<Instant>,
 }
 
 impl EscCoalesce {
@@ -585,7 +728,39 @@ impl EscCoalesce {
             pending: None,
             queue: VecDeque::new(),
             enabled,
-            window: Duration::from_millis(ESC_COALESCE_MS),
+            window: None,
+            last_text: None,
+        }
+    }
+
+    /// A coalescer with a fixed hold window instead of the live
+    /// `escape-time`, so tests do not depend on (or race over) the global.
+    pub fn with_window(enabled: bool, window: Duration) -> Self {
+        EscCoalesce { window: Some(window), ..EscCoalesce::new(enabled) }
+    }
+
+    fn window(&self) -> Duration {
+        self.window
+            .unwrap_or_else(|| Duration::from_millis(escape_wait_ms()))
+    }
+
+    /// True when a character was handed on as text so recently that whatever
+    /// follows is still the same run: a paste, not a key.
+    fn in_text_burst(&self, now: Instant) -> bool {
+        self.last_text.is_some_and(|t| {
+            now.saturating_duration_since(t) < Duration::from_millis(TEXT_BURST_MS)
+        })
+    }
+
+    /// Remember that `ev` left here as text, so the character behind it is
+    /// read as more of the same run.
+    fn note_text(&mut self, ev: &Event, now: Instant) {
+        if let Event::Key(k) = ev {
+            if matches!(k.code, KeyCode::Char(_))
+                && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            {
+                self.last_text = Some(now);
+            }
         }
     }
 
@@ -593,57 +768,144 @@ impl EscCoalesce {
         make_key(KeyCode::Esc, KeyModifiers::empty())
     }
 
-    /// Feed one event straight from the terminal.
+    /// Feed one event straight from the terminal, with no way to look ahead.
+    ///
+    /// Extended keys cannot be recovered through this entry point — see
+    /// [`EscCoalesce::feed_with`], which is what the live input source calls.
+    pub fn feed(&mut self, ev: Event, now: Instant) -> Option<Event> {
+        self.feed_with(ev, now, || None)
+    }
+
+    /// Feed one event, with `pull` offering whatever the terminal has ALREADY
+    /// delivered.
+    ///
+    /// `pull` must never wait: it returns the next event if one is queued and
+    /// `None` the moment nothing is, which is what lets a `[` that opens an
+    /// extended key be told apart from a `[` a person typed without holding
+    /// either of them back.
     ///
     /// Returns the event the client should see, or `None` when the event was
-    /// absorbed: either a bare Escape that is now being held, or the key
-    /// release belonging to one.
-    pub fn feed(&mut self, ev: Event, now: Instant) -> Option<Event> {
+    /// absorbed: a bare Escape now being held, the key release belonging to
+    /// one, or a whole sequence that resolved to nothing.
+    pub fn feed_with<F>(&mut self, ev: Event, now: Instant, pull: F) -> Option<Event>
+    where
+        F: FnMut() -> Option<Event>,
+    {
         if !self.enabled {
             return Some(ev);
         }
+        // The release of the very Escape being held is not "another key" and
+        // must not close the window.
         if self.pending.is_some() {
-            match ev {
-                // ESC then Enter: the pair every terminal that cannot encode a
-                // modified Enter falls back to.  Merge into one Alt+Enter, the
-                // way tmux merges `\033` + byte into a META key.  Ctrl+Enter is
-                // left alone because it has its own byte (0x0a) and must not
-                // gain a spurious Alt.
-                Event::Key(k)
-                    if matches!(k.code, KeyCode::Enter)
-                        && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                        && !k.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    self.pending = None;
-                    let mut merged = k;
-                    merged.modifiers.insert(KeyModifiers::ALT);
-                    merged.kind = KeyEventKind::Press;
-                    Some(Event::Key(merged))
-                }
-                // The release of the very Escape being held is not "another
-                // key" and must not close the window.
-                Event::Key(k)
-                    if k.kind == KeyEventKind::Release && matches!(k.code, KeyCode::Esc) =>
-                {
-                    None
-                }
-                other => {
-                    self.pending = None;
-                    self.queue.push_back(other);
-                    Some(Self::escape_event())
+            if let Event::Key(k) = &ev {
+                if k.kind == KeyEventKind::Release && matches!(k.code, KeyCode::Esc) {
+                    return None;
                 }
             }
-        } else {
-            match ev {
-                Event::Key(k)
-                    if matches!(k.code, KeyCode::Esc)
-                        && k.modifiers.is_empty()
-                        && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    self.pending = Some(now);
-                    None
+        }
+        // A `[` that follows text by microseconds belongs to that text: a
+        // pasted clipboard reaches a console as the same burst of character
+        // records an unparsed sequence does, and the user's own characters
+        // must not be eaten by a decoder.  A real sequence opens its burst,
+        // because the console dropped the ESC in front of it.
+        let in_text_burst = self.in_text_burst(now);
+        match ev {
+            // `[` may be the second byte of an extended key whose ESC the
+            // console dropped.  Everything else of the sequence is already in
+            // the queue, so this decides itself immediately.
+            Event::Key(k)
+                if matches!(k.code, KeyCode::Char('['))
+                    && !in_text_burst
+                    && !k
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                match recover_csi_u(pull) {
+                    // The sequence was real, so a held Escape was its
+                    // introducer and goes with it.
+                    Recovered::Key(out) => {
+                        self.pending = None;
+                        Some(out)
+                    }
+                    Recovered::Consumed => {
+                        self.pending = None;
+                        None
+                    }
+                    // Not a sequence.  Hand back the `[`, everything pulled
+                    // behind it and any held Escape, in arrival order.
+                    Recovered::Raw(rest) => {
+                        let had_escape = self.pending.take().is_some();
+                        // All of this leaves as text, so the run goes on.  A
+                        // decoded key deliberately does NOT count: two presses
+                        // of a held key must both still decode.
+                        self.last_text = Some(now);
+                        self.queue.push_back(Event::Key(k));
+                        self.queue.extend(rest);
+                        if had_escape {
+                            Some(Self::escape_event())
+                        } else {
+                            self.queue.pop_front()
+                        }
+                    }
                 }
-                other => Some(other),
+            }
+            // ESC then Enter: the pair every terminal that cannot encode a
+            // modified Enter falls back to.  Merge into one Alt+Enter, the
+            // way tmux merges `\033` + byte into a META key.  Ctrl+Enter is
+            // left alone because it has its own byte (0x0a) and must not
+            // gain a spurious Alt.
+            Event::Key(k)
+                if self.pending.is_some()
+                    && matches!(k.code, KeyCode::Enter)
+                    && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && !k.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.pending = None;
+                let mut merged = k;
+                merged.modifiers.insert(KeyModifiers::ALT);
+                merged.kind = KeyEventKind::Press;
+                Some(Event::Key(merged))
+            }
+            // A bare Escape.  Whether it can be ambiguous at all depends on
+            // what the console has ALREADY queued behind it (issue #841 follow
+            // up, measured through a real pseudoconsole on 26200):
+            //
+            //   * a key a person pressed reaches the console as a DOWN record
+            //     on its own, Windows Terminal's win32-input-mode report and a
+            //     classic console window alike.  Its UP follows only when the
+            //     key is let go, tens of milliseconds later, so at this point
+            //     nothing is queued behind it.  Nothing can be merged into a
+            //     key press, so it goes out now, with no hold.
+            //   * an Escape the console synthesised from a VT byte (a host
+            //     writing `1b 0d` for Shift+Enter, #611) arrives as a DOWN and
+            //     UP pair in the same read, and a pair written in one
+            //     WriteConsoleInput call has its partner queued too.  That is
+            //     the case the hold exists for, so it keeps its window, which
+            //     now follows `escape-time` like tmux's own (tty-keys.c).
+            Event::Key(k)
+                if self.pending.is_none()
+                    && matches!(k.code, KeyCode::Esc)
+                    && k.modifiers.is_empty()
+                    && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                let mut pull = pull;
+                match pull() {
+                    None => Some(Event::Key(k)),
+                    Some(next) => {
+                        self.pending = Some(now);
+                        self.feed_with(next, now, pull)
+                    }
+                }
+            }
+            other => {
+                self.note_text(&other, now);
+                if self.pending.take().is_some() {
+                    self.queue.push_back(other);
+                    Some(Self::escape_event())
+                } else {
+                    Some(other)
+                }
             }
         }
     }
@@ -651,7 +913,7 @@ impl EscCoalesce {
     /// Milliseconds left on the held Escape, `None` when nothing is held.
     pub fn deadline_ms(&self, now: Instant) -> Option<u64> {
         self.pending.map(|t| {
-            self.window
+            self.window()
                 .saturating_sub(now.saturating_duration_since(t))
                 .as_millis() as u64
         })
@@ -660,7 +922,7 @@ impl EscCoalesce {
     /// Release a held Escape whose window has run out.
     pub fn expire(&mut self, now: Instant) -> Option<Event> {
         match self.pending {
-            Some(t) if now.saturating_duration_since(t) >= self.window => {
+            Some(t) if now.saturating_duration_since(t) >= self.window() => {
                 self.pending = None;
                 Some(Self::escape_event())
             }
@@ -672,6 +934,185 @@ impl EscCoalesce {
     pub fn pop(&mut self) -> Option<Event> {
         self.queue.pop_front()
     }
+}
+
+/// What a frame wake owes the caller before it returns (#658).
+///
+/// `read_timeout`'s loop ends with an `esc.expire()`, and that expire is the
+/// ONLY thing that releases a lone Escape once its coalescing window is up. A
+/// frame wake leaves the loop through an early `return`, so it used to jump
+/// straight over it: while frames kept arriving the held Escape had no way out
+/// at all. Factored out of the match arm so the decision can be exercised with
+/// no console and no clock of its own - see
+/// `tests-rs/test_issue658_frame_wake_escape.rs`.
+pub fn frame_wake_release(esc: &mut EscCoalesce, now: Instant) -> Option<Event> {
+    esc.expire(now)
+}
+
+/// Waking the client's input wait when a frame lands, not when a timer expires.
+///
+/// The client loop has two things to wait for, console input and a frame off
+/// the socket, and `crossterm::event::poll` can only wait for the first. So the
+/// frame was the one it could not block on: a frame that arrived just after the
+/// wait began sat unread until the poll interval expired.
+///
+/// Measured with `pty_trace`, from the socket reader finishing a frame line
+/// (`c`) to the main loop taking it (`d`), 40 single keystrokes into a raw echo
+/// child:
+///
+///   before   median 0.737ms   p90 1.330ms   p99 5.015ms   max 5.494ms
+///   after    median 0.086ms   p90 0.136ms   p99 0.235ms   max 1.546ms
+///
+/// The tail is the interesting half: before, a frame that missed the wait paid
+/// whatever interval the loop had chosen, which is why the first key after a
+/// pause felt slower than keys typed during a burst.
+///
+/// The fix is a Windows auto-reset event that the socket reader thread signals,
+/// waited on together with `CONIN$` through `WaitForMultipleObjects`. Both
+/// handles are process-wide singletons, created once and never closed.
+///
+/// If either handle cannot be obtained the module reports "no wake available"
+/// and `read_timeout` falls back to plain `crossterm::event::poll`, which is
+/// exactly the old behaviour.
+#[cfg(windows)]
+pub mod frame_wake {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
+        fn SetEvent(h: *mut c_void) -> i32;
+        fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
+        fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+        // Signature matches the declaration in `platform.rs` exactly. Two
+        // `extern` blocks in one crate that name the same symbol with different
+        // types is a `clashing_extern_declarations` warning, and the pointer
+        // mutability and `isize` return are the shape already in use.
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *const c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *const c_void,
+        ) -> isize;
+    }
+
+    const WAIT_OBJECT_0: u32 = 0;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    /// Auto-reset event, signalled once per frame that lands on the socket.
+    static WAKE: OnceLock<usize> = OnceLock::new();
+    /// A waitable handle to this process's console input buffer.
+    static CONIN: OnceLock<usize> = OnceLock::new();
+
+    fn wake_handle() -> Option<*mut c_void> {
+        let h = *WAKE.get_or_init(|| {
+            // manual = 0 (auto-reset): the wait itself clears it, so a frame
+            // that lands between two waits still wakes exactly one of them.
+            let h = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+            h as usize
+        });
+        if h == 0 { None } else { Some(h as *mut c_void) }
+    }
+
+    fn conin_handle() -> Option<*mut c_void> {
+        let h = *CONIN.get_or_init(|| {
+            // CONIN$ always names the console input buffer, whatever stdin has
+            // been redirected to, and the returned handle is waitable: it is
+            // signalled while the buffer is non-empty, which is exactly the
+            // condition crossterm's own poll reports.
+            let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+            const GENERIC_READ: u32 = 0x8000_0000;
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_WRITE: u32 = 0x2;
+            const OPEN_EXISTING: u32 = 3;
+            let h = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if h == INVALID_HANDLE_VALUE { 0 } else { h as usize }
+        });
+        if h == 0 { None } else { Some(h as *mut c_void) }
+    }
+
+    /// The waitable console input handle, for the #742 record tap
+    /// (`console_tap::take_head`), which peeks the same buffer crossterm reads.
+    pub fn conin() -> Option<*mut c_void> {
+        conin_handle()
+    }
+
+    /// Block until console input is available or `ms` elapses, without
+    /// reading it. `None` when there is no console handle. Used when the frame
+    /// wake is off, so the read after it can still be a one record
+    /// `poll(Duration::ZERO)` that the #742 tap runs in front of.
+    pub fn wait_console(ms: u32) -> Option<bool> {
+        let h = conin_handle()?;
+        Some(unsafe { WaitForSingleObject(h, ms) } == WAIT_OBJECT_0)
+    }
+
+    /// What ended the wait.
+    pub enum Woke {
+        /// Console input is available; ask crossterm for it.
+        Console,
+        /// A frame landed; the caller should go round its loop and drain it.
+        Frame,
+        /// Nothing happened before the timeout.
+        Timeout,
+        /// No wake handles available on this process; caller must fall back.
+        Unavailable,
+    }
+
+    /// Signal that a frame is ready to be picked up. Called from the client's
+    /// socket reader thread. Cheap and lock free.
+    pub fn signal() {
+        if let Some(h) = wake_handle() {
+            unsafe { SetEvent(h) };
+        }
+    }
+
+    /// `PSMUX_NO_FRAME_WAKE=1` reverts to crossterm's console-only wait, which
+    /// is how this is A/B'd against the same binary.
+    fn disabled() -> bool {
+        static OFF: OnceLock<bool> = OnceLock::new();
+        *OFF.get_or_init(|| std::env::var_os("PSMUX_NO_FRAME_WAKE").is_some_and(|v| v != "0"))
+    }
+
+    /// Block until console input arrives, a frame lands, or `ms` elapses.
+    pub fn wait(ms: u32) -> Woke {
+        if disabled() {
+            return Woke::Unavailable;
+        }
+        let (conin, wake) = match (conin_handle(), wake_handle()) {
+            (Some(c), Some(w)) => (c, w),
+            _ => return Woke::Unavailable,
+        };
+        let handles = [conin, wake];
+        // all = 0: return as soon as EITHER is signalled.
+        let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) };
+        match r {
+            x if x == WAIT_OBJECT_0 => Woke::Console,
+            x if x == WAIT_OBJECT_0 + 1 => Woke::Frame,
+            _ => Woke::Timeout,
+        }
+    }
+}
+
+/// No console on this platform, so nothing to wake: the client's poll ladder
+/// keeps its timer.
+#[cfg(not(windows))]
+pub mod frame_wake {
+    pub fn signal() {}
 }
 
 pub enum InputSource {
@@ -747,9 +1188,55 @@ impl InputSource {
                         None => left,
                     };
                     let started = Instant::now();
-                    if crossterm::event::poll(wait)? {
-                        let ev = crossterm::event::read()?;
-                        if let Some(out) = esc.feed(ev, Instant::now()) {
+                    // Wait on console input AND a pushed frame together, so a
+                    // frame that lands mid-wait is picked up on the event
+                    // rather than when this interval happens to expire.
+                    //
+                    // Every read on this route is a one record
+                    // `next_queued()`, never a `poll` with a timeout: crossterm
+                    // reads records in a loop until one yields an event, and
+                    // the #742 tap has to see each record at the head of the
+                    // buffer before crossterm does.
+                    #[cfg(windows)]
+                    let wait_ms = wait.as_millis().min(u32::MAX as u128) as u32;
+                    #[cfg(windows)]
+                    let ready = match frame_wake::wait(wait_ms) {
+                        // #658: a frame wake returns to the caller without
+                        // reading console input, so it jumps over the
+                        // `esc.expire()` at the foot of this loop - and that
+                        // expire is the only thing that releases a lone Escape
+                        // once its ESC_COALESCE_MS window is up. While frames
+                        // keep arriving, which is what a busy pane does, the
+                        // held Escape had no other way out. Give the deadline
+                        // its chance before handing control back.
+                        frame_wake::Woke::Frame => {
+                            return Ok(frame_wake_release(&mut esc, Instant::now()))
+                        }
+                        frame_wake::Woke::Console => Some(next_queued()?),
+                        frame_wake::Woke::Timeout => Some(None),
+                        // No frame wake: wait on the console alone, then read
+                        // one record. Only with no console handle at all does
+                        // this fall back to crossterm's own wait.
+                        frame_wake::Woke::Unavailable => match frame_wake::wait_console(wait_ms) {
+                            Some(true) => Some(next_queued()?),
+                            Some(false) => Some(None),
+                            None => None,
+                        },
+                    };
+                    #[cfg(not(windows))]
+                    let ready: Option<Option<Event>> = None;
+                    let ready = match ready {
+                        Some(r) => r,
+                        None => {
+                            if crossterm::event::poll(wait)? {
+                                Some(crossterm::event::read()?)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(ev) = ready {
+                        if let Some(out) = esc.feed_with(ev, Instant::now(), pull_queued) {
                             return Ok(Some(out));
                         }
                     }
@@ -789,9 +1276,8 @@ impl InputSource {
                     return Ok(Some(ev));
                 }
                 loop {
-                    if crossterm::event::poll(Duration::ZERO)? {
-                        let ev = crossterm::event::read()?;
-                        if let Some(out) = esc.feed(ev, Instant::now()) {
+                    if let Some(ev) = next_queued()? {
+                        if let Some(out) = esc.feed_with(ev, Instant::now(), pull_queued) {
                             return Ok(Some(out));
                         }
                         continue;
@@ -809,6 +1295,40 @@ impl InputSource {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// The look-ahead [`EscCoalesce::feed_with`] runs on: one event if the terminal
+/// has already delivered it, `None` the instant it has not.
+///
+/// A read error is reported as "nothing queued" rather than swallowed for good:
+/// the very next `poll`/`read` in the loop above hits the same broken stdin and
+/// surfaces it as the `io::Error` the caller expects.
+fn pull_queued() -> Option<Event> {
+    next_queued().ok().flatten()
+}
+
+/// One event if the console has already delivered it, `None` the instant it
+/// has not, reading at most one record.
+///
+/// On Windows the #742 tap goes first: when the record at the head of the
+/// console input buffer is one crossterm 0.29 would lose or misread (a UTF-16
+/// surrogate half, a control character with no virtual key, an Alt code
+/// character, or a lowercase ASCII letter with the AltGr signature, which is
+/// normalized to the plain letter), psmux consumes and decodes it itself.
+/// Otherwise `poll(Duration::ZERO)` hands crossterm exactly that one record,
+/// since with a zero timeout crossterm's reader stops after a single
+/// `ReadConsoleInputW` whether or not it produced an event.
+#[inline]
+fn next_queued() -> io::Result<Option<Event>> {
+    #[cfg(windows)]
+    if let Some(ev) = crate::console_tap::take_head() {
+        return Ok(Some(ev));
+    }
+    if crossterm::event::poll(Duration::ZERO)? {
+        Ok(Some(crossterm::event::read()?))
+    } else {
+        Ok(None)
+    }
+}
 
 /// Construct a press `Event::Key` with the given code and modifiers.
 #[inline(always)]
@@ -835,7 +1355,176 @@ fn decode_modifiers(n: u16) -> KeyModifiers {
     if m & 4 != 0 {
         mods |= KeyModifiers::CONTROL;
     }
+    // Bit 8 is Meta. tmux folds it into the same modifier as Alt
+    // (tty-keys.c, tty_keys_extended_key: both set KEYC_META), and psmux has no
+    // separate Meta, so a terminal reporting Meta lands on Alt here too.
+    if m & 8 != 0 {
+        mods |= KeyModifiers::ALT;
+    }
     mods
+}
+
+/// What the characters behind a `[` turned out to be.
+pub(crate) enum Recovered {
+    /// A complete extended key.  Everything pulled belonged to it.
+    Key(Event),
+    /// A complete key report that carries nothing for the client (a Kitty
+    /// protocol RELEASE).  Everything pulled belonged to it and none of it is
+    /// forwarded.
+    Consumed,
+    /// No sequence.  These are the events pulled, in arrival order; the caller
+    /// owes every one of them to the client, behind the `[` itself.
+    Raw(Vec<Event>),
+}
+
+/// Pull the characters sitting behind a `[` and decide whether they are an
+/// extended key.
+///
+/// `pull` returns only what the terminal has ALREADY delivered and `None` the
+/// instant it has nothing, so a `[` a person typed costs exactly one empty pull
+/// and is handed straight back — no hold, no guess about typing speed.  A `[`
+/// that opens a sequence the console could not parse is a different case
+/// entirely: conhost flushes the whole thing in one `ReadConsoleInputW`, so
+/// every remaining byte is already queued and the pulls all succeed.
+///
+/// Nothing pulled is ever dropped on the way out: [`Recovered::Raw`] carries
+/// the events back in the order they arrived, releases included, because the
+/// caller cannot re-read what this function has consumed.
+pub(crate) fn recover_csi_u<F>(mut pull: F) -> Recovered
+where
+    F: FnMut() -> Option<Event>,
+{
+    let mut pulled: Vec<Event> = Vec::new();
+    let mut params = String::new();
+    loop {
+        let Some(ev) = pull() else {
+            return Recovered::Raw(pulled);
+        };
+        pulled.push(ev.clone());
+        let Event::Key(k) = ev else {
+            return Recovered::Raw(pulled);
+        };
+        // Releases are not sequence content.  A console that reports them
+        // interleaved with the presses must not break the sequence apart.
+        if k.kind == KeyEventKind::Release {
+            continue;
+        }
+        if k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Recovered::Raw(pulled);
+        }
+        let KeyCode::Char(c) = k.code else {
+            return Recovered::Raw(pulled);
+        };
+        match c as u32 {
+            // Parameter and intermediate bytes.
+            0x20..=0x3f if params.len() < CSI_MAX_PARAM_LEN => params.push(c),
+            // Final byte: the sequence is complete, for better or worse.
+            0x40..=0x7e => {
+                return match csi_key(&params, c) {
+                    CsiKey::Key(out) => Recovered::Key(out),
+                    CsiKey::Absorbed => Recovered::Consumed,
+                    CsiKey::NotAKey => Recovered::Raw(pulled),
+                }
+            }
+            _ => return Recovered::Raw(pulled),
+        }
+    }
+}
+
+/// What a reassembled `CSI … <final>` turned out to be.
+pub(crate) enum CsiKey {
+    /// A key the client should see.
+    Key(Event),
+    /// A well formed key report that carries nothing for the client: a key
+    /// RELEASE from a terminal running the Kitty protocol.  Dropping it is not
+    /// a loss — psmux never asks for release reporting — and it must not be
+    /// forwarded, because a release of Enter is exactly what the client's
+    /// WezTerm workaround promotes back into a press.
+    Absorbed,
+    /// Not a key sequence; the caller hands the raw bytes back.
+    NotAKey,
+}
+
+/// Decode a `CSI <code> ; <modifiers> u` key sequence — the modifyOtherKeys /
+/// fixterms encoding, which xterm, Kitty, WezTerm, Windows Terminal and tmux's
+/// own `extended-keys` all speak, and the only reason a terminal can report
+/// Shift+Enter at all (legacy VT has no encoding for it: CR is CR whether or
+/// not Shift is down).
+///
+/// `<code>` is the unicode code point of the unmodified key, so Shift+Enter is
+/// `CSI 13;2u`.  Kitty's extra sub-parameters are tolerated: `code:shifted:base`
+/// keeps only the first, and `modifiers:event` uses the event type to tell a
+/// press from a release.
+///
+/// Every other final byte returns [`CsiKey::NotAKey`], including the ones the
+/// console DOES understand (`A`-`D`, `~`, …).  Those never arrive here as loose
+/// characters — conhost translates them into virtual-key records long before
+/// psmux sees them — so recognising them would add a second, divergent decoder
+/// for sequences that cannot reach it.
+pub(crate) fn csi_key(params: &str, final_byte: char) -> CsiKey {
+    if final_byte != 'u' {
+        return CsiKey::NotAKey;
+    }
+    // `CSI ? … u`, `CSI > … u` and friends are terminal queries and replies,
+    // never keys.
+    if params.starts_with(['?', '<', '=', '>']) {
+        return CsiKey::NotAKey;
+    }
+    let mut fields = params.split(';');
+    let Some(code) = fields
+        .next()
+        .and_then(|f| f.split(':').next())
+        .and_then(|f| f.parse::<u32>().ok())
+    else {
+        return CsiKey::NotAKey;
+    };
+    let mut modifier_field = fields.next().unwrap_or("1").split(':');
+    let mods = match modifier_field.next() {
+        // `CSI 13u` and `CSI 13;u` both mean "no modifiers".
+        None | Some("") => KeyModifiers::empty(),
+        Some(f) => match f.parse::<u16>() {
+            Ok(n) => decode_modifiers(n),
+            Err(_) => return CsiKey::NotAKey,
+        },
+    };
+    // Kitty event types: 1 press, 2 repeat, 3 release.
+    let kind = match modifier_field.next() {
+        Some("3") => return CsiKey::Absorbed,
+        Some("2") => KeyEventKind::Repeat,
+        _ => KeyEventKind::Press,
+    };
+    let Some(code) = csi_u_key_code(code) else {
+        return CsiKey::NotAKey;
+    };
+    CsiKey::Key(Event::Key(KeyEvent {
+        code,
+        modifiers: mods,
+        kind,
+        state: crossterm::event::KeyEventState::empty(),
+    }))
+}
+
+/// Map the code point in a `CSI u` sequence onto the key it names.
+///
+/// The named keys are spelled out because `KeyCode::Char('\r')` is not the
+/// Enter key to anything downstream: the client's key tables, its paste
+/// heuristic and `encode_key_event` all match on `KeyCode::Enter`.
+fn csi_u_key_code(code: u32) -> Option<KeyCode> {
+    Some(match code {
+        8 | 127 => KeyCode::Backspace,
+        9 => KeyCode::Tab,
+        13 => KeyCode::Enter,
+        27 => KeyCode::Esc,
+        c => {
+            let ch = char::from_u32(c)?;
+            if ch.is_control() {
+                return None;
+            }
+            KeyCode::Char(ch)
+        }
+    })
 }
 
 /// Decode a UTF-16 code unit, combining surrogate pairs.
@@ -914,6 +1603,29 @@ struct VtParser {
     osc: String,
     /// Pending high surrogate for UTF-16 decoding.
     hi_sur: Option<u16>,
+    /// When the last ordinary character left this parser as text.
+    ///
+    /// A `0x0a` arriving within [`TEXT_BURST_MS`] of one is the LF of a pasted
+    /// CRLF and not a keypress (issue #598).  This is the same clock and the
+    /// same window `EscCoalesce` keeps for the `[` of an extended key (issue
+    /// #654); the SSH path needs its own because `InputSource::Ssh` has no
+    /// coalescer, the decode happens here in `on_ground`.
+    ///
+    /// A DECODED key deliberately does not refresh it, so two presses of a held
+    /// key both still decode.
+    last_text: Option<std::time::Instant>,
+    /// When the character this parser last saw on the ground state was a CR.
+    ///
+    /// An LF that follows one within [`CRLF_PAIR_MS`] is the second half of a
+    /// CRLF line ending and is swallowed, because the CR already produced the
+    /// Enter.  Any other character clears it, so only an ADJACENT LF pairs.
+    ///
+    /// The window is much wider than the 20 ms text burst on purpose: the two
+    /// bytes of a CRLF routinely land in different console reads when a paste
+    /// arrives fragmented, which is the whole of issue #598, and 20 ms is not
+    /// enough to survive that.  It is bounded at all only so that a `C-j`
+    /// pressed some time after an Enter still decodes (issue #642).
+    prev_cr_at: Option<std::time::Instant>,
 }
 
 impl VtParser {
@@ -932,7 +1644,18 @@ impl VtParser {
             needs_vti_recheck: false,
             osc: String::new(),
             hi_sur: None,
+            last_text: None,
+            prev_cr_at: None,
         }
+    }
+
+    /// True when a character left as text so recently that whatever follows is
+    /// still the same run: a paste, not a key.
+    #[inline]
+    fn in_text_burst(&self, now: std::time::Instant) -> bool {
+        self.last_text.is_some_and(|t| {
+            now.saturating_duration_since(t) < std::time::Duration::from_millis(TEXT_BURST_MS)
+        })
     }
 
     #[inline(always)]
@@ -1100,11 +1823,67 @@ impl VtParser {
 
     #[inline]
     fn on_ground<F: FnMut(Event)>(&mut self, ch: char, emit: &mut F) {
+        let now = std::time::Instant::now();
+        // A 0x0a that lands inside a run of text is the LF of a pasted CRLF,
+        // not a keypress (issue #598).
+        //
+        // Ctrl+J IS the byte 0x0a, so the arm below decodes a bare one as C-j
+        // and that is right for a key somebody pressed (issue #642).  Inside a
+        // paste it is payload, and the difference is not cosmetic: a decoded
+        // key ENDS the client's text run, so it flushes what it has as one
+        // `send-paste`, sends C-j on its own, then opens a FRESH paste for the
+        // next line.  A three line clipboard reaches the pane as three
+        // separately bracketed pastes with a literal LF between them, and a
+        // shell with bracketed paste on runs each one as its own command line.
+        //
+        // This is the rule #654 already applies to the `[` of an extended key,
+        // on the same 20 ms window and for the same reason: a decoder must not
+        // eat the user's own clipboard.  A real C-j opens its burst, so it is
+        // not in a text run and still decodes, which is all #642 asked for.
+        //
+        // Two things tell a paste's LF from a keypress, and the CRLF pairing is
+        // the one that carries the reproduction: it needs no clock, so it holds
+        // however badly the two bytes are split across reads.  The 20 ms window
+        // is the fallback for a paste that carries BARE LFs, the shape a Unix
+        // file gives a Mac clipboard.
+        let was_cr = std::mem::take(&mut self.prev_cr_at).is_some_and(|t| {
+            now.saturating_duration_since(t) < std::time::Duration::from_millis(CRLF_PAIR_MS)
+        });
+        if ch == '\n' && (was_cr || self.in_text_burst(now)) {
+            if !was_cr {
+                // A bare LF stands in for the whole line ending.
+                self.last_text = Some(now);
+                emit(make_key(KeyCode::Enter, KeyModifiers::empty()));
+            }
+            // After a CR the Enter has already gone out, so the LF is the rest
+            // of ONE line ending and is swallowed.  The run stays alive either
+            // way so the next line's bytes are still inside it.
+            self.last_text = Some(now);
+            return;
+        }
         match ch {
             '\x1b' => {
                 self.state = PS::Escape;
             }
-            '\r' | '\n' => emit(make_key(KeyCode::Enter, KeyModifiers::empty())),
+            '\r' => {
+                self.prev_cr_at = Some(now);
+                emit(make_key(KeyCode::Enter, KeyModifiers::empty()))
+            }
+            // NOTE: 0x0a deliberately has NO arm here.  It falls through to the
+            // Ctrl+A..Ctrl+Z arm below, which turns it into C-j (issue #642).
+            //
+            // Ctrl+<letter> puts the letter's low five bits on the wire, so
+            // Ctrl+J IS the byte LF, the way Ctrl+I is Tab and Ctrl+M is CR.
+            // Those two collisions have a named key on the other side and tmux
+            // treats each pair as one key, which is why `'\t'` and `'\r'` keep
+            // their arms.  0x0a has no such name: Enter is 0x0d, so the only
+            // key 0x0a can be is C-j, and that is what tmux calls it (measured
+            // against tmux 3.6a: `bind -n C-j` fires on the byte, and a `C-j`
+            // prefix arms).  Sharing an arm with `'\r'` reported it as an
+            // unmodified Enter, so a `C-j` prefix was dead on every client
+            // where needs_vt_input() is true — WezTerm, the JetBrains
+            // terminals, and everything over SSH — while it worked under
+            // Windows Terminal, whose records take the native path.
             '\t' => emit(make_key(KeyCode::Tab, KeyModifiers::empty())),
             '\x7f' => emit(make_key(KeyCode::Backspace, KeyModifiers::empty())),
             // NOTE: 0x08 deliberately has NO arm here.  It falls through to the
@@ -1129,7 +1908,12 @@ impl VtParser {
             c if c as u32 == 29 => emit(make_key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
             c if c as u32 == 30 => emit(make_key(KeyCode::Char('^'), KeyModifiers::CONTROL)),
             c if c as u32 == 31 => emit(make_key(KeyCode::Char('_'), KeyModifiers::CONTROL)),
-            c => emit(make_key(KeyCode::Char(c), KeyModifiers::empty())),
+            c => {
+                // Ordinary text keeps the run alive.  Only this arm does: a
+                // decoded key must not, or a held key would stop decoding.
+                self.last_text = Some(now);
+                emit(make_key(KeyCode::Char(c), KeyModifiers::empty()))
+            }
         }
     }
 
@@ -1158,7 +1942,18 @@ impl VtParser {
                 // Windows Terminal sends ESC+CR for Shift+Enter; forwarding one
                 // \x1b\r (re-emitted by encode_key_event) lets TUI apps such as
                 // the Copilot and Claude CLIs insert a newline instead of
-                // submitting the prompt.
+                // submitting the prompt (issue #396).
+                //
+                // ESC+LF stays paired with ESC+CR here even though a BARE 0x0a
+                // is now C-j (see `on_ground`).  The asymmetry is deliberate:
+                // measured end to end, `\x1b\n` reaches a pane as `\x1b\r`
+                // today and would reach it as `0a` if this were decoded as
+                // M-C-j, because a named `C-M-<letter>` does not go through
+                // `encode_key_event` at all — `write_named_key_to_pane` injects
+                // a console record first and ConPTY drops the Alt from it.
+                // Neither is the `\x1b\n` the terminal sent, so making this
+                // right is a separate problem in the OUTPUT path and does not
+                // belong to #642.
                 emit(make_key(KeyCode::Enter, KeyModifiers::ALT));
                 self.state = PS::Ground;
             }
@@ -1319,6 +2114,28 @@ impl VtParser {
                 let cols = self.params[2];
                 if rows > 0 && cols > 0 {
                     emit(Event::Resize(cols, rows));
+                }
+            }
+            // `CSI <code> ; <modifiers> u` — the modifyOtherKeys / fixterms
+            // extended key.  This parser reads real bytes, so unlike the
+            // console path it has the whole sequence in hand; without an arm
+            // here it fell through to the discard below and the key vanished
+            // outright, which is how a terminal-side Shift+Enter binding
+            // silently did nothing over SSH.  See [`csi_u_key_code`] for why
+            // the code point becomes a named `KeyCode`.
+            'u' => {
+                // A Kitty protocol RELEASE report (`CSI 13;2:3u`, the event
+                // type riding behind the modifiers on a sub-parameter) carries
+                // nothing for the client, and this parser keeps sub-parameters
+                // as ordinary ones, so without this the console path absorbed
+                // the release while the VT path turned it into a second press.
+                // psmux never asks a terminal for release reporting; when one
+                // sends it anyway, both paths now drop it.
+                let kitty_release = self.pidx >= 3 && self.params[2] == 3;
+                if !kitty_release {
+                    if let Some(code) = csi_u_key_code(self.params[0] as u32) {
+                        emit(make_key(code, mods));
+                    }
                 }
             }
             '~' => self.dispatch_tilde(mods, emit),
@@ -1918,10 +2735,15 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             ));
         }
     }
-    // Log SSH env vars
+    // Log which SSH env vars are set; their values only with PSMUX_SSH_DEBUG=1.
+    let verbose_env = ssh_verbose();
     for var in &["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
         if let Ok(val) = std::env::var(var) {
-            ssh_debug_log(&format!("  {}={}", var, val));
+            if verbose_env {
+                ssh_debug_log(&format!("  {}={}", var, val));
+            } else {
+                ssh_debug_log(&format!("  {} is set", var));
+            }
         }
     }
 
@@ -1994,8 +2816,8 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
             let mut records: Vec<INPUT_RECORD> = Vec::with_capacity(64);
             records.resize_with(64, || unsafe { std::mem::zeroed() });
 
-            // Escape-timeout: 50 ms matches tmux's default.
-            const ESC_TIMEOUT_MS: u32 = 50;
+            // Escape-timeout: escape-time capped at 50 ms (escape_wait_ms),
+            // read afresh each pass so a changed option takes effect live.
 
             let mut alive = true;
             let verbose = ssh_verbose();
@@ -2012,7 +2834,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // Dynamic timeout: short when the parser has a pending Esc
                 // or is inside a paste (need to detect stale paste quickly).
                 let wait_ms = if parser.has_pending_escape() {
-                    ESC_TIMEOUT_MS
+                    escape_wait_ms() as u32
                 } else if parser.is_in_paste() || parser.state == PS::PasteDrain {
                     200 // check paste timeout / drain expiry frequently
                 } else {
@@ -2074,8 +2896,15 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                     match rec.event_type {
                         KEY_EVENT => {
                             let key = unsafe { &*(rec.data.as_ptr() as *const KEY_EVENT_RECORD) };
-                            // Skip key-up events entirely.
-                            if key.key_down == 0 { continue; }
+                            // Skip key-up events, except the Alt UP that
+                            // carries an Alt code character (issue #766: an
+                            // em dash written by node-pty arrives that way
+                            // even with VT input on, and was dropped here).
+                            if key.key_down == 0
+                                && !crate::console_tap::alt_code_release_char(false, key.virtual_key_code, key.u_char)
+                            {
+                                continue;
+                            }
 
                             if verbose {
                                 ssh_debug_log(&format!(
@@ -2176,7 +3005,7 @@ fn start_ssh_reader() -> io::Result<std::sync::mpsc::Receiver<Event>> {
                 // After processing all records from this batch, flush any
                 // pending escape if no more input is immediately available.
                 if parser.has_pending_escape() {
-                    let peek_wait = unsafe { WaitForSingleObject(handle, ESC_TIMEOUT_MS) };
+                    let peek_wait = unsafe { WaitForSingleObject(handle, escape_wait_ms() as u32) };
                     if peek_wait == WAIT_TIMEOUT {
                         parser.flush_escape(&mut |evt| {
                             if tx.send(evt).is_err() { alive = false; }
@@ -2241,6 +3070,14 @@ pub(crate) mod test_support {
 mod tests;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue642_vt_ctrl_j.rs"]
+mod tests_issue642_vt_ctrl_j;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue598_paste_lf.rs"]
+mod tests_issue598_paste_lf;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue457_ssh_mouse_build_gate.rs"]
 mod tests_issue457_ssh_mouse_build_gate;
 
@@ -2265,6 +3102,10 @@ mod tests_windows10_ssh_mouse;
 mod tests_pr468_wezterm_vt_input;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue787_alacritty_vt_input.rs"]
+mod tests_issue787_alacritty_vt_input;
+
+#[cfg(test)]
 #[cfg(windows)]
 #[path = "../tests-rs/test_issue508_wezterm_vt_cspace.rs"]
 mod tests_issue508_wezterm_vt_cspace;
@@ -2272,6 +3113,10 @@ mod tests_issue508_wezterm_vt_cspace;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue611_shift_enter_event_modifiers.rs"]
 mod tests_issue611_shift_enter_event_modifiers;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_extended_keys_csi_u.rs"]
+mod tests_extended_keys_csi_u;
 
 // ─── Raw VT pipe client input — issue #474 / Windows 10 SSH ────────────────
 //
@@ -2557,3 +3402,11 @@ impl InputSource {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue658_frame_wake_escape.rs"]
+mod test_issue658_frame_wake_escape;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue841_escape_no_hold.rs"]
+mod test_issue841_escape_no_hold;

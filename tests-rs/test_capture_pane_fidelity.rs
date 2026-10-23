@@ -33,6 +33,8 @@ struct DummyWriter;
 
 struct DummyMaster;
 
+impl crate::pane::PaneInputSink for DummyWriter {}
+
 impl std::io::Write for DummyWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
@@ -76,7 +78,7 @@ impl portable_pty::MasterPty for DummyMaster {
     fn tty_name(&self) -> Option<std::path::PathBuf> { None }
 }
 
-fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
+pub(super) fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
     let term = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
     let epoch = Instant::now() - Duration::from_secs(2);
     crate::types::Pane {
@@ -98,21 +100,23 @@ fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
         scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: Arc::new(AtomicU8::new(0)),
         bell_pending: Arc::new(AtomicBool::new(false)),
         cpr_pending: Arc::new(AtomicBool::new(false)),
         color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        copy_state: None,
+        copy_state: None, live_term: None,
         pane_style: None, pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         spawned_at: None,
+        start_command: String::new(),
+        cwd_hint: None,
     }
 }
 
-fn make_window(id: usize) -> crate::types::Window {
+pub(super) fn make_window(id: usize) -> crate::types::Window {
     crate::types::Window {
         root: Node::Split { kind: crate::types::LayoutKind::Horizontal, sizes: vec![], children: vec![] },
         active_path: vec![],
@@ -120,6 +124,7 @@ fn make_window(id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -137,7 +142,7 @@ fn make_window(id: usize) -> crate::types::Window {
 
 /// One window, one pane (root is the leaf so `active_path` stays empty), with
 /// `bytes` already fed through the pane's vt100 parser.
-fn app_showing(bytes: &[u8]) -> AppState {
+pub(super) fn app_showing(bytes: &[u8]) -> AppState {
     let mut app = AppState::new("fidelity".to_string());
     app.window_base_index = 0;
     app.pane_base_index = 0;

@@ -5,9 +5,11 @@
 # Uses a Python mouse-event detector to prove forwarding
 
 $ErrorActionPreference = "Continue"
-$PSMUX = (Get-Command psmux -EA Stop).Source
+# Binary and data root are overridable so this suite can be pointed at a build
+# under test without disturbing the installed psmux or its sessions.
+$PSMUX = if ($env:PSMUX_BIN) { $env:PSMUX_BIN } else { (Get-Command psmux -EA Stop).Source }
 $SESSION = "scroll_ctrl_277"
-$psmuxDir = "$env:USERPROFILE\.psmux"
+$psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $mouseInjector = "$env:TEMP\psmux_mouse_injector.exe"
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -76,7 +78,12 @@ Write-Host "==========================================================" -Foregro
 
 # === SETUP ===
 Cleanup
-Get-Process psmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+# Sweeping every psmux on the machine is only safe when this suite owns the
+# default data root. Pointed at a private build or root it runs BESIDE other
+# servers, and killing them by image name would take those down too.
+if (-not $env:PSMUX_BIN -and -not $env:PSMUX_DATA_DIR) {
+    Get-Process psmux -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+}
 Start-Sleep -Seconds 1
 
 # ================================================================
@@ -290,7 +297,10 @@ if (-not $opencodeCmd) {
     Start-Sleep -Seconds 8
 
     # Give it a prompt to generate scrollable content
-    & $PSMUX send-keys -t $SESSION "say hello and list 50 numbers" Enter 2>&1 | Out-Null
+    # One number per line: a model that answers "1, 2, 3, ..." on one line
+    # fits the screen and leaves nothing to scroll (run 2026-10-20_15-41-23).
+    $ocPrompt = "print the numbers 1 to 80, each on its own line, nothing else"
+    & $PSMUX send-keys -t $SESSION $ocPrompt Enter 2>&1 | Out-Null
     Start-Sleep -Seconds 20
 
     # Now capture state before and after scroll
@@ -303,7 +313,12 @@ if (-not $opencodeCmd) {
     # there is nothing to scroll, and the capture diff oracle would
     # misreport that as "scroll broken". Require a filled viewport first.
     $ocLines = @($capBefore -split "`n" | Where-Object { $_.Trim().Length -gt 0 }).Count
-    if ($ocLines -lt 15) {
+    # And the reply must overflow the screen: while the prompt line is still
+    # on screen nothing has scrolled away, so a wheel up has nothing to show.
+    $ocOverflow = -not $capBefore.Contains($ocPrompt)
+    if (-not $ocOverflow) {
+        Write-Host "  [SKIP] the opencode reply fits the screen (prompt still visible); nothing to scroll. Scroll checks skipped." -ForegroundColor DarkYellow
+    } elseif ($ocLines -lt 15) {
         Write-Host "  [SKIP] opencode produced no scrollable content ($ocLines non-empty lines); model backend likely unreachable. Scroll checks skipped." -ForegroundColor DarkYellow
     } else {
         # Test 3a: Scroll up in opencode

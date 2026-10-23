@@ -194,23 +194,24 @@ fn host_title_is_none_when_set_titles_is_off() {
     );
 }
 
-// ───────────────── the other two guarded render helpers ─────────────────
+// ───────────────── additional guarded render inputs ─────────────────
 
 #[test]
-fn extra_style_json_does_not_block_the_render_path() {
-    let counter = counter_path("extra_block");
+fn client_render_option_formats_do_not_block_the_render_path() {
+    let counter = counter_path("client_options");
     cleanup(&counter);
     let mut app = mock_app(15);
     app.status_left_style = format!("#({})", slow_tracer(&counter));
 
-    let mut buf = String::from("{}");
     let t0 = Instant::now();
-    append_extra_style_json(&mut buf, &app);
+    let formats = expand_status_formats(&app, "");
+    let mut buf = String::from("{}");
+    append_client_render_options_json(&mut buf, &formats.client_render_options).unwrap();
     let elapsed = t0.elapsed();
 
     assert!(
         elapsed < NONBLOCKING,
-        "append_extra_style_json blocked {:?} — it runs on every frame too",
+        "client render option expansion blocked {:?}; it runs on every frame",
         elapsed
     );
 

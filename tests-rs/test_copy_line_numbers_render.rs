@@ -27,7 +27,7 @@ fn copy_leaf(w: u16, h: u16, cy: u16, oy: usize) -> LayoutJson {
         active: true, copy_mode: true, scroll_offset: oy, view_offset: oy,
         sel_start_row: None, sel_start_col: None, sel_end_row: None, sel_end_col: None,
         sel_mode: None, copy_cursor_row: Some(cy), copy_cursor_col: Some(0),
-        content, rows_v2: Vec::new(), title: None,
+        content, rows_v2: Vec::new(), title: None, copy_hl: Vec::new(),
     }
 }
 
@@ -41,18 +41,21 @@ fn render_gutters(leaf: &LayoutJson, mode: CopyLnMode, hsize: usize, w: u16, h: 
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();
     let copy_ln = Some(CopyLnRender {
-        mode, hsize,
+        mode, hsize, hide_position: false,
         num_style: Style::default().fg(Color::DarkGray),
-        cur_style: Style::default().fg(Color::Yellow),
+        cur_style: Style::default().fg(Color::Yellow), hl: Default::default(),
     });
     term.draw(|f| {
         let area = Rect::new(0, 0, w, h);
         let active_rect = crate::client::compute_active_rect_json(leaf, area);
         crate::client::render_layout_json(
-            f, leaf, area, false, Color::DarkGray, Color::Green,
+            f, leaf, area, false,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset, active_rect, "", false, "off", "", 1,
             crate::border_lines::border_chars("single"), copy_ln,
             crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
     let buf = term.backend().buffer().clone();
@@ -116,10 +119,13 @@ fn off_draws_no_gutter_and_keeps_content() {
         let area = Rect::new(0, 0, 40, h);
         let active_rect = crate::client::compute_active_rect_json(&leaf, area);
         crate::client::render_layout_json(
-            f, &leaf, area, false, Color::DarkGray, Color::Green,
+            f, &leaf, area, false,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
             false, Color::Reset, active_rect, "", false, "off", "", 1,
             crate::border_lines::border_chars("single"), None,
             crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
     let buf = term.backend().buffer().clone();
@@ -142,23 +148,26 @@ fn gutter_shifts_content_right() {
         let backend = TestBackend::new(40, h);
         let mut term = Terminal::new(backend).unwrap();
         let copy_ln = Some(CopyLnRender {
-            mode: CopyLnMode::Relative, hsize: 0,
+            mode: CopyLnMode::Relative, hsize: 0, hide_position: false,
             num_style: Style::default().fg(Color::DarkGray),
-            cur_style: Style::default().fg(Color::Yellow),
+            cur_style: Style::default().fg(Color::Yellow), hl: Default::default(),
         });
         term.draw(|f| {
             let area = Rect::new(0, 0, 40, h);
             let active_rect = crate::client::compute_active_rect_json(&leaf, area);
             crate::client::render_layout_json(
-                f, &leaf, area, false, Color::DarkGray, Color::Green,
+                f, &leaf, area, false,
+                ratatui::style::Style::default().fg(Color::DarkGray),
+                ratatui::style::Style::default().fg(Color::Green),
                 false, Color::Reset, active_rect, "", false, "off", "", 1,
                 crate::border_lines::border_chars("single"), copy_ln,
                 crate::client::WindowContentStyles::default(),
+                crate::pane_border::PaneBorderIndicators::Colour,
             );
         }).unwrap();
         let buf = term.backend().buffer().clone();
-        let aw = buf.area.width as usize;
-        buf.content[0 * aw + gw].symbol().chars().next()
+        // Row 0, so the cell index is the column itself.
+        buf.content[gw].symbol().chars().next()
     };
     assert_eq!(gutters_and_content, Some('X'), "content must begin right after the {}-col gutter", gw);
 }

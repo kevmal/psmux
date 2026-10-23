@@ -288,6 +288,16 @@ fn clamp_to_window_limit(app: &AppState, window_id: usize, size: (u16, u16)) -> 
         .unwrap_or(size)
 }
 
+/// tmux resize.c ignore_client_size: a client that set `ignore-size` is left
+/// out of the window size while any attached client has not set it (#825).
+pub(crate) fn client_size_ignored(app: &AppState, client_id: u64) -> bool {
+    app.ignore_size_clients.contains(&client_id)
+        && app
+            .client_registry
+            .keys()
+            .any(|id| !app.ignore_size_clients.contains(id))
+}
+
 fn client_sizes_for_window(app: &AppState, window_id: usize) -> Vec<(u64, (u16, u16))> {
     let mut sizes: Vec<(u64, (u16, u16))> = app
         .client_sizes
@@ -301,10 +311,14 @@ fn client_sizes_for_window(app: &AppState, window_id: usize) -> Vec<(u64, (u16, 
                 control_size_for_window(client, window_id).map(|size| (*client_id, size))
             }),
     );
+    sizes.retain(|(client_id, _)| !client_size_ignored(app, *client_id));
     sizes
 }
 
 fn default_client_size(app: &AppState, client_id: u64) -> Option<(u16, u16)> {
+    if client_size_ignored(app, client_id) {
+        return None;
+    }
     app.client_sizes.get(&client_id).copied().or_else(|| {
         app.control_clients
             .get(&client_id)
@@ -380,6 +394,26 @@ fn effective_window_size(app: &AppState, window: &crate::types::Window) -> Optio
     }
 }
 
+/// Record that `client_id` just sent a request: `window-size latest` follows
+/// the client the user is actually using, not the one that happened to resize
+/// last.  Returns true when the window geometry changed (the caller then
+/// resizes the panes).
+///
+/// Only clients that reported a size can drive the geometry: one-shot CLI
+/// clients (`psmux ls`) and CONTROL clients send requests constantly and have
+/// no entry in `client_sizes`, so they are ignored.
+pub fn note_client_activity(app: &mut AppState, client_id: u64) -> bool {
+    if !app.client_sizes.contains_key(&client_id) {
+        return false;
+    }
+    if app.latest_client_id == Some(client_id) && app.latest_size_client_id == Some(client_id) {
+        return false; // already the latest: nothing to recompute
+    }
+    app.latest_client_id = Some(client_id);
+    app.latest_size_client_id = Some(client_id);
+    refresh_dynamic_window_sizes(app)
+}
+
 pub fn refresh_dynamic_window_sizes(app: &mut AppState) -> bool {
     let latest_size_is_live = app.latest_size_client_id.is_some_and(|client_id| {
         app.client_sizes.contains_key(&client_id)
@@ -413,12 +447,14 @@ pub fn refresh_dynamic_window_sizes(app: &mut AppState) -> bool {
         .or_else(|| {
             app.client_sizes
                 .iter()
+                .filter(|(client_id, _)| !client_size_ignored(app, **client_id))
                 .max_by_key(|(client_id, _)| *client_id)
                 .map(|(_, size)| *size)
         })
         .or_else(|| {
             app.control_clients
                 .iter()
+                .filter(|(client_id, _)| !client_size_ignored(app, **client_id))
                 .filter_map(|(client_id, client)| client.size.map(|size| (*client_id, size)))
                 .max_by_key(|(client_id, _)| *client_id)
                 .map(|(_, size)| size)
@@ -553,3 +589,7 @@ pub fn set_active_window_size_mode(
 #[cfg(test)]
 #[path = "../tests-rs/test_resize_window_compat.rs"]
 mod test_resize_window_compat;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_size_after_reconnect.rs"]
+mod test_client_size_after_reconnect;

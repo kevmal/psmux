@@ -66,13 +66,24 @@ $tree01 = Get-PaneTree $pid01
 if ($tree01 -eq 'direct') { Write-Pass "split-window -- pane is cmd.exe itself (pid $pid01)" }
 else { Write-Fail "split-window -- pane tree: $tree01 (pid=$pid01)" }
 
-# --- Arm 4: single-string command keeps shell semantics (tmux parity) ---
-Write-Host "[Arm 4] string form still routes through the shell" -ForegroundColor Yellow
+# --- Arm 4: a plain "exe + args" string is direct too (launch latency) ---
+# This arm used to assert the opposite. The psmux CLI joins positional words
+# into one string, so by the time a command reaches the spawn code a quoted
+# "cmd.exe /k echo hi" and an unquoted cmd.exe /k echo hi are the SAME string:
+# the argc distinction tmux keys on survives only through the explicit `--`
+# marker the arms above cover. Keeping the shell for that shared string meant
+# every `psmux new-session pwsh -NoLogo -NoProfile -File x.ps1` paid a second
+# pwsh start, measured at 278ms of launch-to-prompt (and the wrapper, having no
+# -NoProfile of its own, sourced the profile the inner flag had opted out of).
+# So a bare program name with arguments that PATH resolves to an .exe/.com is
+# now exec'd directly; shell-syntax strings, lone words and names that resolve
+# to a .cmd/.ps1/extensionless launcher still get the shell (Arms 6 and 7).
+Write-Host "[Arm 4] plain exe + args string is direct, output intact" -ForegroundColor Yellow
 & $PSMUX new-window -t $SESSION "cmd.exe /k echo hello582d"
 Start-Sleep -Seconds 3
 $pid2 = (& $PSMUX display-message -t "${SESSION}:2.0" -p '#{pane_pid}' 2>&1 | Out-String).Trim()
 $tree2 = Get-PaneTree $pid2
-if ($tree2 -match '^wrapped:(pwsh|powershell)') { Write-Pass "string command runs under the shell ($tree2), tmux string semantics" }
+if ($tree2 -eq 'direct') { Write-Pass "plain exe + args string is cmd.exe itself, no pwsh wrapper (pid $pid2)" }
 else { Write-Fail "string form tree unexpected: $tree2 (pid=$pid2)" }
 $cap = & $PSMUX capture-pane -t "${SESSION}:2" -p 2>&1 | Out-String
 if ($cap -match 'hello582d') { Write-Pass "string form output intact" }
@@ -90,6 +101,24 @@ Start-Sleep -Seconds 3
 $cap = & $PSMUX capture-pane -t $paneId -p 2>&1 | Out-String
 if ($cap -match 'RESPAWN582') { Write-Pass "quoted-string respawn (teammate idiom) intact" }
 else { Write-Fail "quoted respawn broken: [$($cap.Trim())]" }
+
+# --- Arm 6: shell syntax still gets a real shell ---
+Write-Host "[Arm 6] shell-syntax string still routes through the shell" -ForegroundColor Yellow
+& $PSMUX new-window -t $SESSION "cmd.exe /k echo hello582f; Start-Sleep 300"
+Start-Sleep -Seconds 3
+$pid6 = (& $PSMUX display-message -t "${SESSION}:4.0" -p '#{pane_pid}' 2>&1 | Out-String).Trim()
+$p6 = Get-CimInstance Win32_Process -Filter "ProcessId=$pid6" -ErrorAction SilentlyContinue
+if ($p6 -and $p6.Name -match '^(pwsh|powershell)') { Write-Pass "a `;` in the command keeps the shell ($($p6.Name))" }
+else { Write-Fail "shell-syntax string did not get a shell: $($p6.Name) (pid=$pid6)" }
+
+# --- Arm 7: a lone word keeps the shell (PowerShell alias semantics) ---
+# `ls` means Get-ChildItem to every Windows user; only the shell resolves it,
+# and tmux routes a single-argument command through the shell too.
+Write-Host "[Arm 7] lone word keeps the shell" -ForegroundColor Yellow
+$o7 = (& $PSMUX new-window -t $SESSION -P -F '#{pane_id}' ls 2>&1 | Out-String).Trim()
+Start-Sleep -Seconds 2
+if ($o7 -notmatch 'not a valid Win32|error 193|failed') { Write-Pass "lone `ls` spawned through the shell, not CreateProcessW" }
+else { Write-Fail "lone word was direct-spawned: [$o7]" }
 
 & $PSMUX kill-session -t $SESSION 2>&1 | Out-Null
 

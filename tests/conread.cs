@@ -58,6 +58,21 @@ class ConRead
     static extern bool ReadConsoleOutputAttribute(IntPtr h, [Out] ushort[] buf,
         uint len, COORD coord, out uint read);
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct CONSOLE_CURSOR_INFO { public uint dwSize; public bool bVisible; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CHAR_INFO { public char UnicodeChar; public ushort Attributes; }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ReadConsoleOutputW(IntPtr h, [Out] CHAR_INFO[] buf,
+        COORD size, COORD at, ref SMALL_RECT region);
+
+    const ushort COMMON_LVB_TRAILING_BYTE = 0x0200;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetConsoleCursorInfo(IntPtr h, out CONSOLE_CURSOR_INFO info);
+
     static int Main(string[] argv)
     {
         if (argv.Length < 1)
@@ -68,9 +83,15 @@ class ConRead
         uint pid = uint.Parse(argv[0]);
         int maxRows = 0;
         bool withAttrs = false;
+        bool withCursor = false;
+        bool utf8 = false;
+        bool grid = false;
         for (int a = 1; a < argv.Length; a++)
         {
             if (argv[a] == "-a" || argv[a] == "--attrs") withAttrs = true;
+            else if (argv[a] == "-c" || argv[a] == "--cursor") withCursor = true;
+            else if (argv[a] == "-u" || argv[a] == "--utf8") utf8 = true;
+            else if (argv[a] == "-g" || argv[a] == "--grid") grid = true;
             else int.TryParse(argv[a], out maxRows);
         }
 
@@ -111,14 +132,46 @@ class ConRead
         int width = info.dwSize.X;
         if (maxRows > 0 && maxRows < height) { top = info.srWindow.Bottom - maxRows + 1; height = maxRows; }
 
+        // -c: first line is the console cursor, window relative, plus its
+        // visibility flag. This is the cell the user sees blinking, so it is the
+        // oracle for "which pane is the cursor in" (#767).
+        if (withCursor)
+        {
+            CONSOLE_CURSOR_INFO ci;
+            bool vis = GetConsoleCursorInfo(h, out ci) && ci.bVisible;
+            sb.Append("CURSOR x=").Append(info.dwCursorPosition.X)
+              .Append(" y=").Append(info.dwCursorPosition.Y - info.srWindow.Top)
+              .Append(" visible=").Append(vis ? 1 : 0).AppendLine();
+        }
+
         var line = new char[width];
         var attrs = new ushort[width];
         for (int row = 0; row < height; row++)
         {
             uint read;
             COORD at; at.X = 0; at.Y = (short)(top + row);
-            if (!ReadConsoleOutputCharacterW(h, line, (uint)width, at, out read)) break;
-            string text = new string(line, 0, (int)read).TrimEnd();
+            string text;
+            if (grid)
+            {
+                // -g: exactly one char per CELL, so a string index is a screen
+                // column. ReadConsoleOutputCharacterW folds a two cell glyph into
+                // one char, which shifts every later column. The second cell of a
+                // wide glyph is written as U+0001.
+                var cells = new CHAR_INFO[width];
+                COORD sz; sz.X = (short)width; sz.Y = 1;
+                COORD origin; origin.X = 0; origin.Y = 0;
+                SMALL_RECT reg; reg.Left = 0; reg.Right = (short)(width - 1); reg.Top = at.Y; reg.Bottom = at.Y;
+                if (!ReadConsoleOutputW(h, cells, sz, origin, ref reg)) break;
+                var gsb = new StringBuilder(width);
+                for (int i = 0; i < width; i++)
+                    gsb.Append((cells[i].Attributes & COMMON_LVB_TRAILING_BYTE) != 0 ? '\u0001' : cells[i].UnicodeChar);
+                text = gsb.ToString().TrimEnd();
+            }
+            else
+            {
+                if (!ReadConsoleOutputCharacterW(h, line, (uint)width, at, out read)) break;
+                text = new string(line, 0, (int)read).TrimEnd();
+            }
 
             if (withAttrs)
             {
@@ -148,6 +201,14 @@ class ConRead
         }
 
         FreeConsole();
+        if (utf8)
+        {
+            // -u: raw UTF-8 bytes. The console code page turns every non-ASCII
+            // glyph into '?', and then a wide name cannot be told from a narrow one.
+            byte[] bytes = Encoding.UTF8.GetBytes(sb.ToString());
+            using (var o = Console.OpenStandardOutput()) o.Write(bytes, 0, bytes.Length);
+            return 0;
+        }
         Console.Out.Write(sb.ToString());
         return 0;
     }

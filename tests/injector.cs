@@ -86,7 +86,10 @@ class Injector
         bool ok = WriteConsoleInput(h, recs, 2, out written);
         int err = ok ? 0 : Marshal.GetLastWin32Error();
         log.Add(string.Format("  '{0}' vk=0x{1:X2} ok={2} w={3} e={4}",
-            ch == '\0' ? "NUL" : ch.ToString(), vk, ok, written, err));
+            // A lone surrogate cannot be written to the UTF-8 log file
+            // (EncoderFallbackException), so code units are logged as hex.
+            ch == '\0' ? "NUL" : char.IsSurrogate(ch) ? string.Format("U+{0:X4}", (int)ch) : ch.ToString(),
+            vk, ok, written, err));
         return ok && written == 2;
     }
 
@@ -115,7 +118,7 @@ class Injector
         if (args.Length < 2)
         {
             File.WriteAllText(logFile, "Usage: injector.exe <pid> <keys>\n" +
-                "Keys: chars, ^x=Ctrl+x, {ALT:x}, {ENTER}, {ESC}, {LBRACE}, {RBRACE}, {SLEEP:ms}");
+                "Keys: chars, ^x=Ctrl+x, {ALT:x}, {ENTER}, {ESC}, {F1}..{F12}, {LBRACE}, {RBRACE}, {SLEEP:ms}");
             return 99;
         }
 
@@ -205,6 +208,25 @@ class Injector
                     {
                         if (SendKey(handle, 0x22, '\0', 0, log)) injected++;
                     }
+                    else if (token.Length >= 2 && token.Length <= 3 && token[0] == 'F'
+                             && token[1] >= '0' && token[1] <= '9'
+                             && (token.Length == 2 || (token[2] >= '0' && token[2] <= '9')))
+                    {
+                        // {F1}..{F12} function keys. VK_F1 is 0x70 and the
+                        // function keys are contiguous through VK_F12 at 0x7B.
+                        // UnicodeChar stays NUL: a real keyboard reports no
+                        // character for a function key, and apps that read
+                        // INPUT_RECORDs (Far Manager) key off the virtual key.
+                        int fn = int.Parse(token.Substring(1));
+                        if (fn >= 1 && fn <= 12)
+                        {
+                            if (SendKey(handle, (ushort)(0x70 + fn - 1), '\0', 0, log)) injected++;
+                        }
+                        else
+                        {
+                            log.Add("  SKIP {" + token + "}: only F1..F12 exist");
+                        }
+                    }
                     else if (token.StartsWith("ALT:"))
                     {
                         // {ALT:x} — Alt+x, e.g. copy mode jump-to-mark
@@ -251,6 +273,91 @@ class Injector
                             char uc = (char)Convert.ToUInt16(hex, 16);
                             if (SendKey(handle, 0, uc, 0, log)) injected++;
                             Thread.Sleep(20);
+                        }
+                    }
+                    else if (token.StartsWith("UTF16:"))
+                    {
+                        // {UTF16:XXXX[,XXXX,...]}: raw UTF-16 code units, written
+                        // in ONE WriteConsoleInputW call as a key down and a key
+                        // up record per unit, all with vk=0 and no modifiers.
+                        // That is byte for byte what the console itself produces
+                        // for a paste, an IME commit or a Win+. emoji pick of a
+                        // non BMP character (issue #742): for U+1F60A it is
+                        //   down D83D, up D83D, down DE0A, up DE0A.
+                        // {U:} cannot express that: it writes each unit in its
+                        // own call with a sleep between, so the two halves of a
+                        // surrogate pair arrive in two separate reads.
+                        var hexes = token.Substring(6).Split(',');
+                        var urecs = new List<INPUT_RECORD>();
+                        foreach (var hex in hexes)
+                        {
+                            char uc = (char)Convert.ToUInt16(hex, 16);
+                            var down = MakeKey(true, 0, uc, 0);
+                            var up = MakeKey(false, 0, uc, 0);
+                            down.KeyEvent.wVirtualScanCode = 0;
+                            up.KeyEvent.wVirtualScanCode = 0;
+                            urecs.Add(down);
+                            urecs.Add(up);
+                        }
+                        var uarr = urecs.ToArray();
+                        uint uw; bool uok = WriteConsoleInput(handle, uarr, (uint)uarr.Length, out uw);
+                        int ue = uok ? 0 : Marshal.GetLastWin32Error();
+                        log.Add(string.Format("  UTF16 {0} n={1} ok={2} w={3} e={4}",
+                            token.Substring(6), uarr.Length, uok, uw, ue));
+                        if (uok && uw == uarr.Length) injected++;
+                    }
+                    else if (token.StartsWith("MOD:"))
+                    {
+                        // MOD:vkHex:charHex:ctrlHex  e.g. MOD:70:0000:0002
+                        //
+                        // Like RAW, but the modifier key-down/key-up records that
+                        // bracket the keypress are derived from the control key
+                        // state instead of being hard-wired to Ctrl.  A real
+                        // keyboard reports VK_MENU before an Alt combination and
+                        // VK_SHIFT before a shifted one, and Far Manager keys off
+                        // those, so Alt+F1 (the drives menu) cannot be expressed
+                        // with RAW, which would press Ctrl instead.
+                        var parts = token.Substring(4).Split(':');
+                        if (parts.Length == 3)
+                        {
+                            ushort rvk = Convert.ToUInt16(parts[0], 16);
+                            char rch = (char)Convert.ToUInt16(parts[1], 16);
+                            uint rctrl = Convert.ToUInt32(parts[2], 16);
+                            var pre = new List<INPUT_RECORD>();
+                            var post = new List<INPUT_RECORD>();
+                            uint held = 0;
+                            // Order matters: Ctrl first, then Alt, then Shift, and
+                            // released in the reverse order, which is the order
+                            // Windows reports for a real chord.
+                            if ((rctrl & 0x000C) != 0)
+                            {
+                                held |= (rctrl & 0x000C);
+                                pre.Add(MakeKey(true, 0x11, '\0', held));
+                                post.Insert(0, MakeKey(false, 0x11, '\0', 0));
+                            }
+                            if ((rctrl & 0x0003) != 0)
+                            {
+                                held |= (rctrl & 0x0003);
+                                pre.Add(MakeKey(true, 0x12, '\0', held));
+                                post.Insert(0, MakeKey(false, 0x12, '\0', held & ~0x0003u));
+                            }
+                            if ((rctrl & SHIFT_PRESSED) != 0)
+                            {
+                                held |= SHIFT_PRESSED;
+                                pre.Add(MakeKey(true, 0x10, '\0', held));
+                                post.Insert(0, MakeKey(false, 0x10, '\0', held & ~SHIFT_PRESSED));
+                            }
+                            var all = new List<INPUT_RECORD>();
+                            all.AddRange(pre);
+                            all.Add(MakeKey(true, rvk, rch, rctrl));
+                            all.Add(MakeKey(false, rvk, rch, rctrl));
+                            all.AddRange(post);
+                            var arr = all.ToArray();
+                            uint w; bool ok = WriteConsoleInput(handle, arr, (uint)arr.Length, out w);
+                            int e = ok ? 0 : Marshal.GetLastWin32Error();
+                            log.Add(string.Format("  MOD vk=0x{0:X2} ch=0x{1:X2} ctrl=0x{2:X4} n={3} ok={4} w={5} e={6}",
+                                rvk, (int)rch, rctrl, arr.Length, ok, w, e));
+                            if (ok) injected++;
                         }
                     }
                     else if (token.StartsWith("RAW:"))

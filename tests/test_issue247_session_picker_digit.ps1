@@ -78,7 +78,9 @@ Write-Test "Handler: Esc clears the buffer on close"
 # Post-ea71e75 Esc is handled in a shared matches!() guard (filter-aware branch);
 # the close path sets session_chooser = false, drops the filter state, and
 # clears session_num_buffer in the same block.
-$escClears = ($src -match 'matches!\(key\.code,\s*KeyCode::Esc\)\s*&&\s*\([^)]*session_chooser') -and ($src -match '(?s)session_chooser\s*=\s*false;\s*session_filter_active\s*=\s*false;\s*session_filter\.clear\(\);[^}]*session_num_buffer\.clear\(\)')
+# The guard's condition list now nests parentheses (the command prompt term
+# is itself a group), so match up to the arm's opening brace instead.
+$escClears = ($src -match 'matches!\(key\.code,\s*KeyCode::Esc\)\s*&&[^{]*session_chooser') -and ($src -match '(?s)session_chooser\s*=\s*false;\s*session_filter_active\s*=\s*false;\s*session_filter\.clear\(\);[^}]*session_num_buffer\.clear\(\)')
 Add-Result "Esc clears buffer" $escClears ""
 
 Write-Test "Handler: catch-all absorbs remaining Char keys while picker is open"

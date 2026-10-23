@@ -19,7 +19,10 @@
 
 $ErrorActionPreference = "Continue"
 $PSMUX = (Get-Command psmux -EA Stop).Source
-$psmuxDir = "$env:USERPROFILE\.psmux"
+# Honour PSMUX_DATA_DIR: Reset-All deletes every registry file in this
+# directory, so with an isolated data dir it must never touch the real one
+# (2026-10-13 a run with a private PSMUX_DATA_DIR wiped ~/.psmux).
+$psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -218,8 +221,8 @@ if (New-Detached "dup") {
 
     $resp = Send-TcpCommand -Session "dup2" -Command "new-session -d -s dup2"
     Write-Info "duplicate-name response: '$resp'"
-    if ($resp -match "already exists") { Write-Pass "creating the live session's own name is still rejected" }
-    else { Write-Fail "expected 'already exists' for a live duplicate, got '$resp'" }
+    if ($resp -match "duplicate session") { Write-Pass "creating the live session's own name is still rejected" }
+    else { Write-Fail "expected 'duplicate session' for a live duplicate, got '$resp'" }
 
     $resp = Send-TcpCommand -Session "dup2" -Command "new-session -d -s unrelated"
     if ($resp -eq "OK") { Write-Pass "unrelated name still creatable after rename" }

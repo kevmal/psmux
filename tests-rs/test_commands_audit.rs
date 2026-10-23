@@ -26,6 +26,7 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -390,6 +391,8 @@ fn linkw_alias_accepted() {
     let mut app = mock_app_with_window();
     // linkw alias is also accepted without error
     execute_command_string(&mut app, "linkw").unwrap();
+    // These commands start a real shell; end it before the state drops.
+    crate::util::kill_app_shells(&mut app);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -469,12 +472,17 @@ fn suspendc_alias_shows_not_available() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn choose_client_shows_single_client_message() {
+fn choose_client_lists_the_attached_clients() {
+    // psmux takes several clients, so the old "single-client model" status
+    // line was wrong (discussion #776); the client list is shown instead, as
+    // the wire path does.
     let mut app = mock_app_with_window();
+    app.register_client(1, false);
     execute_command_string(&mut app, "choose-client").unwrap();
-    let msg = extract_status_message(&app);
-    assert!(msg.contains("single-client") || msg.contains("only client"),
-        "choose-client should show single-client feedback, got: {}", msg);
+    let (cmd, out) = extract_popup(&app);
+    assert_eq!(cmd, "choose-client");
+    assert!(out.contains("/dev/pts/1:"), "choose-client should list the client, got: {}", out);
+    assert!(app.status_message.as_ref().map_or(true, |m| !m.0.contains("single-client")));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -980,8 +988,10 @@ fn every_command_does_not_panic_embedded_mode() {
     ];
     for cmd in &safe_commands {
         let mut app = mock_app_with_windows(&["test1", "test2"]);
-        app.paste_buffers.push("buffer_data".to_string());
+        app.paste_add("buffer_data".to_string());
         let result = execute_command_string(&mut app, cmd);
         assert!(result.is_ok(), "command '{}' panicked or returned error: {:?}", cmd, result);
+        // Some of these start a real shell; end it before the state drops.
+        crate::util::kill_app_shells(&mut app);
     }
 }
