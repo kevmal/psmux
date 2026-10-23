@@ -77,7 +77,6 @@ function Tcp([string]$Command, [switch]$Control) {
             return $lines -join "`n"
         }
         $writer.WriteLine($Command); $writer.Flush()
-        $client.Client.Shutdown([Net.Sockets.SocketShutdown]::Send)
         $reader.ReadToEnd().Trim()
     } finally { $client.Dispose() }
 }
@@ -85,7 +84,7 @@ try {
     foreach ($name in $SavedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $null) }
     $env:PSMUX_DATA_DIR = $DataDir
     $env:PSMUX_CONFIG_FILE = $Config
-    $env:PSMUX_NO_WARM = '1' 
+    $env:PSMUX_NO_WARM = '1'
     [IO.File]::WriteAllText($Config, '')
     $setup = (& $Binary -L $Namespace -f $Config new-session -d -s $Session -x 100 -y 30 'cmd.exe /k' 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { throw $setup }

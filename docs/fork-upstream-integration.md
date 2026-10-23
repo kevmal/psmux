@@ -101,7 +101,8 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-Focused Rust tests cover passive closes (including warm claim and factored
+234 focused Rust tests passed after the safety port. They cover passive closes
+(including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use
 pure fixtures or private loopback peers; inspect filters before running them.
