@@ -1370,7 +1370,10 @@ pub(crate) fn dispatch(
                     hook_event = Some("window-closed");
                 }
                 // copied from server/mod.rs run_server (line 5123 at 86a78100)
-                CtrlReq::KillWindowTarget { win, win_is_id, name, resp } => {
+                CtrlReq::ResolveWindowTarget { target, resp } => {
+                    let _ = resp.send(crate::server::temp_target::resolve_window_command_target(&app, &target));
+                }
+                CtrlReq::KillWindowTarget { target, resp } => {
                     // Resolve the target here, on live state. An unresolvable
                     // target must be an error, never a fallback to the active
                     // window: the old temp-focus-then-kill dance silently
@@ -1378,19 +1381,10 @@ pub(crate) fn dispatch(
                     // killed whatever was focused (session death when it was
                     // the last window). tmux: "can't find window: X", kills
                     // nothing, exit 1.
-                    let resolved = if let Some(w) = win {
-                        if win_is_id {
-                            app.windows.iter().position(|x| x.id == w)
-                        } else {
-                            app.win_pos(w)
-                        }
-                    } else if let Some(ref n) = name {
-                        app.windows.iter().position(|x| x.name == *n)
-                    } else {
-                        Some(app.active_idx)
-                    };
+                    let resolved = crate::server::temp_target::resolve_command_window(&app, &target, false)
+                        .and_then(|w| w.pos().ok_or_else(|| format!("can't find window: {}", target)));
                     match resolved {
-                        Some(pos) => {
+                        Ok(pos) => {
                             kill_window_at(&mut app, pos);
                             resize_all_panes(&mut app);
                             meta_dirty = true;
@@ -1399,13 +1393,7 @@ pub(crate) fn dispatch(
                             hook_event = Some("window-closed");
                             let _ = resp.send(Ok(()));
                         }
-                        None => {
-                            let spec = if let Some(w) = win {
-                                if win_is_id { format!("@{}", w) } else { w.to_string() }
-                            } else {
-                                name.clone().unwrap_or_default()
-                            };
-                            let msg = format!("can't find window: {}", spec);
+                        Err(msg) => {
                             // Surface in the status bar for attached clients,
                             // same convention as join-pane (#437).
                             app.status_message = Some((msg.clone(), Instant::now(), None));

@@ -233,8 +233,8 @@ class Contract:
         assert all(b"{VANISHED}" not in self.bytes(label) and b"{MISSING}" not in self.bytes(label) for label in self.logs)
 
     def open_pr7_ordering_probe(self):
-        # A diagnostic of the separate open PR's bug, not a passing assertion
-        # of window-target safety. Both possible victims are disposable probes.
+        # Regression for the separate PR's pane-to-window mapping. Both
+        # possible victims are disposable probes; never target a live session.
         self.sessions.append("gamma")
         first = self.run("new-session", "-d", "-s", "gamma", "-P", "-F", "#{pane_id}",
                          "--", *self.probe_args("G")).stdout.strip()
@@ -248,6 +248,7 @@ class Contract:
                              "active_pane_before": first, "remaining_panes": remaining,
                              "requires_pr7_rebase": not fixed})
         print(f"PR7 DIAGNOSTIC: target-safe={fixed}; requested {second}; remaining {remaining}", flush=True)
+        assert fixed, "pane-to-window safety from PR #7 must be present"
 
     def cleanup(self):
         for stop in self.stops:

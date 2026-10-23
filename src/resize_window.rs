@@ -13,6 +13,7 @@ pub enum WindowTarget {
     Index(usize),
     Name(String),
     PaneId(usize),
+    Spec(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +78,12 @@ fn target_from_raw(raw: Option<&str>) -> Result<WindowTarget, String> {
         return Ok(WindowTarget::Current);
     };
     let parsed = parse_target(raw);
+    // Keep composite syntax intact: parse_target intentionally omits malformed
+    // pane slots, which must not silently reduce `@1.%bad` to window @1.
+    let body = raw.split_once(':').map(|(_, body)| body).unwrap_or(raw);
+    if (raw.contains(':') || raw.starts_with(['@', '.'])) && body.contains('.') && body != "." {
+        return Ok(WindowTarget::Spec(raw.to_string()));
+    }
     if let Some(window) = parsed.window {
         return Ok(if parsed.window_is_id {
             WindowTarget::Id(window)
@@ -92,7 +99,8 @@ fn target_from_raw(raw: Option<&str>) -> Result<WindowTarget, String> {
             return Ok(WindowTarget::PaneId(pane));
         }
     }
-    if raw == "." || raw.ends_with(':') || parsed.session.is_some() {
+    if raw == "." || raw.ends_with(':')
+        || (!raw.contains(':') && parsed.session.is_some()) {
         return Ok(WindowTarget::Current);
     }
     Err(format!("can't find window: {}", raw))
@@ -265,6 +273,8 @@ pub fn resolve_window(app: &AppState, target: &WindowTarget) -> Result<usize, St
         WindowTarget::PaneId(id) => crate::tree::find_pane_by_id_global(app, *id)
             .map(|(window_index, _)| window_index)
             .ok_or_else(|| format!("can't find pane: %{}", id)),
+        WindowTarget::Spec(raw) => app.resolve_window_spec(raw, false)?
+            .pos().ok_or_else(|| format!("can't find window: {}", raw)),
     }
 }
 

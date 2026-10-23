@@ -46,27 +46,38 @@ applies/restores focus within the request. The old fork commit is deliberately
 not cherry-picked on top. Both ordinary and stalled concurrent sends must be
 checked against the new implementation.
 
-## PR #7 is an unresolved dependency
+## PR #7 target safety is ported onto the upstream protocol
 
-[PR #7](https://github.com/kevmal/psmux/pull/7), head `62c2f69c` at review time,
-remains on its separate branch. It fixes pane targets being lost before window
-mutations. Upstream request-local targeting does **not** fix that entire issue:
-`kill-window` still skips generic pane focus and its `KillWindowTarget` arm only
-receives the parsed window portion.
+The first draft reproduced the existing wrong-window bug fixed by
+[PR #7](https://github.com/kevmal/psmux/pull/7): `kill-window -t gamma:%2`
+removed active `%1` and left `%2`. The follow-up now ports #7's semantics
+without changing its branch or resurrecting `FocusTargetTemp`.
 
-The isolated diagnostic reproduces it: create gamma with active pane `%1` and
-another window holding `%2`; `kill-window -t gamma:%2` leaves `%2` and removes
-`%1`. Both panes are disposable probes in the test's private `-L` namespace.
-This is the existing bug fixed by #7, not a claim of passing target safety.
+Window mutations and window-option commands retain their complete raw target.
+`ResolveWindowTarget` resolves that spec read-only into a stable window id;
+the existing `TargetedSender`/`CtrlReq::Targeted` carries it with each request.
+`KillWindowTarget` also keeps the raw spec and resolves it on live state in
+the mutation turn. Missing/malformed pane components cannot silently become
+an active-window operation. Qualified session identity is checked, numeric
+pane indexes honor pane-base-index, and floating pane ids map to their owner.
+Resize-window retains composite syntax through its `Spec` variant.
 
-**Do not merge this PR independently ahead of #7's semantics.** Whichever PR
-lands second needs a semantic rebase. Keep upstream `TargetedSender` and
-`CtrlReq::Targeted`; do not resurrect the old `FocusTargetTemp` protocol while
-porting #7. Carry #7's raw-window-target resolution, pane-to-owning-window
-mapping, fail-closed behavior and resize/option handling onto the new resolvers
-and both one-shot/control dispatch paths. Run #7's window-target regression
-suite against the combined tree before approval. This branch does not modify
-#7's branch or absorb its commit.
+The port carries #7's pure resolver/resize cases and full runtime safety suite,
+adapted to a private data root, empty config, unique `-L`, LF wire framing and
+filesystem-only default-registry snapshots. All **187** runtime checks pass:
+valid pane-to-window mutation, survivor focus, invalid/malformed targets,
+window options and CLI/raw/control paths. The CI test job runs this suite
+against its freshly built binary before the full Rust suite.
+
+The separate #7 commit is not a parent of this branch; its behavior is ported
+and tested here. #7 can be reconciled/closed only after review of this concrete
+combined implementation. Keep this PR draft until Kevin's thorough review;
+green CI does not authorize merging master or deploying binaries.
+
+The independent review also found three CI fixture failures. The parity test
+now expects the retained 500 ms; both source-job TCP peers read framed AUTH
+and command lines instead of waiting for a client half-close. Production
+passive close and refusal classification remain unchanged.
 
 ## Validation and safety boundaries
 
@@ -87,8 +98,8 @@ Enter/Return/CR/Escape bytes; and removed/invalid targets with no redirection.
 Long-stalled read queries may report their bounded timeout; the send payloads
 must still arrive exactly once in only the intended panes.
 
-`--probe-open-pr7` is a separate diagnostic, deliberately reporting whether the
-known window-target bug remains; its exit code is not a target-safety verdict.
+`--probe-open-pr7` is a focused regression: it reports the requested and
+remaining pane ids and now asserts that the correct window was removed.
 
 Focused Rust tests cover passive closes (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,

@@ -1072,6 +1072,32 @@ pub(crate) fn set_hook_request(args: &[&str]) -> Option<CtrlReq> {
     })
 }
 
+/// Window mutations and window options retain the full raw target until
+/// the server resolves it; parse_target alone can omit an invalid pane slot.
+fn targets_existing_window(cmd: &str, args: &[&str]) -> bool {
+    matches!(cmd, "kill-window" | "killw" | "rename-window" | "renamew"
+        | "respawn-window" | "respawnw" | "unlink-window" | "unlinkw"
+        | "rotate-window" | "rotatew" | "select-layout" | "selectl"
+        | "next-layout" | "nextl" | "previous-layout" | "prevl"
+        | "select-window" | "selectw"
+        | "set-window-option" | "setw" | "show-window-options" | "showw" | "show-window-option")
+        || (matches!(cmd, "set-option" | "set" | "show-options" | "show") && crate::cli::has_short_flag(args, 'w'))
+}
+
+fn validate_window_target(tx: &mpsc::Sender<CtrlReq>, target: &str) -> Result<crate::types::TempTarget, String> {
+    let (resp, rx) = mpsc::channel();
+    tx.send(CtrlReq::ResolveWindowTarget { target: target.to_string(), resp })
+        .map_err(|_| "server disconnected".to_string())?;
+    rx.recv().unwrap_or_else(|_| Err("server disconnected".to_string()))
+}
+
+fn pane_command_checks_window(cmd: &str, raw: &str) -> bool {
+    // Bare numeric pane indexes have a different grammar. Complete qualified
+    // specs and explicit %/@/. forms can be checked without changing it.
+    matches!(cmd, "kill-pane" | "killp")
+        && (raw.contains(':') || raw.starts_with(['%', '@', '.']))
+}
+
 fn requote_command_tail(args: &[&str]) -> String {
     // One encoder for the argv form, the one build_command decodes (#794).
     crate::pane::requote_argv(args)
@@ -2588,6 +2614,18 @@ if control_echo || control_quiet || control_noecho {
                 })
             })
             .or(ctrl_target_err);
+        if focus_err.is_none() {
+            if let Some(ref raw) = ctrl_raw_target {
+                let window = targets_existing_window(cmd_name, &filtered_args);
+                if window || pane_command_checks_window(cmd_name, raw) {
+                    match validate_window_target(&tx_ctrl, raw) {
+                        Ok(resolved) if window && !is_focus_cmd => ctrl_command_target = Some(resolved),
+                        Ok(_) => {},
+                        Err(e) => focus_err = Some(e),
+                    }
+                }
+            }
+        }
         if focus_err.is_none() && is_focus_cmd {
             if let Some(ref s) = ctrl_target_session {
                 let spec = crate::types::TempTarget { session: Some(s.clone()), ..Default::default() };
@@ -2665,7 +2703,7 @@ if control_echo || control_quiet || control_noecho {
                 let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
                 let check_pane = ctrl_target_pane.is_some() && !want_pane
                     && pane_checked_not_focused(cmd_name, ctrl_pane_is_id);
-                if want_win || want_pane || check_pane || ctrl_target_session.is_some() {
+                if ctrl_command_target.is_none() && (want_win || want_pane || check_pane || ctrl_target_session.is_some()) {
                     let spec = crate::types::TempTarget {
                         win: if want_win { ctrl_target_win } else { None },
                         win_is_id: ctrl_target_win_is_id,
@@ -3233,6 +3271,22 @@ let mut target_failed = false;
 // Issue #793: a `sess:...` target naming another session is tmux's "can't
 // find session", checked before the command touches anything.
 let target_session = explicit_target_session(cmd, raw_target.as_deref());
+if let Some(ref raw) = raw_target {
+    let window = targets_existing_window(cmd, &args);
+    if window || pane_command_checks_window(cmd, raw) {
+        match validate_window_target(&tx, raw) {
+            Ok(resolved) if window && !is_focus_cmd => command_target = Some(resolved),
+            Ok(_) => {},
+            Err(e) => {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+                if !persistent { break; }
+                line.clear();
+                continue;
+            }
+        }
+    }
+}
 if is_focus_cmd {
     if let Some(ref s) = target_session {
         let spec = crate::types::TempTarget { session: Some(s.clone()), ..Default::default() };
@@ -3300,7 +3354,7 @@ if is_focus_cmd {
     let want_win = (target_win.is_some() || target_win_name.is_some()) && !skip_target_focus;
     let want_pane = target_pane.is_some() && !skip_pane_focus && targeted_kill_pane_id.is_none();
     let check_pane = target_pane.is_some() && !want_pane && pane_checked_not_focused(cmd, pane_is_id);
-    if want_win || want_pane || check_pane || target_session.is_some() {
+    if command_target.is_none() && (want_win || want_pane || check_pane || target_session.is_some()) {
         let spec = crate::types::TempTarget {
             win: if want_win { target_win } else { None },
             win_is_id: target_win_is_id,
@@ -3953,15 +4007,11 @@ match cmd {
         // that fails to resolve silently left the PREVIOUS window focused and
         // the bare KillWindow then killed it — `kill-window -t sess:typo`
         // destroyed whatever was active (tmux: "can't find window", no kill).
-        if target_win.is_some() || target_win_name.is_some() {
+        if let Some(ref target) = raw_target {
             let (resp_s, resp_r) = mpsc::channel();
-            let _ = tx.send(CtrlReq::KillWindowTarget {
-                win: target_win,
-                win_is_id: target_win_is_id,
-                name: target_win_name.clone(),
-                resp: resp_s,
-            });
-            if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            let _ = tx.send(CtrlReq::KillWindowTarget { target: target.clone(), resp: resp_s });
+            if let Err(e) = resp_r.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| Err("window target request did not complete".to_string())) {
                 if !persistent {
                     let _ = writeln!(write_stream, "ERROR: {}", e);
                     let _ = write_stream.flush();
@@ -7119,22 +7169,13 @@ fn dispatch_control_command(
         "kill-window" | "killw" => {
             // Resolve any -t target server-side and error on a miss instead
             // of killing the active window (same fix as the one-shot path).
-            let parsed = raw_target.map(parse_target);
-            let (t_win, t_win_is_id, t_name) = match parsed {
-                Some(pt) => (pt.window, pt.window_is_id, pt.window_name),
-                None => (None, false, None),
-            };
-            if t_win.is_some() || t_name.is_some() {
+            if let Some(target) = raw_target {
                 let (resp_s, resp_r) = mpsc::channel();
-                let _ = tx.send(CtrlReq::KillWindowTarget {
-                    win: t_win,
-                    win_is_id: t_win_is_id,
-                    name: t_name,
-                    resp: resp_s,
-                });
-                match resp_r.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
-                    _ => { let _ = resp_tx.send(String::new()); }
+                let _ = tx.send(CtrlReq::KillWindowTarget { target: target.to_string(), resp: resp_s });
+                match resp_r.recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| Err("window target request did not complete".to_string())) {
+                    Err(e) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                    Ok(()) => { let _ = resp_tx.send(String::new()); }
                 }
             } else {
                 let _ = tx.send(CtrlReq::KillWindow);

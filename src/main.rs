@@ -177,6 +177,15 @@ fn cli_pane_id_exists(pane_id: &str) -> Option<bool> {
     if any { Some(false) } else { None }
 }
 
+/// Mutation replies must surface validation errors, not just a flushed send.
+fn send_control_checked(line: String) -> io::Result<()> {
+    let response = crate::session::send_control_with_response(line)?;
+    if let Some(error) = response.trim().strip_prefix("ERROR:") {
+        return Err(io::Error::new(io::ErrorKind::Other, error.trim().to_string()));
+    }
+    Ok(())
+}
+
 /// Returns Some(true)/Some(false) for whether a pane index exists in the ACTIVE
 /// window of the target session, or None if it could not be queried. Used for the
 /// "<session>.<index>" target form (no explicit window), which refers to the active
@@ -5270,13 +5279,13 @@ fn run_main() -> io::Result<()> {
                 }
                 
                 if next {
-                    send_control("next-layout\n".to_string())?;
+                    send_control_checked("next-layout\n".to_string())?;
                 } else if prev {
-                    send_control("previous-layout\n".to_string())?;
+                    send_control_checked("previous-layout\n".to_string())?;
                 } else if let Some(l) = layout {
-                    send_control(format!("select-layout {}\n", l))?;
+                    send_control_checked(format!("select-layout {}\n", l))?;
                 } else {
-                    send_control("select-layout\n".to_string())?;
+                    send_control_checked("select-layout\n".to_string())?;
                 }
                 return Ok(());
             }
@@ -5713,12 +5722,12 @@ fn run_main() -> io::Result<()> {
             }
             // next-layout - Cycle to next layout
             "next-layout" => {
-                send_control("next-layout\n".to_string())?;
+                send_control_checked("next-layout\n".to_string())?;
                 return Ok(());
             }
             // previous-layout - Cycle to previous layout
             "previous-layout" => {
-                send_control("previous-layout\n".to_string())?;
+                send_control_checked("previous-layout\n".to_string())?;
                 return Ok(());
             }
             // choose-tree / choose-window / choose-session — interactive TUI choosers.

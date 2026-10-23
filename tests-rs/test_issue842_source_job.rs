@@ -176,15 +176,18 @@ fn warnings_are_written_the_way_warn_config_writes_them() {
 
 #[test]
 fn exchange_on_port_returns_the_whole_reply_after_the_server_closes() {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            // The client half-closes after its request, so this read ends.
+            // Requests are line framed. The passive client waits for our EOF;
+            // waiting for its EOF here would deadlock both ends.
             let mut request = String::new();
-            let _ = stream.read_to_string(&mut request);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut request).unwrap();
+            reader.read_line(&mut request).unwrap();
             let _ = stream.write_all(b"OK\nline one\nline two\n");
             let _ = seen_tx.send(request);
         }
@@ -197,13 +200,15 @@ fn exchange_on_port_returns_the_whole_reply_after_the_server_closes() {
 
 #[test]
 fn exchange_on_port_reports_a_refused_key() {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut request = String::new();
-            let _ = stream.read_to_string(&mut request);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut request).unwrap();
+            reader.read_line(&mut request).unwrap();
             let _ = stream.write_all(b"ERROR: Invalid session key\n");
         }
     });

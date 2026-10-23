@@ -9,6 +9,27 @@
 
 use crate::types::{AppState, TempTarget};
 
+/// Complete window spec, including its session and pane components.
+pub(crate) fn resolve_command_window(app: &AppState, raw: &str, index_ok: bool)
+    -> Result<crate::types::WindowTarget, String>
+{
+    let raw = crate::cli::strip_exact_match_prefix(raw);
+    if raw.is_empty() { return Err("can't find window: ".to_string()); }
+    if let Some((session, _)) = raw.split_once(':') {
+        if !session.is_empty() && !session_names_this_server(app, session) {
+            return Err(format!("can't find session: {}", session));
+        }
+    }
+    let spec = if session_names_this_server(app, raw) { "" } else { raw };
+    app.resolve_window_spec(spec, index_ok)
+}
+
+pub(crate) fn resolve_window_command_target(app: &AppState, raw: &str) -> Result<TempTarget, String> {
+    let pos = resolve_command_window(app, raw, false)?.pos()
+        .ok_or_else(|| format!("can't find window: {}", raw))?;
+    Ok(TempTarget { win: Some(app.windows[pos].id), win_is_id: true, ..Default::default() })
+}
+
 /// Resolve `t` against the current state.  Ok carries the same target in
 /// stable id form (`TempTarget::is_resolved`); Err carries tmux's message.
 pub(crate) fn resolve_temp_target(app: &AppState, t: &TempTarget) -> Result<TempTarget, String> {

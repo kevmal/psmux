@@ -260,6 +260,22 @@ fn targeted_sender_wraps_every_request() {
     assert!(matches!(rx.try_recv().unwrap(), CtrlReq::ClearHistory));
 }
 
+#[test]
+fn raw_window_targets_resolve_to_owning_stable_ids_without_focus_changes() {
+    let a = named("work", Some("window_unit"), 7);
+    let win = &a.windows[1];
+    let pane = crate::tree::get_active_pane_id(&win.root, &win.active_path).unwrap();
+    let before = active(&a);
+    let resolved = resolve_window_command_target(&a, &format!("work:%{pane}")).unwrap();
+    assert_eq!(resolved.win, Some(win.id));
+    assert!(resolved.win_is_id);
+    assert_eq!(resolved.pane, None);
+    for raw in ["work:%bad", "work:@bad", "work:.%bad", "work:%999999", "other:%1"] {
+        assert!(resolve_window_command_target(&a, raw).is_err(), "{raw}");
+    }
+    assert_eq!(active(&a), before);
+}
+
 // Issue #793: a target's session part is a claim about which server the
 // connection reached. Over the raw TCP protocol the reporter's script read the
 // first `<ns>*.port` file, which is the namespace's warm standby

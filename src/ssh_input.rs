@@ -598,8 +598,8 @@ pub fn set_escape_time(ms: u64) {
 /// How long an ambiguous Escape may be held: tmux's rule, `escape-time` with
 /// 0 read as 1 ms (tty-keys.c: `if (delay == 0) delay = 1`), capped at
 /// [`ESC_COALESCE_MS`] so a large escape-time (tmux 3.4's old 500 ms default)
-/// never turns into a half second hold.  The default is tmux 3.5's 10 ms
-/// ([`crate::types::DEFAULT_ESCAPE_TIME_MS`]).
+/// never turns into a half second hold. The fork retains a 500 ms option
+/// default ([`crate::types::DEFAULT_ESCAPE_TIME_MS`]); this ceiling still applies.
 pub fn escape_wait_ms() -> u64 {
     escape_wait_for(ESCAPE_TIME_MS.load(std::sync::atomic::Ordering::Relaxed))
 }

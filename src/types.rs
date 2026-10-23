@@ -2902,6 +2902,34 @@ impl AppState {
         let missing = || format!("can't find window: {}", body);
         if self.windows.is_empty() { return Err(missing()); }
         let last_pos = self.windows.len() - 1;
+        // A pane target identifies its owning window. Retain and validate
+        // every component, including malformed input that parse_target omits.
+        if let Some(id) = body.strip_prefix('%') {
+            let id = id.parse::<usize>().map_err(|_| missing())?;
+            return crate::tree::find_pane_by_id_global(self, id)
+                .or_else(|| crate::tree::find_floating_by_id(self, id))
+                .map(|(pos, _)| WindowTarget::Pos(pos)).ok_or_else(missing);
+        }
+        if let Some((window, pane)) = body.rsplit_once('.') {
+            if window.is_empty() || window.starts_with('@') || pane.starts_with('%') || pane.parse::<usize>().is_ok() {
+                if window.is_empty() && pane.starts_with('%') {
+                    return self.resolve_window_spec(pane, false);
+                }
+                let pos = self.resolve_window_spec(window, false)?.pos().ok_or_else(missing)?;
+                let found = if let Some(id) = pane.strip_prefix('%') {
+                    id.parse::<usize>().ok()
+                        .and_then(|id| crate::tree::find_pane_by_id_global(self, id)
+                            .or_else(|| crate::tree::find_floating_by_id(self, id)))
+                        .is_some_and(|(owner, _)| owner == pos)
+                } else {
+                    pane.parse::<usize>().ok()
+                        .and_then(|p| p.checked_sub(self.pane_base_index_of(pos)))
+                        .is_some_and(|p| p < crate::tree::count_panes(&self.windows[pos].root)
+                            + self.windows[pos].floating.len())
+                };
+                return if found { Ok(WindowTarget::Pos(pos)) } else { Err(missing()) };
+            }
+        }
         // `sess:` with nothing after it (and a bare `-t sess`) means the
         // session's current window.
         if body.is_empty() { return Ok(WindowTarget::Pos(self.active_idx.min(last_pos))); }
@@ -3930,13 +3958,18 @@ pub enum CtrlReq {
     /// kill-window with an explicit window target. The server resolves the
     /// target itself and reports an unresolvable one as an error instead of
     /// killing whatever window happens to be active (tmux parity: tmux says
-    /// "can't find window: X" and kills nothing). `win` carries an index or,
-    /// when `win_is_id` is set, an @id; `name` carries a window-name target.
+    /// "can't find window: X" and kills nothing). Keep the complete raw
+    /// target so a missing/invalid pane part never becomes an untargeted kill.
     KillWindowTarget {
-        win: Option<usize>,
-        win_is_id: bool,
-        name: Option<String>,
+        /// Complete raw spec: a pane id or malformed field must not vanish.
+        target: String,
         resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// Resolve a complete window target to a stable id without moving focus.
+    /// Subsequent requests carry that id through CtrlReq::Targeted.
+    ResolveWindowTarget {
+        target: String,
+        resp: mpsc::Sender<Result<TempTarget, String>>,
     },
     KillSession,
     HasSession(mpsc::Sender<bool>),
