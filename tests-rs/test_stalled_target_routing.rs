@@ -260,6 +260,80 @@ fn targeted_sender_wraps_every_request() {
     assert!(matches!(rx.try_recv().unwrap(), CtrlReq::ClearHistory));
 }
 
+/// Exercise the complete resolve -> wrap -> focus -> re-resolve data flow.
+/// With three windows, keeping the raw `:+` would select window 12 here,
+/// even though validation selected window 11. Other self-resolving window
+/// requests (unlink and option reads/writes) need the same stable identity.
+#[test]
+fn self_resolving_window_requests_keep_the_validated_identity() {
+    for raw in ["s:+", "s:-", "s:+1", "s:{next}", "s:{previous}", "s:{end}", "s:+.+", "s:-.-"] {
+        let mut a = app();
+        a.windows.push(make_window(12, "third", &[5]));
+        let resolved = resolve_window_command_target(&a, raw).unwrap();
+        let expected = resolved.win.unwrap();
+        let (tx, rx) = mpsc::channel();
+        let s = TargetedSender::new(&tx, Some(resolved));
+        let (ack, _) = mpsc::channel();
+        let (out, _) = mpsc::channel();
+        s.send(CtrlReq::KillWindowTarget { target: raw.into(), resp: ack.clone() }).unwrap();
+        s.send(CtrlReq::UnlinkWindowReq { target: Some(raw.into()), resp: ack }).unwrap();
+        s.send(CtrlReq::SetWindowOption { target: raw.into(), option: "@probe".into(),
+            value: "yes".into(), unset: false, append: false, only_if_unset: false,
+            quiet: false, resp: out.clone() }).unwrap();
+        s.send(CtrlReq::ShowWindowOptionsFor(out.clone(), raw.into(), crate::server::options::WindowListing::Local)).unwrap();
+        s.send(CtrlReq::ShowWindowOptionValue(out, "@probe".into(), raw.into())).unwrap();
+        for _ in 0..5 {
+            let CtrlReq::Targeted(t, req) = rx.try_recv().unwrap() else { panic!("missing stable wrapper") };
+            let mut saved = None;
+            apply_temp_target(&mut a, &mut saved, &t).unwrap();
+            let carried = match *req {
+                CtrlReq::KillWindowTarget { target, .. }
+                | CtrlReq::SetWindowOption { target, .. }
+                | CtrlReq::ShowWindowOptionsFor(_, target, _)
+                | CtrlReq::ShowWindowOptionValue(_, _, target) => target,
+                CtrlReq::UnlinkWindowReq { target, .. } => target.unwrap(),
+                _ => panic!("unexpected request"),
+            };
+            assert_eq!(carried, format!("@{expected}"), "{raw}");
+            let again = resolve_window_command_target(&a, &carried).unwrap();
+            assert_eq!(again.win, Some(expected), "{raw} advanced twice");
+            restore_temp_focus(&mut a, &mut saved);
+            // Disappearance after validation must not redirect to current.
+            let removed = a.windows.iter().position(|w| w.id == expected).unwrap();
+            let window = a.windows.remove(removed);
+            assert!(resolve_window_command_target(&a, &carried).is_err());
+            a.windows.insert(removed, window);
+        }
+    }
+}
+
+#[test]
+fn targeted_global_window_option_table_is_not_rewritten() {
+    let (tx, rx) = mpsc::channel();
+    let t = TempTarget { win: Some(11), win_is_id: true, ..Default::default() };
+    let (out, _) = mpsc::channel();
+    TargetedSender::new(&tx, Some(t)).send(CtrlReq::ShowWindowOptionValue(
+        out, "@probe".into(), crate::server::options::GLOBAL_WINDOW_TABLE.into())).unwrap();
+    let CtrlReq::Targeted(_, req) = rx.try_recv().unwrap() else { panic!("missing wrapper") };
+    let CtrlReq::ShowWindowOptionValue(_, _, target) = *req else { panic!("wrong request") };
+    assert_eq!(target, crate::server::options::GLOBAL_WINDOW_TABLE);
+}
+
+#[test]
+fn multi_target_requests_preserve_the_original_implicit_source() {
+    let (tx, rx) = mpsc::channel();
+    let t = TempTarget { win: Some(11), win_is_id: true, ..Default::default() };
+    let sender = TargetedSender::new(&tx, Some(t));
+    let (ack, _) = mpsc::channel();
+    sender.send(CtrlReq::SwapWindow { src: None, dst: "s:+".into(), detach: true, resp: ack.clone() }).unwrap();
+    sender.send(CtrlReq::MoveWindow { src: None, dst: Some("s:+3".into()), detach: true,
+        kill: false, renumber: false, after: false, before: false, resp: ack.clone() }).unwrap();
+    sender.send(CtrlReq::SwapPaneSrcDst { src: None, dst: "s:@11.%4".into(), detach: true, resp: ack }).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::SwapWindow { src: None, .. }));
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::MoveWindow { src: None, .. }));
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::SwapPaneSrcDst { src: None, .. }));
+}
+
 #[test]
 fn raw_window_targets_resolve_to_owning_stable_ids_without_focus_changes() {
     let a = named("work", Some("window_unit"), 7);

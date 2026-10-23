@@ -79,6 +79,49 @@ now expects the retained 500 ms; both source-job TCP peers read framed AUTH
 and command lines instead of waiting for a client half-close. Production
 passive close and refusal classification remain unchanged.
 
+### Second review: relative targets and focus ownership
+
+The green `5b9dcda2` candidate was still unsafe: resolving `session:+` for
+temporary focus and then resolving the original string inside kill-window or
+unlink-window advanced twice. The revised sender puts the **same validated
+stable `@id`** into both the wrapper and the self-resolving request. The server
+still checks that id at execution time; disappearance cannot select the active
+window instead. Window option writes, value reads and listings share this fix.
+The global window-option table sentinel is preserved.
+
+The related command audit found these ownership rules:
+
+| Commands | Target/focus ownership |
+|---|---|
+| kill-window, unlink-window, window option reads/writes | Validate the whole spec once, pin the carried target to that stable id, apply/execute/restore atomically. |
+| rename-window, rotate-window, layout commands, respawn-window | Operate on current window inside the stable wrapper; no second raw-target resolver. No respawn was executed locally. |
+| select-window | Its own complete resolver and persistent focus operation; generic temporary focus is excluded. |
+| resize-window | Its own full-spec resolver; generic temporary focus is excluded. |
+| move/swap/link-window, join/move/break-pane, explicit swap-pane | Resolve both ends using original focus. The sender never temporarily focuses their destination before resolving an implicit source, including dispatch from an if-shell branch. |
+| select-pane | Explicit target selection locates the start; relative/directional selection runs once. Control mode now performs the relative operation instead of silently acknowledging a no-op. |
+| send/paste, pane attributes/options, pane resizing | Stable pane wrapper; their scoped operations do not advance a relative window spec again. Existing unsupported raw syntax is not broadened. |
+| capture/display, pane-id kill | Their explicit pane-id paths check identity and do not retarget a vanished pane. |
+
+Cross-window swap-pane previously allowed the generic window focus to replace
+its implicit source; both entry paths now exclude that focus, and the sender
+also protects multi-target requests from accidental wrapping. The internal
+`session-info` barrier ignores inherited window focus, so a successful relative
+window-option write is not followed by a spurious target-name error.
+
+Window commands accept `:+.+`/`:-.-` as their relative pane's containing window.
+**kill-pane still does not implement relative pane selectors**: it rejects
+`:.+`/`:.-` before the parser can discard the suffix and kill the active pane.
+**Control mode still has no move-window dispatcher**; its explicit error and
+unchanged state are tested. Neither limitation is represented as working parity.
+
+`tests/test_relative_target_safety.py` exercises three-window destruction with
+`:+`, `:-`, offsets, `{next}`, `{previous}`, `{start}`, `{end}`, `!`, `{last}`
+and relative composite pane targets through CLI, raw LF TARGET and control
+mode. It also checks rename, option write/read, selection, relative pane
+selection/rejection, cross-window swaps and move-window source identity. It
+uses only private namespaces/config/data and default-registry file snapshots.
+Pure tests exercise resolve/wrap/focus/re-resolve and target disappearance.
+
 ## Validation and safety boundaries
 
 `tests/test_fork_upstream_contract.py` accepts an explicit worktree binary,
@@ -101,7 +144,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-234 focused Rust tests passed after the safety port. They cover passive closes
+237 focused Rust tests passed after the relative-target correction. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use

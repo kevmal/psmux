@@ -2911,7 +2911,7 @@ impl AppState {
                 .map(|(pos, _)| WindowTarget::Pos(pos)).ok_or_else(missing);
         }
         if let Some((window, pane)) = body.rsplit_once('.') {
-            if window.is_empty() || window.starts_with('@') || pane.starts_with('%') || pane.parse::<usize>().is_ok() {
+            if window.is_empty() || window.starts_with('@') || pane.starts_with('%') || pane.parse::<usize>().is_ok() || matches!(pane, "+" | "-") {
                 if window.is_empty() && pane.starts_with('%') {
                     return self.resolve_window_spec(pane, false);
                 }
@@ -2921,6 +2921,10 @@ impl AppState {
                         .and_then(|id| crate::tree::find_pane_by_id_global(self, id)
                             .or_else(|| crate::tree::find_floating_by_id(self, id)))
                         .is_some_and(|(owner, _)| owner == pos)
+                } else if matches!(pane, "+" | "-") {
+                    // A relative pane always names a pane of this window;
+                    // a window command checks it but never focuses that pane.
+                    true
                 } else {
                     pane.parse::<usize>().ok()
                         .and_then(|p| p.checked_sub(self.pane_base_index_of(pos)))

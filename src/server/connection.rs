@@ -393,8 +393,8 @@ fn expand_shell_command(tx: &TargetedSender, cmd: String) -> String {
 /// between.  Without a target it passes requests through untouched.
 ///
 /// Deliberately not `Deref` to the raw sender: a handler cannot reach the
-/// server except through `send`, so no request of a targeted command can
-/// silently go out untargeted.
+/// server except through `send`, so requests either carry the stable target
+/// or explicitly own both ends and resolve them using the original focus.
 ///
 /// A command a source job runs also has its file, and every request goes out
 /// as `CtrlReq::InFile(file, request)` around that, for #{current_file}.
@@ -422,10 +422,40 @@ impl<'a> TargetedSender<'a> {
         }
     }
 
-    pub(crate) fn send(&self, req: CtrlReq) -> Result<(), mpsc::SendError<CtrlReq>> {
-        let req = match &self.target {
-            Some(t) => CtrlReq::Targeted(t.clone(), Box::new(req)),
-            None => req,
+    pub(crate) fn send(&self, mut req: CtrlReq) -> Result<(), mpsc::SendError<CtrlReq>> {
+        // These requests also carry a window spec. Never resolve their raw
+        // relative/symbolic spelling after Targeted has moved the focus:
+        // `:+` would otherwise advance a second time. Use the same validated
+        // identity for both the wrapper and the mutation/read. A vanished id
+        // remains an error when the server executes the request.
+        if let Some(t) = &self.target {
+            if let Some(id) = t.win.filter(|_| t.win_is_id) {
+                let raw = match &mut req {
+                    CtrlReq::KillWindowTarget { target, .. }
+                    | CtrlReq::SetWindowOption { target, .. }
+                    | CtrlReq::ShowWindowOptionsFor(_, target, _)
+                    | CtrlReq::ShowWindowOptionValue(_, _, target) => Some(target),
+                    CtrlReq::UnlinkWindowReq { target, .. } => target.as_mut(),
+                    _ => None,
+                };
+                if let Some(raw) = raw {
+                    if raw != crate::server::options::GLOBAL_WINDOW_TABLE {
+                        *raw = format!("@{}", id);
+                    }
+                }
+            }
+        }
+        // Multi-target operations resolve source and destination together.
+        // Their implicit source is the original focus, so applying even just
+        // a destination window first can turn a swap into a no-op or move the
+        // wrong source. This also covers dispatch from an if-shell branch.
+        let resolves_both_ends = matches!(&req,
+            CtrlReq::MoveWindow { .. } | CtrlReq::SwapWindow { .. }
+            | CtrlReq::SwapPaneSrcDst { .. } | CtrlReq::LinkWindowReq { .. }
+            | CtrlReq::JoinPane { .. } | CtrlReq::BreakPaneReq { .. });
+        let req = match (&self.target, resolves_both_ends) {
+            (Some(t), false) => CtrlReq::Targeted(t.clone(), Box::new(req)),
+            _ => req,
         };
         self.inner.send(self.wrap_file(req))
     }
@@ -1084,7 +1114,14 @@ fn targets_existing_window(cmd: &str, args: &[&str]) -> bool {
         || (matches!(cmd, "set-option" | "set" | "show-options" | "show") && crate::cli::has_short_flag(args, 'w'))
 }
 
-fn validate_window_target(tx: &mpsc::Sender<CtrlReq>, target: &str) -> Result<crate::types::TempTarget, String> {
+fn validate_window_target(tx: &mpsc::Sender<CtrlReq>, cmd: &str, target: &str) -> Result<crate::types::TempTarget, String> {
+    // Window commands only check a relative pane suffix to find its owner.
+    // kill-pane still needs a concrete pane: its legacy parser drops +/-.
+    // Refuse that unsupported form before it can become an active-pane kill.
+    if matches!(cmd, "kill-pane" | "killp") && target.rsplit_once('.')
+        .is_some_and(|(_, pane)| matches!(pane, "+" | "-")) {
+        return Err(format!("can't find pane: {}", target));
+    }
     let (resp, rx) = mpsc::channel();
     tx.send(CtrlReq::ResolveWindowTarget { target: target.to_string(), resp })
         .map_err(|_| "server disconnected".to_string())?;
@@ -1341,6 +1378,20 @@ pub(crate) fn select_pane_has_own_operation(args: &[&str], raw_target: Option<&s
         || args.iter().any(|a| {
             matches!(*a, "-U" | "-D" | "-L" | "-R" | "-l" | "-m" | "-M" | "-e" | "-d")
         })
+}
+
+fn select_pane_direction(args: &[&str], raw_target: Option<&str>) -> &'static str {
+    let raw = raw_target.unwrap_or_default();
+    if raw.contains(".+") || matches!(raw, "+" | ":.+") { "next" }
+    else if raw.contains(".-") || matches!(raw, "-" | ":.-") { "prev" }
+    else if args.contains(&"-U") { "U" }
+    else if args.contains(&"-D") { "D" }
+    else if args.contains(&"-L") { "L" }
+    else if args.contains(&"-R") { "R" }
+    else if args.contains(&"-l") { "last" }
+    else if args.contains(&"-m") { "mark" }
+    else if args.contains(&"-M") { "unmark" }
+    else { "" }
 }
 
 /// `select-pane -e` / `-d` as an input toggle: `Some((off, last))` when this
@@ -2575,7 +2626,7 @@ if control_echo || control_quiet || control_noecho {
         // (issue #693 items 1 and 2).
         let skip_target_focus = matches!(cmd_name, "join-pane" | "joinp" | "move-pane" | "movep"
             | "new-window" | "neww"
-            | "move-window" | "movew" | "swap-window" | "swapw"
+            | "move-window" | "movew" | "swap-window" | "swapw" | "swap-pane" | "swapp"
             | "break-pane" | "breakp"
             | "link-window" | "linkw" | "unlink-window" | "unlinkw"
             | "switch-client" | "switchc" | "resize-window" | "resizew"
@@ -2584,7 +2635,10 @@ if control_echo || control_quiet || control_noecho {
             // resolved by its own arm (#789 follow up).
             | "command-prompt"
             // So is set-buffer's (cmd-set-buffer.c:40).
-            | "set-buffer" | "setb");
+            | "set-buffer" | "setb"
+            // Internal event-loop barrier: a preceding relative TARGET is
+            // command context, not a window to focus for session metadata.
+            | "session-info");
         // capture-pane -t %N resolves the pane id inside the capture itself;
         // swap-pane resolves its own target and swaps it with the *current*
         // active pane (temp-focusing the target would make active == target
@@ -2618,7 +2672,7 @@ if control_echo || control_quiet || control_noecho {
             if let Some(ref raw) = ctrl_raw_target {
                 let window = targets_existing_window(cmd_name, &filtered_args);
                 if window || pane_command_checks_window(cmd_name, raw) {
-                    match validate_window_target(&tx_ctrl, raw) {
+                    match validate_window_target(&tx_ctrl, cmd_name, raw) {
                         Ok(resolved) if window && !is_focus_cmd => ctrl_command_target = Some(resolved),
                         Ok(_) => {},
                         Err(e) => focus_err = Some(e),
@@ -3224,7 +3278,7 @@ let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "
 // so validating it as an existing window dropped every such command at rc 0.
 let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep"
     | "new-window" | "neww"
-    | "move-window" | "movew" | "swap-window" | "swapw"
+    | "move-window" | "movew" | "swap-window" | "swapw" | "swap-pane" | "swapp"
     | "break-pane" | "breakp"
     | "link-window" | "linkw" | "unlink-window" | "unlinkw"
     | "switch-client" | "switchc" | "resize-window" | "resizew"
@@ -3233,7 +3287,8 @@ let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "mov
             // resolved by its own arm (#789 follow up).
             | "command-prompt"
             // So is set-buffer's (cmd-set-buffer.c:40).
-            | "set-buffer" | "setb");
+            | "set-buffer" | "setb"
+            | "session-info");
 let targeted_kill_pane_id = if matches!(cmd, "kill-pane" | "killp") && pane_is_id {
     target_pane
 } else {
@@ -3274,7 +3329,7 @@ let target_session = explicit_target_session(cmd, raw_target.as_deref());
 if let Some(ref raw) = raw_target {
     let window = targets_existing_window(cmd, &args);
     if window || pane_command_checks_window(cmd, raw) {
-        match validate_window_target(&tx, raw) {
+        match validate_window_target(&tx, cmd, raw) {
             Ok(resolved) if window && !is_focus_cmd => command_target = Some(resolved),
             Ok(_) => {},
             Err(e) => {
@@ -3905,20 +3960,7 @@ match cmd {
         }
     }
     "select-pane" | "selectp" => {
-        // Detect relative pane targets: -t :.+  or  -t :.-
-        let is_next_pane = raw_target.as_deref().map_or(false, |t| t.contains(".+") || t == "+" || t == ":.+");
-        let is_prev_pane = raw_target.as_deref().map_or(false, |t| t.contains(".-") || t == "-" || t == ":.-");
-        let dir = if is_next_pane { "next" }
-            else if is_prev_pane { "prev" }
-            else if args.iter().any(|a| *a == "-U") { "U" }
-            else if args.iter().any(|a| *a == "-D") { "D" }
-            else if args.iter().any(|a| *a == "-L") { "L" }
-            else if args.iter().any(|a| *a == "-R") { "R" }
-            else if args.iter().any(|a| *a == "-l") { "last" }
-            else if args.iter().any(|a| *a == "-m") { "mark" }
-            else if args.iter().any(|a| *a == "-M") { "unmark" }
-            // -e / -d without any of the above are the input toggle arm.
-            else { "" };
+        let dir = select_pane_direction(&args, raw_target.as_deref());
         // Check for -T title and -P style (per-pane style, e.g.
         // "bg=default,fg=blue" — Claude Code uses -P for agent pane
         // coloring; stored even if rendering doesn't support it yet).
@@ -7237,6 +7279,21 @@ fn dispatch_control_command(
             let style = args.windows(2).find(|w| w[0] == "-P").map(|w| w[1].trim_matches('"').to_string());
             if title.is_some() || style.is_some() {
                 let _ = tx.send(CtrlReq::SetPaneAttrs { title, style });
+            }
+            // Target selection above only locates the starting pane. A
+            // relative/directional operation is a separate single request,
+            // just as on the one-shot route; previously control mode silently
+            // acknowledged :.+/:.- without performing the operation at all.
+            let dir = select_pane_direction(args, raw_target);
+            if dir == "last" {
+                let (ack, done) = mpsc::channel();
+                let _ = tx.send(CtrlReq::LastPane { resp: ack });
+                if let Ok(Err(e)) = done.recv_timeout(Duration::from_secs(5)) {
+                    let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e));
+                    return true;
+                }
+            } else if !dir.is_empty() {
+                let _ = tx.send(CtrlReq::SelectPane(dir.into(), args.contains(&"-Z")));
             }
             let _ = resp_tx.send(String::new());
             true
