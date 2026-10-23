@@ -8603,13 +8603,16 @@ mod tests_pane_selector_dispatch {
             ("resize-pane", vec!["-R"]), ("capture-pane", vec!["-p"]),
             ("pipe-pane", vec![]), ("display-message", vec!["-p"]),
             ("swap-pane", vec![]), ("join-pane", vec![])] {
-            let (tx, rx) = mpsc::channel();
-            let sender = TargetedSender::new(&tx, None);
-            let (reply, received) = mpsc::channel();
-            assert!(dispatch_control_command(command, &args, &sender, reply,
-                None, false, Some("s:.+"), 0, false));
-            assert!(received.recv().unwrap().starts_with("\u{0001}ERR\u{0001}unsupported relative or symbolic pane target"));
-            assert!(rx.try_recv().is_err(), "{command} sent a request before refusal");
+            for raw in ["s:.+", "%bad", "s:@1.%bad"] {
+                let (tx, rx) = mpsc::channel();
+                let sender = TargetedSender::new(&tx, None);
+                let (reply, received) = mpsc::channel();
+                assert!(dispatch_control_command(command, &args, &sender, reply,
+                    None, false, Some(raw), 0, false));
+                let error = received.recv().unwrap();
+                assert!(error.starts_with("\u{0001}ERR\u{0001}") && error.contains("pane target"));
+                assert!(rx.try_recv().is_err(), "{command} sent a request before refusal");
+            }
         }
     }
 }

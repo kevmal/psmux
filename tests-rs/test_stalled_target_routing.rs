@@ -338,11 +338,12 @@ fn multi_target_requests_preserve_the_original_implicit_source() {
 fn in_server_relative_pane_refusals_precede_process_or_option_mutation() {
     let mut a = app();
     for command in ["respawn-pane -k -t s:.+", "set-option -p -t s:.- @probe WRONG",
-        "swap-pane -s s:.+ -t s:%4", "join-pane -s s:.- -t s:%4"] {
+        "swap-pane -s s:.+ -t s:%4", "join-pane -s s:.- -t s:%4",
+        "respawn-pane -k -t %bad", "respawn-pane -k -t s:@10.%bad"] {
         let before = active(&a);
         let count = crate::tree::count_panes(&a.windows[0].root);
         let error = crate::commands::execute_command_string(&mut a, command).unwrap_err();
-        assert!(error.to_string().contains("unsupported relative or symbolic pane target"));
+        assert!(error.to_string().contains("pane target"));
         assert_eq!(active(&a), before);
         assert_eq!(crate::tree::count_panes(&a.windows[0].root), count);
     }

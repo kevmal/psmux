@@ -262,13 +262,28 @@ pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target:
     }
     targets.into_iter().find_map(|(flag, target)| {
         if !(flag == 't' && pane_command || flag == 's' && pane_source) { return None; }
-        // select-pane's +/- forms are normalized to a stable %id before
-        // dispatch; this preserves the built-in prefix-o pane cycle.
-        if flag == 't' && relative_select_pane_target(command, target) { return None; }
         let body = target.split_once(':').map(|(_, body)| body).unwrap_or(target);
-        let selector = body.rsplit_once('.').map(|(_, pane)| pane).unwrap_or(body);
+        let invalid = || Some(format!("invalid pane target: {}", target));
+        // parse_target is deliberately permissive and drops malformed ids.
+        // Reject them before a missing field can mean "the current pane".
+        if let Some(pane) = body.strip_prefix('%') {
+            if pane.parse::<usize>().is_err() { return invalid(); }
+        }
+        let (window, pane) = body.split_once('.').map(|(w, p)| (w, Some(p))).unwrap_or((body, None));
+        if let Some(window_id) = window.strip_prefix('@') {
+            if window_id.parse::<usize>().is_err() { return invalid(); }
+        }
+        let selector = pane.unwrap_or(body);
+        if let Some(id) = pane.and_then(|pane| pane.strip_prefix('%')) {
+            if id.parse::<usize>().is_err() { return invalid(); }
+        }
         if selector.starts_with(['+', '-', '{']) || matches!(selector, "!" | "~" | "=") {
+            // select-pane's +/- forms are normalized to a stable %id before
+            // dispatch; this preserves the built-in prefix-o pane cycle.
+            if flag == 't' && relative_select_pane_target(command, target) && matches!(selector, "+" | "-") { return None; }
             Some(format!("unsupported relative or symbolic pane target: {} (use an explicit pane id)", target))
+        } else if pane.is_some_and(|pane| !pane.is_empty() && !pane.starts_with('%') && pane.parse::<usize>().is_err()) {
+            invalid()
         } else { None }
     })
 }
@@ -335,6 +350,20 @@ mod tests_pane_selector_guard {
             "mouse-down-right", "mouse-down-middle", "mouse-drag", "mouse-up",
             "mouse-up-right", "mouse-up-middle", "mouse-move", "copy-drag-begin", "mouse-key", "mouse-forward"] {
             assert!(pane_selector_error(cmd, &[], Some("s:.+")).is_some(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn malformed_pane_and_window_fields_never_become_current_pane() {
+        for command in ["respawn-pane", "kill-pane", "set-option", "select-pane", "resize-pane",
+            "send-keys", "capture-pane", "pipe-pane", "display-message", "swap-pane", "join-pane", "move-pane"] {
+            for target in ["%bad", "%", "s:%bad", "s:@1.%bad", "@1.%bad", "s:@bad", "s:.bad", "s:0.%", "s:@.0", "s:@1.%2.bad"] {
+                let args = if command == "set-option" { vec!["-p", "-t", target] } else { vec!["-t", target] };
+                assert!(pane_selector_error(command, &args, None).is_some(), "{command} {target}");
+            }
+        }
+        for command in ["swap-pane", "join-pane", "move-pane", "break-pane", "copy-mode"] {
+            assert!(pane_selector_error(command, &["-s", "%bad", "-t", "s:@1.%1"], None).is_some(), "{command}");
         }
     }
 }

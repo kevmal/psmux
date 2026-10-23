@@ -56,7 +56,10 @@ class PaneSelectors(RelativeTargets):
         if args and args[0] in ("respawn-pane", "respawnp"):
             assert "-t" in args
             target = args[args.index("-t") + 1]
-            assert target.startswith("alpha:") and any(s in target for s in (".+", ".-", ".!", ".{"))
+            body = target.split(':', 1)[-1]
+            assert target.startswith(("alpha:", "%", "@"))
+            assert (any(s in body for s in (".+", ".-", ".!", ".{"))
+                    or body == "%bad" or body.endswith(".%bad"))
             cmd = [self.binary, "-L", self.ns, *args]
             p = subprocess.run(cmd, env=self.env, capture_output=True, encoding="utf-8",
                                errors="replace", timeout=20)
@@ -65,6 +68,17 @@ class PaneSelectors(RelativeTargets):
                 assert p.returncode == 0, (args, p.stdout, p.stderr)
             return p
         return super().run(*args, check=check)
+
+    def bare_probe(self, route, command, target, *tail):
+        if route == "cli":
+            p = self.run(command, "-t", target, *tail, check=False)
+            assert p.returncode != 0, (route, command, target, p.stdout, p.stderr)
+        elif route == "raw":
+            reply = self.wire("alpha", " ".join((command, *tail)), target).decode()
+            assert "ERROR: invalid pane target" in reply, (command, target, reply)
+        else:
+            reply = self.control("alpha", " ".join((command, "-t", target, *tail)))
+            assert "%error " in reply and "invalid pane target" in reply, (command, target, reply)
 
 
 def snapshot(test):
@@ -90,14 +104,14 @@ def main():
         wait_for(lambda: "target_routing_probe" in test.run("capture-pane", "-p", "-t", f"alpha:{extra}").stdout)
         first_window = test.run("display-message", "-p", "-t", test.A, "#{window_id}").stdout.strip()
         specs = [".+", ".-", ".+2", ".-2", ".!", ".{last}", ".{top-left}",
-                 f"{first_window}.+", f"{first_window}.-"]
+                 f"{first_window}.+", f"{first_window}.-", "%bad", f"{first_window}.%bad"]
         for route in ("cli", "raw", "control"):
             count = 0
             for spec in specs:
                 # Reproduce both active endpoint cases from the review.
                 active = f"alpha:{extra}" if spec.endswith(".-") else test.A
                 test.run("select-pane", "-t", active)
-                commands = COMMANDS if spec in (".+", ".-") else [
+                commands = COMMANDS if spec in (".+", ".-", "%bad", f"{first_window}.%bad") else [
                     (command, tail) for command, tail in COMMANDS
                     if command in ("respawn-pane", "set-option", "select-pane", "send-keys",
                                    "capture-pane", "display-message", "swap-pane", "join-pane")
@@ -113,7 +127,7 @@ def main():
                     # The control parser refuses some internal/UI commands
                     # before dispatch. An explicit unknown-command error is
                     # also fail-closed; it must still preserve all state/input.
-                    assert ("unsupported relative or symbolic pane target" in reply
+                    assert ("unsupported relative or symbolic pane target" in reply or "invalid pane target" in reply
                             or route == "control" and f"parse error: unknown command: {command}" in reply), (route, command, spec, reply)
                     assert snapshot(test) == initial, (route, command, spec, "state/input changed after refusal")
                     test.cases.append(dict(route=route, command=command, args=tail, target=spec, ok=True))
@@ -122,9 +136,17 @@ def main():
                     initial = snapshot(test)
                     reply = test.invoke(route, "alpha", command, first_window,
                                         "-s", f"alpha:{spec}", fail=True)
-                    assert "unsupported relative or symbolic pane target" in reply, (route, command, spec, reply)
+                    assert "pane target" in reply, (route, command, spec, reply)
                     assert snapshot(test) == initial
                     test.cases.append(dict(route=route, command=command, source=spec, target=first_window, ok=True))
+                    count += 1
+            for malformed in ("%bad", f"{first_window}.%bad"):
+                for command, tail in [("respawn-pane", ["-k", "cmd.exe /k"]),
+                                      ("set-option", ["-p", "@pane-selector-probe", "WRONG"])]:
+                    initial = snapshot(test)
+                    test.bare_probe(route, command, malformed, *tail)
+                    assert snapshot(test) == initial
+                    test.cases.append(dict(route=route, command=command, bare_target=malformed, ok=True))
                     count += 1
             pane_ids = test.run("list-panes", "-t", f"alpha:{first_window}", "-F", "#{pane_id}").stdout.splitlines()
             assert len(pane_ids) == 3

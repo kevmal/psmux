@@ -43,6 +43,18 @@ function Windows {
     if ($result.Code -ne 0) { throw $result.Output }
     $result.Output
 }
+function WaitWindowGone([string]$WindowId) {
+    # Killing the only pane first terminates its child; the dead-pane/PTY
+    # cleanup removes the window on a later event-loop pass. EOF acknowledges
+    # the queued request, so one immediate list query is not a completion fence.
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $current = Windows
+        if ($current -notmatch [regex]::Escape($WindowId + ':')) { return $current }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $current
+}
 function State {
     $windows = Windows
     $panes = Px -Command @('list-panes', '-s', '-t', $Session, '-F', '#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}')
@@ -115,7 +127,8 @@ try {
         Check ($r.Code -eq 0 -and (Windows) -match [regex]::Escape($victim[1] + ':other-victim:1')) 'select-window resolves the containing window of a pane'
         $null = Px -Command @('select-window', '-t', "${Session}:$($survivor[2])")
         $r = Px -Command @($command, '-t', "${Session}:.%$($victim[2].TrimStart('%'))")
-        Check ($r.Code -eq 0 -and (Windows) -notmatch [regex]::Escape($victim[1] + ':')) "$command resolves the pane's own window"
+        $after = if ($command -eq 'kill-pane') { WaitWindowGone $victim[1] } else { Windows }
+        Check ($r.Code -eq 0 -and $after -notmatch [regex]::Escape($victim[1] + ':')) "$command resolves the pane's own window (exit=$($r.Code); reply=$($r.Output); windows=$after)"
         Check ((Windows) -match [regex]::Escape($survivor[1] + ':survivor:1')) "$command preserves the active survivor"
     }
 

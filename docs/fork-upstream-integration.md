@@ -164,6 +164,34 @@ target in the private namespace; they must fail before any process replacement.
 Pure tests also prove that nested dispatch sends no request on refusal, and
 in-server commands return an error before mutating a stub fixture.
 
+### Fourth review: malformed fields must not disappear
+
+The expanded independent matrix also reproduced raw/control
+`respawn-pane -k -t %bad` and `-t @1.%bad` replacing the current process.
+The permissive parser omitted the invalid id and the handler received no pane.
+The shared ingress guard now rejects malformed `%`/`@` ids and nonnumeric pane
+fields before omitted fields can drive focus or mutation, for every
+pane-scoped primary/source target and alias.
+Bare and session-qualified targets use the same rule. This also protects pane
+option writes, attributes, sends, captures, pipes and structural operations.
+Ambiguous nonnumeric dot fields in pane-scoped targets are refused; use a
+qualified stable pane id when a window/session name contains dots. Window-only
+commands keep their separate full window resolver.
+
+The pane matrix includes `%bad` and `@id.%bad` for every audited command and
+source on all three routes, plus dedicated bare-target respawn/option probes.
+Each refusal must leave process ids, layout, focus, options and input unchanged.
+Nested/local pure fixtures also prove malformed targets send no request and
+cannot replace a process or change options.
+
+The preceding candidate's hosted release run also exposed a timing assumption
+in the original 187-check safety fixture: killing a window's only pane first
+terminates the child, then dead-PTY cleanup removes the window. The fixture now
+waits up to five seconds for that specific private window to disappear, keeping
+the original correct-victim and active-survivor assertions. It never treats
+another window disappearing as success, and reports exit/reply/window evidence
+on a failure. Production completion/EOF semantics are unchanged.
+
 ## Validation and safety boundaries
 
 `tests/test_fork_upstream_contract.py` accepts an explicit worktree binary,
@@ -186,7 +214,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-244 focused Rust tests passed after the pane-selector correction. They cover passive closes
+245 focused Rust tests passed after the pane-selector correction. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use
