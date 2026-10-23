@@ -60,6 +60,18 @@ fn app_from(spec: &[(usize, &str)]) -> AppState {
     app
 }
 
+#[test]
+fn malformed_and_missing_pane_targets_never_resolve_to_the_current_window() {
+    let app = app_from(&[(0, "active"), (2, "other")]);
+    for spec in ["%999999", "t601:%999999", "t601:%bad", "t601:@bad", "t601:.%bad", "t601:2.%999999"] {
+        assert!(app.resolve_window_spec(spec, false).is_err(), "{spec}");
+        assert!(app.resolve_window_spec(spec, true).is_err(), "destination {spec}");
+    }
+    assert_eq!(app.active_idx, 0);
+    assert_eq!(app.windows.len(), 2);
+    assert_eq!(app.windows[0].name, "active");
+}
+
 /// `list-windows -F '#{window_index}:#{window_name}<active><last>'`.
 fn render(app: &AppState) -> String {
     app.windows.iter().enumerate().map(|(i, w)| {

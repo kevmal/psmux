@@ -822,6 +822,14 @@ fn kill_window_at(app: &mut AppState, pos: usize) {
     }
 }
 
+fn resolve_command_window(app: &AppState, target: &str, index_ok: bool) -> Result<crate::types::WindowTarget, String> {
+    let raw = crate::cli::strip_exact_match_prefix(target);
+    if raw.is_empty() { return Err("can't find window: ".to_string()); }
+    // A session-only target explicitly names that session's current window.
+    let spec = if raw == app.session_name || raw == app.port_file_base() { "" } else { raw };
+    app.resolve_window_spec(spec, index_ok)
+}
+
 /// Apply one move-window request. The move itself lives on `AppState` so the
 /// CLI, the command prompt and this path cannot drift; the only extra the
 /// server can do is `-k`, which kills the window occupying the destination
@@ -1548,6 +1556,66 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // FocusWindowTemp and the actual command land in different
                 // batches).
                 for req in pending {
+                    let mut targeted_reply = None;
+                    let mut targeted_restore = None;
+                    // Unwrap only after resolving the COMPLETE raw target. The
+                    // lookup and mutation stay in this turn, so another client's
+                    // focus request cannot redirect an already validated command.
+                    let req = match req {
+                        CtrlReq::WindowTargetCommand { target, request, resp } => {
+                            let pos = match resolve_command_window(&app, &target, false).and_then(|w|
+                                w.pos().ok_or_else(|| format!("can't find window: {}", target))) {
+                                Ok(pos) => pos,
+                                Err(e) => { let _ = resp.send(Err(e)); continue; }
+                            };
+                            targeted_reply = Some(resp);
+                            if matches!(*request, CtrlReq::SelectWindow(_)) {
+                                CtrlReq::SelectWindow(app.win_display_index(pos))
+                            } else if matches!(*request, CtrlReq::NextWindow | CtrlReq::PrevWindow | CtrlReq::LastWindow) {
+                                app.active_idx = pos;
+                                *request
+                            } else {
+                                let saved = &app.windows[app.active_idx];
+                                targeted_restore = Some((saved.id,
+                                    get_active_pane_id(&saved.root, &saved.active_path)));
+                                app.active_idx = pos;
+                                app.last_window_area = app.windows[pos].area;
+                                if matches!(*request, CtrlReq::KillPane) {
+                                    let parsed = crate::cli::parse_target(&target);
+                                    if let Some(pane) = parsed.pane {
+                                        if parsed.pane_is_id { focus_pane_by_id_no_mru(&mut app, pane); }
+                                        else { focus_pane_by_index(&mut app, pane); }
+                                    }
+                                }
+                                *request
+                            }
+                        }
+                        CtrlReq::LinkWindowTarget { src, dst, resp } => {
+                            let resolved = (|| -> Result<(usize, Option<usize>), String> {
+                                let src = match src.as_deref() {
+                                    Some(s) => resolve_command_window(&app, s, false)?.pos()
+                                        .ok_or_else(|| format!("can't find window: {}", s))?,
+                                    None => app.active_idx,
+                                };
+                                let dst = match dst.as_deref() {
+                                    Some(d) => Some(match resolve_command_window(&app, d, true)? {
+                                        crate::types::WindowTarget::Pos(p) => app.win_display_index(p),
+                                        crate::types::WindowTarget::FreeIndex(i) => i,
+                                    }),
+                                    None => None,
+                                };
+                                Ok((src, dst))
+                            })();
+                            match resolved {
+                                Ok((src, dst)) => {
+                                    targeted_reply = Some(resp);
+                                    CtrlReq::LinkWindow(Some(src), dst)
+                                }
+                                Err(e) => { let _ = resp.send(Err(e)); continue; }
+                            }
+                        }
+                        other => other,
+                    };
                     let mutates_state = !matches!(&req,
                         CtrlReq::DumpState(..)
                         | CtrlReq::SendText(_)
@@ -1963,8 +2031,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // (issue #545 — the old per-kind Temp handlers had no miss
                 // path, so the untargeted command that followed ran against
                 // whatever was focused). Same convention as KillWindowTarget.
-                CtrlReq::FocusTargetTemp { win, win_is_id, win_name, pane, pane_is_id, resp } => {
-                    let win_idx: Option<usize> = if let Some(w) = win {
+                CtrlReq::FocusTargetTemp { window_target, win, win_is_id, win_name, pane, pane_is_id, resp } => {
+                    let win_idx: Option<usize> = if let Some(ref raw) = window_target {
+                        resolve_command_window(&app, raw, false).ok().and_then(|w| w.pos())
+                    } else if let Some(w) = win {
                         if win_is_id {
                             app.windows.iter().position(|x| x.id == w)
                         } else {
@@ -1980,7 +2050,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let spec = if let Some(w) = win {
                                 if win_is_id { format!("@{}", w) } else { w.to_string() }
                             } else {
-                                win_name.clone().unwrap_or_default()
+                                window_target.clone().or_else(|| win_name.clone()).unwrap_or_default()
                             };
                             Some(format!("can't find window: {}", spec))
                         }
@@ -2027,7 +2097,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 // (issue #551).
                                 app.temp_focus_saved_active = Some(app.active_idx);
                             }
-                            if win.is_some() || win_name.is_some() {
+                            if window_target.is_some() || win.is_some() || win_name.is_some() {
                                 if let Some(internal_idx) = win_idx {
                                     app.active_idx = internal_idx;
                                     app.last_window_area = app.windows[internal_idx].area;
@@ -3295,7 +3365,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                     hook_event = Some("window-closed");
                 }
-                CtrlReq::KillWindowTarget { win, win_is_id, name, resp } => {
+                CtrlReq::WindowTargetCommand { .. } | CtrlReq::LinkWindowTarget { .. } => unreachable!("unwrapped above"),
+                CtrlReq::KillWindowTarget { target, resp } => {
                     // Resolve the target here, on live state. An unresolvable
                     // target must be an error, never a fallback to the active
                     // window: the old temp-focus-then-kill dance silently
@@ -3303,17 +3374,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // killed whatever was focused (session death when it was
                     // the last window). tmux: "can't find window: X", kills
                     // nothing, exit 1.
-                    let resolved = if let Some(w) = win {
-                        if win_is_id {
-                            app.windows.iter().position(|x| x.id == w)
-                        } else {
-                            app.win_pos(w)
-                        }
-                    } else if let Some(ref n) = name {
-                        app.windows.iter().position(|x| x.name == *n)
-                    } else {
-                        Some(app.active_idx)
-                    };
+                    let resolved = resolve_command_window(&app, &target, false)
+                        .ok().and_then(|w| w.pos());
                     match resolved {
                         Some(pos) => {
                             kill_window_at(&mut app, pos);
@@ -3324,12 +3386,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             let _ = resp.send(Ok(()));
                         }
                         None => {
-                            let spec = if let Some(w) = win {
-                                if win_is_id { format!("@{}", w) } else { w.to_string() }
-                            } else {
-                                name.clone().unwrap_or_default()
-                            };
-                            let msg = format!("can't find window: {}", spec);
+                            let msg = format!("can't find window: {}", target);
                             // Surface in the status bar for attached clients,
                             // same convention as join-pane (#437).
                             app.status_message = Some((msg.clone(), Instant::now(), None));
@@ -6286,6 +6343,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.temp_focus_saved_active = None;
                 }
             }
+            if let Some((window_id, pane_id)) = targeted_restore {
+                if let Some(pos) = app.windows.iter().position(|w| w.id == window_id) {
+                    app.active_idx = pos;
+                    if let Some(path) = pane_id.and_then(|id| crate::tree::find_path_by_id(&app.windows[pos].root, id)) {
+                        app.windows[pos].active_path = path;
+                    }
+                    app.last_window_area = app.windows[pos].area;
+                }
+            }
+            if let Some(resp) = targeted_reply { let _ = resp.send(Ok(())); }
             if mutates_state {
                 state_dirty = true;
             }
