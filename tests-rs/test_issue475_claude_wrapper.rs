@@ -93,7 +93,9 @@ fn wrapper_resolves_npm_only_install_without_claude_exe() {
     // claude.exe, put the npm-style shim dir first.
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<std::path::PathBuf> = vec![dir.clone()];
-    dirs.extend(std::env::split_paths(&path).filter(|d| !d.join("claude.exe").exists()));
+    // A broken exe symlink is still discovered by PowerShell Get-Command.
+    // Exclude the directory even when exists() follows it to a missing target.
+    dirs.extend(std::env::split_paths(&path).filter(|d| std::fs::symlink_metadata(d.join("claude.exe")).is_err()));
     let new_path = std::env::join_paths(dirs).unwrap();
 
     let script = format!("{}; claude --version", ENV_SHIM_PS);

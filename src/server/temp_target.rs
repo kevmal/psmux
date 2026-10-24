@@ -334,7 +334,7 @@ pub(crate) fn restore_temp_focus(app: &mut AppState, saved: &mut Option<SavedFoc
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_stalled_target_routing.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue828_temp_focus_modes.rs"]

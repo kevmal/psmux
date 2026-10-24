@@ -873,7 +873,11 @@ fn decode_send_command(line: &str) -> Option<(String, Vec<u8>)> {
     if toks.is_empty() { return None; }
     let cmd = toks[0].as_str();
     if cmd != "send" && cmd != "send-keys" { return None; }
-    let args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+    let canonical = crate::cli::canonical_command_args(cmd, &toks[1..]);
+    let args: Vec<&str> = canonical.iter().map(|s| s.as_str()).collect();
+    if crate::cli::validate_flag_arguments(cmd, &args).is_err() || crate::cli::unknown_flag(cmd, &args).is_some() {
+        return None;
+    }
 
     // Bail on modes that require special semantics.
     let any_short = |c: char| {
@@ -1124,14 +1128,14 @@ pub(crate) fn set_hook_request(args: &[&str]) -> Option<CtrlReq> {
 
 /// Window mutations and window options retain the full raw target until
 /// the server resolves it; parse_target alone can omit an invalid pane slot.
-fn targets_existing_window(cmd: &str, args: &[&str]) -> bool {
+pub(crate) fn targets_existing_window(cmd: &str, args: &[&str]) -> bool {
     matches!(cmd, "kill-window" | "killw" | "rename-window" | "renamew"
         | "respawn-window" | "respawnw" | "unlink-window" | "unlinkw"
         | "rotate-window" | "rotatew" | "select-layout" | "selectl"
         | "next-layout" | "nextl" | "previous-layout" | "prevl"
         | "select-window" | "selectw"
         | "set-window-option" | "setw" | "show-window-options" | "showw" | "show-window-option")
-        || (matches!(cmd, "set-option" | "set" | "show-options" | "show") && crate::cli::has_short_flag(args, 'w'))
+        || (matches!(cmd, "set-option" | "set" | "show-options" | "show") && crate::cli::parse_set_option_args(args).flag_chars.contains('w'))
 }
 
 fn validate_window_target(tx: &mpsc::Sender<CtrlReq>, cmd: &str, target: &str) -> Result<crate::types::TempTarget, String> {
@@ -2527,13 +2531,11 @@ if control_echo || control_quiet || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
-        // Clustered select-pane / last-pane flags, as in the one-shot route.
+        // Canonical getopt arguments before any target/scope consumer.
         let ctrl_cluster_split: Vec<String>;
-        let cmd_args: Vec<&str> = if matches!(cmd_name, "select-pane" | "selectp" | "last-pane" | "lastp") {
+        let cmd_args: Vec<&str> = {
             ctrl_cluster_split = crate::cli::expand_flag_clusters(cmd_name, &cmd_args);
             ctrl_cluster_split.iter().map(|s| s.as_str()).collect()
-        } else {
-            cmd_args
         };
         // A bare `-t` name, resolved as on the attached route (see
         // bare_target_rewrite); an error is this command's %error.
@@ -3128,15 +3130,11 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
-    // select-pane / last-pane read flags by exact token below (the -t scan,
-    // the -l/-m/-T arms), so a clustered `-dt %2` lost its target and fenced
-    // the ACTIVE pane.  Split clusters the way tmux's getopt reads them.
+    // Every target/scope consumer reads this canonical getopt representation.
     let cluster_split: Vec<String>;
-    let args: Vec<&str> = if matches!(cmd, "select-pane" | "selectp" | "last-pane" | "lastp") {
+    let args: Vec<&str> = {
         cluster_split = crate::cli::expand_flag_clusters(cmd, &args);
         cluster_split.iter().map(|s| s.as_str()).collect()
-    } else {
-        args
     };
 
 // Issue #635: a value-taking flag with nothing after it never runs. Checked
@@ -8468,7 +8466,8 @@ fn dispatch_control_command(
             for sub in crate::config::split_chained_commands_pub(chosen) {
                 let toks = parse_command_line(&sub);
                 let Some(name) = toks.first().map(|s| s.as_str()) else { continue };
-                let original_args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+                let canonical_args = crate::cli::canonical_command_args(name, &toks[1..]);
+                let original_args: Vec<&str> = canonical_args.iter().map(|s| s.as_str()).collect();
                 let mut sub_resolution_failed = false;
                 let normalized = match crate::cli::normalize_pane_target_args(name, &original_args, None,
                     |specs| resolve_pane_specs(tx.inner, specs)) {

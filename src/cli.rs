@@ -350,6 +350,20 @@ mod tests_pane_selector_guard {
     use super::pane_selector_error;
 
     #[test]
+    fn canonical_getopt_targets_share_flag_value_and_operand_boundaries() {
+        use super::canonical_command_args as parse;
+        assert_eq!(parse("send-keys", &["-ltalpha:%2", "TOKEN"]), ["-l", "-t", "alpha:%2", "TOKEN"]);
+        assert_eq!(parse("set-option", &["-watS:%bad", "@probe", "-ptOTHER"]), ["-w", "-a", "-t", "S:%bad", "@probe", "-ptOTHER"]);
+        assert_eq!(parse("swap-pane", &["-dsS:.+", "--target=S:.+2"]), ["-d", "-s", "S:.+", "-t", "S:.+2"]);
+        assert_eq!(parse("send-keys", &["--target", "S:%2", "-l", "--", "-tS:%1"]), ["-t", "S:%2", "-l", "--", "-tS:%1"]);
+        assert_eq!(parse("select-pane", &["-T", "-tS:%1", "-tS:%2"]), ["-T", "-tS:%1", "-t", "S:%2"]);
+        assert_eq!(parse("capture-pane", &["-S-12", "-ptS:%2"]), ["-S", "-12", "-p", "-t", "S:%2"]);
+        let argv = super::canonical_argv(["psmux", "-L", "private", "send-keys", "-ltalpha:%2", "TOKEN"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(argv, ["psmux", "-L", "private", "send-keys", "-l", "-t", "alpha:%2", "TOKEN"]);
+        assert!(super::validate_flag_arguments("kill-window", &["--target-pane=S:%2"]).is_err());
+    }
+
+    #[test]
     fn every_pane_command_and_alias_accepts_supported_selectors_for_resolution() {
         for cmd in ["respawn-pane", "respawnp", "resp", "kill-pane", "killp",
             "set-option", "set", "show-options", "show-option", "show",
@@ -532,6 +546,10 @@ pub fn validate_flag_arguments<S: AsRef<str>>(command: &str, args: &[S]) -> Resu
         let token = args[i].as_ref();
         if !token.starts_with('-') || token == "-" || token == "--" {
             break; // positional, bare '-', or end-of-options: flags are over
+        }
+        if token.starts_with("--") && !(command == "kill-server" && token == "--all")
+            && !(matches!(command, "new-session" | "new") && token == "--spawner") {
+            return Err(format!("unknown flag {}", token.split('=').next().unwrap_or(token)));
         }
         i += 1; // the flag token itself is consumed
         let letters: Vec<char> = token.chars().skip(1).collect();
@@ -837,31 +855,54 @@ pub fn first_operand<'a>(command: &str, args: &[&'a str]) -> Option<&'a str> {
 /// (`select-pane -dt %2` reached the server as a bare `select-pane`).  A
 /// value-taking flag ends its cluster and takes the rest of the word or the
 /// next argument; `--` and the first non-option end the flags, and what follows
-/// is passed through untouched.  Only for commands whose templates have no
-/// OPTIONAL (`::`) values, which both callers satisfy.
+/// is passed through untouched. Optional values follow the same template
+/// rule as required ones, while another flag starts the next option.
 pub fn expand_flag_clusters<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<String> {
+    canonical_command_args(command, args)
+}
+
+/// One getopt walk for routing and dispatch. Every consumer receives separate
+/// flag/value tokens; a value or operand that resembles a flag stays data.
+pub(crate) fn canonical_command_args<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<String> {
+    let template = args_template(command).unwrap_or("t:s:");
+    let extra = psmux_extra_flags(command);
+    let kind_of = |flag: char| match flag_value_kind(template, flag) {
+        FlagValue::None => flag_value_kind(extra, flag), kind => kind,
+    };
     let mut out = Vec::with_capacity(args.len());
     let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_ref();
-        if a == "--" || !a.starts_with('-') || a.len() < 2 {
-            out.extend(args[i..].iter().map(|s| s.as_ref().to_string()));
+    while let Some(arg) = args.get(i) {
+        let token = arg.as_ref();
+        if token == "--" || token == "-" || !token.starts_with('-') {
+            out.extend(args[i..].iter().map(|arg| arg.as_ref().to_string()));
             break;
         }
-        for (pos, c) in a.char_indices().skip(1) {
-            out.push(format!("-{}", c));
-            if flag_takes_value(command, c) {
-                let rest = &a[pos + c.len_utf8()..];
-                if !rest.is_empty() {
-                    out.push(rest.to_string());
-                } else if let Some(v) = args.get(i + 1) {
-                    out.push(v.as_ref().to_string());
-                    i += 1;
-                }
-                break;
-            }
-        }
         i += 1;
+        if token.starts_with("--") {
+            let (name, attached) = token.split_once('=').map(|(name, value)| (name, Some(value))).unwrap_or((token, None));
+            let flag = match name { "--target" => Some('t'), "--source" => Some('s'), _ => None };
+            if let Some(flag) = flag.filter(|flag| kind_of(*flag) != FlagValue::None) {
+                out.push(format!("-{}", flag));
+                if let Some(value) = attached { out.push(value.to_string()); }
+                else if let Some(value) = args.get(i) { out.push(value.as_ref().to_string()); i += 1; }
+            } else { out.push(token.to_string()); }
+            continue;
+        }
+        for (offset, flag) in token.char_indices().skip(1) {
+            out.push(format!("-{}", flag));
+            let kind = kind_of(flag);
+            if kind == FlagValue::None { continue; }
+            let attached = &token[offset + flag.len_utf8()..];
+            if !attached.is_empty() {
+                // psmux also accepts a short flag's =value spelling.
+                out.push(attached.strip_prefix('=').unwrap_or(attached).to_string());
+            } else if let Some(next) = args.get(i).map(AsRef::as_ref) {
+                if !(kind == FlagValue::Optional && looks_like_another_flag(next)) {
+                    out.push(next.to_string()); i += 1;
+                }
+            }
+            break;
+        }
     }
     out
 }
@@ -888,7 +929,7 @@ pub fn expand_flag_clusters<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<Str
 ///   - The flag letter must be ASCII alphabetic (`-t=foo` yes, `-1=bar` no).
 ///   - Long flags (`--name=value`), bare `-` and degenerate `-=` pass through.
 pub fn normalize_flag_equals(args: Vec<String>) -> Vec<String> {
-    normalize_argv_flags(args, true, false)
+    normalize_argv_flags(args, true, false, false)
 }
 
 /// The flag letter of a `-X=value` token, when `token` has that shape.
@@ -908,7 +949,7 @@ fn ends_command(token: &str) -> bool {
 
 /// Shared walker for [`normalize_flag_equals`] and
 /// [`normalize_attached_target_flag`]: rewrites only flag-position tokens.
-fn normalize_argv_flags(args: Vec<String>, equals: bool, attached_t: bool) -> Vec<String> {
+fn normalize_argv_flags(args: Vec<String>, equals: bool, attached_t: bool, canonical: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len() + 2);
     let mut i = 0;
     // argv shape: a first token that is neither a flag nor a known command is
@@ -961,7 +1002,7 @@ fn normalize_argv_flags(args: Vec<String>, equals: bool, attached_t: bool) -> Ve
             .position(|t| ends_command(t))
             .map(|p| i + p + 1)
             .unwrap_or(args.len());
-        normalize_command_flags(&command, &args[i..end], equals, attached_t, &mut out);
+        normalize_command_flags(&command, &args[i..end], equals, attached_t, canonical, &mut out);
         i = end;
     }
     out
@@ -974,8 +1015,13 @@ fn normalize_command_flags(
     args: &[String],
     equals: bool,
     attached_t: bool,
+    canonical: bool,
     out: &mut Vec<String>,
 ) {
+    if canonical {
+        out.extend(canonical_command_args(command, args));
+        return;
+    }
     let Some(template) = args_template(command) else {
         // A command the flag table does not know (user alias, typo): its
         // operands cannot be told apart, so keep the #196 behaviour up to
@@ -1142,8 +1188,12 @@ pub fn normalize_attached_global_args(args: Vec<String>) -> Vec<String> {
 ///     used to split every `-t...` token up to `--`).
 ///   - The global region is `normalize_attached_global_args`'s job.
 ///   - A bare `-t` (detached form) and every other flag pass through.
+pub(crate) fn canonical_argv(args: Vec<String>) -> Vec<String> {
+    normalize_argv_flags(args, false, false, true)
+}
+
 pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
-    normalize_argv_flags(args, false, true)
+    normalize_argv_flags(args, false, true, false)
 }
 
 pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Option<usize> {
@@ -2234,6 +2284,7 @@ pub fn extract_session_from_target(target: &str) -> String {
 /// Split set-option flags from operands. Ordinary flags end at the option
 /// name; `-t <target>` remains recognized until `--`.
 pub(crate) struct ParsedSetOptionArgs<'a> {
+    pub first_positional_index: Option<usize>,
     pub flag_chars: String,
     pub target: Option<&'a str>,
     pub missing_target: bool,
@@ -2303,6 +2354,7 @@ impl ParsedSetOptionArgs<'_> {
 }
 
 pub(crate) fn parse_set_option_args<'a>(args: &[&'a str]) -> ParsedSetOptionArgs<'a> {
+    let mut first_positional_index = None;
     let mut flag_chars = String::new();
     let mut target = None;
     let mut missing_target = false;
@@ -2312,6 +2364,16 @@ pub(crate) fn parse_set_option_args<'a>(args: &[&'a str]) -> ParsedSetOptionArgs
     let mut literal_values = false;
     while i < args.len() {
         let arg = args[i];
+        if parsing_flags && (arg == "--target" || arg.starts_with("--target=")) {
+            flag_chars.push('t');
+            if let Some(value) = arg.strip_prefix("--target=") { target = Some(value); i += 1; }
+            else {
+                target = args.get(i + 1).copied();
+                missing_target = target.is_none();
+                i += 2;
+            }
+            continue;
+        }
         if parsing_flags {
             if arg == "--" {
                 parsing_flags = false;
@@ -2372,10 +2434,12 @@ pub(crate) fn parse_set_option_args<'a>(args: &[&'a str]) -> ParsedSetOptionArgs
             i += 2;
             continue;
         }
+        first_positional_index.get_or_insert(i);
         positionals.push(arg);
         i += 1;
     }
     ParsedSetOptionArgs {
+        first_positional_index,
         flag_chars,
         target,
         missing_target,

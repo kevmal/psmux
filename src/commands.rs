@@ -2324,15 +2324,46 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     // whitespace split kept them: a copy mode prompt's `rename-window '%%'`
     // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
     // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
-    let original_tokens = parse_command_line(cmd);
+    let parsed_tokens = parse_command_line(cmd);
+    let original_tokens: Vec<String> = if let Some(command) = parsed_tokens.first() {
+        std::iter::once(command.clone()).chain(crate::cli::canonical_command_args(command, &parsed_tokens[1..])).collect()
+    } else { Vec::new() };
     let original_parts: Vec<&str> = original_tokens.iter().map(String::as_str).collect();
     if original_parts.is_empty() { return Ok(()); }
-    let normalized = crate::cli::normalize_pane_target_args(original_parts[0], &original_parts[1..], None,
-        |specs| crate::server::pane_target::resolve_all(app, &specs.iter().map(|spec| spec.to_string()).collect::<Vec<_>>()))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if crate::server::connection::targets_existing_window(original_parts[0], &original_parts[1..]) {
+        let args = &original_parts[1..];
+        let end = crate::cli::outer_target_scan_end(original_parts[0], args).min(args.len());
+        if let Some(target) = args[..end].windows(2).find(|pair| pair[0] == "-t").map(|pair| pair[1]) {
+            if let Err(error) = crate::server::temp_target::resolve_window_command_target(app, target) {
+                app.status_message = Some((error, std::time::Instant::now(), None));
+                return Ok(());
+            }
+        }
+    }
+    let normalized = match crate::cli::normalize_pane_target_args(original_parts[0], &original_parts[1..], None,
+        |specs| crate::server::pane_target::resolve_all(app, &specs.iter().map(|spec| spec.to_string()).collect::<Vec<_>>())) {
+        Ok(args) => args,
+        // Untargeted embedded break-pane on an empty tree remains a no-op.
+        Err(_) if matches!(original_parts[0], "break-pane" | "breakp")
+            && crate::cli::scoped_pane_targets(original_parts[0], &original_parts[1..], None).is_empty()
+            && app.windows.iter().all(|window| crate::tree::pane_paths(&window.root).is_empty()) => original_parts[1..].iter().map(|arg| arg.to_string()).collect(),
+        Err(error) => {
+            app.status_message = Some((error.clone(), std::time::Instant::now(), None));
+            if error.starts_with("invalid pane target:") {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+            }
+            return Ok(());
+        }
+    };
     let normalized_primary = crate::cli::scoped_pane_targets(original_parts[0], &original_parts[1..], None).iter().any(|target| target.flag == 't');
+    let pane_args_changed = !normalized.iter().map(String::as_str).eq(original_parts[1..].iter().copied());
     let tokens: Vec<String> = std::iter::once(original_parts[0].to_string()).chain(normalized).collect();
-    let normalized_command = crate::pane::requote_argv(&tokens);
+    // Raw-tail consumers (copy prompts, config formats, shell templates) need
+    // their original quoting. Requote only when pane identity actually changed.
+    let normalized_command = if pane_args_changed {
+        tokens.iter().map(|token| if token.contains('#') { crate::util::quote_arg(token) }
+            else { crate::util::quote_arg_if_needed(token) }).collect::<Vec<_>>().join(" ")
+    } else { cmd.to_string() };
     let cmd = normalized_command.as_str();
     let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }

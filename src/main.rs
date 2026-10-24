@@ -1205,9 +1205,9 @@ fn write_shell_output(mut stream: impl Write, _std_handle: i32, bytes: &[u8]) ->
 
 fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
-    // command-level `-tname` (attached target): running attached passes
+    // canonical command flags (including clustered -t/-s): running globals
     // first would mis-split `-L=foo` into `-L` + `=foo`.
-    let args: Vec<String> = crate::cli::normalize_attached_target_flag(
+    let args: Vec<String> = crate::cli::canonical_argv(
         crate::cli::normalize_attached_global_args(
             crate::cli::normalize_flag_equals(env::args().collect()),
         ),

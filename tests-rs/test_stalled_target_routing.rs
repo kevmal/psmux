@@ -104,7 +104,7 @@ fn make_window(id: usize, name: &str, pane_ids: &[usize]) -> crate::types::Windo
 
 /// Session `s`: window 0 (@10, "main") with panes %1 %2 %3, window 1
 /// (@11, "other") with pane %4.  Active: window 0, pane %1.
-pub(super) fn app() -> AppState {
+pub(crate) fn app() -> AppState {
     let mut app = AppState::new("s".to_string());
     app.window_base_index = 0;
     app.pane_base_index = 0;
@@ -420,6 +420,24 @@ fn binding_commands_forward_resolved_identity_without_changing_focus() {
             |specs| crate::server::pane_target::resolve_all(&a, &specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())).unwrap();
         assert_eq!(normalized, ["-t", "%3"]);
     }
+}
+
+#[test]
+fn config_and_local_option_flags_preserve_scope_identity_and_value_text() {
+    let mut a = app();
+    crate::config::parse_config_line(&mut a, "set-option -wt s:@11 @scope '  value  # literal  '");
+    assert_eq!(a.windows[1].window_options.get("@scope").map(String::as_str), Some("  value  # literal  "));
+    assert!(!a.windows[0].window_options.contains_key("@scope"));
+    crate::config::parse_config_line(&mut a, "set-option -pt s:.+ @scope 'right pane'");
+    let pane = crate::tree::active_pane_mut(&mut a.windows[0].root, &vec![1]).unwrap();
+    assert_eq!(pane.pane_options.get("@scope").map(String::as_str), Some("right pane"));
+    for line in ["set-option -wt s:%bad @scope WRONG", "set-option -pt s:@10.%bad @scope WRONG"] {
+        crate::config::parse_config_line(&mut a, line);
+        assert_eq!(a.windows[1].window_options.get("@scope").map(String::as_str), Some("  value  # literal  "));
+        assert!(!a.windows[0].window_options.contains_key("@scope"));
+        assert!(!a.user_options.contains_key("@scope"));
+    }
+    assert_eq!(active(&a), (0, 1));
 }
 
 #[test]

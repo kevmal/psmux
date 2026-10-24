@@ -115,6 +115,7 @@ pub(crate) fn resolve_pane(app: &AppState, raw: &str) -> Result<usize, String> {
         }
         Err(_) if session.is_none() && super::temp_target::session_names_this_server(app, body) =>
             current_pane(app, app.active_idx).ok_or_else(|| "no current pane".into()),
+        Err(_) if session.is_none() => Err(format!("can't find pane: {}", body)),
         Err(error) => Err(error),
     }
 }

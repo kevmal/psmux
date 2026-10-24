@@ -181,6 +181,47 @@ last-pane victim window to disappear after child termination and dead-PTY
 cleanup, keeping its original correct-victim/active-survivor assertions.
 Production completion and EOF behavior are unchanged.
 
+### Attached/clustered flags and all command ingress
+
+Independent review found attached primary/source flags still bypassed later
+exact-token scans. This affected valid input delivery and window/pane movers,
+not merely malformed errors. Every routing/dispatch path now receives one
+canonical getopt form: separate, attached, clustered and =value flags share
+flag/value tokens, and source -s is handled alongside primary -t. The CLI does
+this before choosing a session. Raw/control, aliases, nested branches and
+in-server execution do it before target extraction. The control send coalescer
+also canonicalizes before it can merge any input; otherwise it could discard
+a long target before ordinary dispatch saw it.
+
+--target and --source (separate or =value) are compatible aliases of -t/-s
+where those flags take values. Unsupported long flags report an error.
+Required/optional value boundaries, -- and first-operand boundaries follow
+the command templates. Target-shaped titles, option values and shell operands
+remain data. The legacy helper that only normalizes attached -t retains its
+existing public test contract; the actual CLI uses the common full pass.
+
+Window option scope uses ParsedSetOptionArgs, rather than re-guessing letters
+inside a raw flag/value token. Config option writes use that same parsed scope
+and target, with original token offsets for quoted value text. Explicit config
+pane/window targets resolve to stable ids before writes, so attached target
+text cannot become scope flags or an option name.
+
+The preceding full CI exposed real local-execution regressions: unconditional
+requotes lost quoted format values and copy-prompt template syntax. Raw tails
+now retain their original quoting unless pane identity actually changes; a
+rewritten format token is quoted. Well-formed missing UI targets set an error
+status without mutation, and untargeted empty embedded break-pane remains a
+no-op. Malformed pane fields still fail before mutation. The valid-session
+display test now supplies a real stub pane instead of an empty split. The npm
+wrapper fixture excludes broken exe symlinks from its synthetic npm-only PATH,
+because PowerShell discovers such links even when Rust exists() follows them
+to a missing target. No installed shim was changed.
+
+The attached-target runtime suite covers both input consumers (send and paste),
+primary/source failures, window scope, exact victim identity, nested dispatch,
+in-server commands, long forms and flag-shaped data. Full CI includes it with
+the prior target suites. No user binding or configuration was edited.
+
 ## Validation and safety boundaries
 
 `tests/test_fork_upstream_contract.py` accepts an explicit worktree binary,
@@ -203,7 +244,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-258 focused Rust tests passed after the full pane-resolution correction. They cover passive closes
+664 focused Rust checks passed after the getopt and raw-tail corrections. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use

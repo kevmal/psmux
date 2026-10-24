@@ -1709,51 +1709,38 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
     let toks = tokens_with_offsets(line);
     if toks.len() < 2 { warn_config(app, "set-option requires an option name"); return; }
 
-    let mut i = 1;
-    let mut is_global = false;
-    let mut global_flag = false;    // -g itself (is_global also covers -s)
-    let mut format_expand = false;  // -F: expand format strings in value
-    let mut only_if_unset = false;  // -o: only set if not already set
-    let mut append_mode = false;    // -a: append to current value
-    let mut unset_mode = false;     // -u: unset (reset to default)
-    let mut quiet = false;          // -q: suppress the "already set" error
-    let mut window_scope = window_command;
-    let mut pane_scope = false;     // -p: the target pane's own table (#728)
-    let mut target = String::new();
-
-    while i < toks.len() {
-        let p = toks[i].1.as_str();
-        if p.starts_with('-') {
-            if p.contains('g') { is_global = true; global_flag = true; }
-            // -s is tmux's server scope (#618). psmux keeps a single option
-            // store, so it resolves to the global one, exactly like -g. A
-            // config carrying `set -s default-terminal xterm-256color` (or the
-            // very common `set -sg escape-time 0`) must land the value, not
-            // drop the scope on the floor.
-            if p.contains('s') { is_global = true; }
-            if p.contains('F') { format_expand = true; }
-            if p.contains('o') { only_if_unset = true; }
-            if p.contains('a') { append_mode = true; }
-            if p.contains('w') { window_scope = true; }
-            if p.contains('p') { pane_scope = true; }
-            // -U is an unset alias of -u (tmux parity, #553); the contains
-            // check is case-sensitive so both must be tested.
-            if p.contains('u') || p.contains('U') { unset_mode = true; }
-            // -q (quiet) suppresses the `-o` "already set" refusal below, which
-            // is the one error tmux's cmd-set-option.c lets `-q` swallow at
-            // exit 0 (`if (args_has(args, 'q')) goto out;`). Unknown options
-            // are still reported.
-            if p.contains('q') { quiet = true; }
-            i += 1;
-            // #648: the target was skipped and thrown away, so a config line
-            // `set -w -t "s:zero" remain-on-exit on` could not name a window
-            // even once windows had their own option tables.
-            if p.contains('t') && i < toks.len() {
-                target = strip_wrapping_quotes(&toks[i].1).to_string();
-                i += 1;
-            }
+    // Use the same getopt representation as CLI/TCP/control. Keep the
+    // original token offsets for the value tail, so whitespace and comments
+    // retain config-file semantics even when attached flags are expanded.
+    let raw_args: Vec<&str> = toks[1..].iter().map(|token| token.1.as_str()).collect();
+    let parsed = crate::cli::parse_set_option_args(&raw_args);
+    if parsed.missing_target { warn_config(app, "target required after -t"); return; }
+    let flags = &parsed.flag_chars;
+    if let Some(flag) = flags.chars().find(|flag| !crate::SET_OPTION_CLI_FLAGS.contains(*flag)) {
+        warn_config(app, format!("unknown flag -{}", flag));
+        return;
+    }
+    let i = parsed.first_positional_index.map(|index| index + 1).unwrap_or(toks.len());
+    let is_global = flags.contains('g') || flags.contains('s');
+    let global_flag = flags.contains('g');
+    let format_expand = flags.contains('F');
+    let only_if_unset = flags.contains('o');
+    let append_mode = flags.contains('a');
+    let unset_mode = flags.contains('u') || flags.contains('U');
+    let quiet = flags.contains('q');
+    let window_scope = window_command || flags.contains('w');
+    let pane_scope = flags.contains('p');
+    let mut target = parsed.target.map(strip_wrapping_quotes).unwrap_or_default().to_string();
+    if !is_global && !target.is_empty() && (pane_scope || window_scope) {
+        let resolved = if pane_scope {
+            crate::server::pane_target::resolve_pane(app, &target).map(|id| format!("%{}", id))
         } else {
-            break;
+            crate::server::temp_target::resolve_window_command_target(app, &target)
+                .and_then(|target| target.win.map(|id| format!("@{}", id)).ok_or_else(|| "no current window".to_string()))
+        };
+        match resolved {
+            Ok(id) => target = id,
+            Err(error) => { warn_config(app, error); return; }
         }
     }
 

@@ -715,7 +715,10 @@ fn display_message_d_and_I_combined() {
 #[test]
 fn display_message_t_flag_consumed() {
     // -t target should be consumed (ignored locally), not leaked into message
-    let mut app = mock_app_with_window();
+    // A target naming this session's current pane needs a real stub pane,
+    // rather than the empty split used by the other flag-only fixtures.
+    let mut app = crate::server::temp_target::tests::app();
+    app.session_name = "test_session".into();
     app.control_port = None;
     // The session's own name: its current pane (cmd-find.c, a bare name is a
     // window first and then a session).
