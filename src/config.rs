@@ -1599,7 +1599,7 @@ fn strip_wrapping_quotes(v: &str) -> &str {
 /// **verbatim** from the original line. `split_whitespace()` discards where the
 /// runs of whitespace were, which is what made a quoted gap unrecoverable
 /// (#536).
-fn tokens_with_offsets(line: &str) -> Vec<(usize, String)> {
+pub(crate) fn tokens_with_offsets(line: &str) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut cur = String::new();
     let mut start = 0usize;

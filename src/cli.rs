@@ -864,6 +864,13 @@ pub fn expand_flag_clusters<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<Str
 /// One getopt walk for routing and dispatch. Every consumer receives separate
 /// flag/value tokens; a value or operand that resembles a flag stays data.
 pub(crate) fn canonical_command_args<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<String> {
+    canonical_command_tokens(command, args).into_iter().map(|(arg, _)| arg).collect()
+}
+
+/// Canonical arguments plus the original argv token each came from. Local
+/// execution uses these origins to replace target tokens without requoting
+/// unrelated shell/config/prompt text.
+pub(crate) fn canonical_command_tokens<S: AsRef<str>>(command: &str, args: &[S]) -> Vec<(String, usize)> {
     let template = args_template(command).unwrap_or("t:s:");
     let extra = psmux_extra_flags(command);
     let kind_of = |flag: char| match flag_value_kind(template, flag) {
@@ -874,31 +881,31 @@ pub(crate) fn canonical_command_args<S: AsRef<str>>(command: &str, args: &[S]) -
     while let Some(arg) = args.get(i) {
         let token = arg.as_ref();
         if token == "--" || token == "-" || !token.starts_with('-') {
-            out.extend(args[i..].iter().map(|arg| arg.as_ref().to_string()));
+            out.extend(args[i..].iter().enumerate().map(|(offset, arg)| (arg.as_ref().to_string(), i + offset)));
             break;
         }
+        let origin = i;
         i += 1;
         if token.starts_with("--") {
             let (name, attached) = token.split_once('=').map(|(name, value)| (name, Some(value))).unwrap_or((token, None));
             let flag = match name { "--target" => Some('t'), "--source" => Some('s'), _ => None };
             if let Some(flag) = flag.filter(|flag| kind_of(*flag) != FlagValue::None) {
-                out.push(format!("-{}", flag));
-                if let Some(value) = attached { out.push(value.to_string()); }
-                else if let Some(value) = args.get(i) { out.push(value.as_ref().to_string()); i += 1; }
-            } else { out.push(token.to_string()); }
+                out.push((format!("-{}", flag), origin));
+                if let Some(value) = attached { out.push((value.to_string(), origin)); }
+                else if let Some(value) = args.get(i) { out.push((value.as_ref().to_string(), i)); i += 1; }
+            } else { out.push((token.to_string(), origin)); }
             continue;
         }
         for (offset, flag) in token.char_indices().skip(1) {
-            out.push(format!("-{}", flag));
+            out.push((format!("-{}", flag), origin));
             let kind = kind_of(flag);
             if kind == FlagValue::None { continue; }
             let attached = &token[offset + flag.len_utf8()..];
             if !attached.is_empty() {
-                // psmux also accepts a short flag's =value spelling.
-                out.push(attached.strip_prefix('=').unwrap_or(attached).to_string());
+                out.push((attached.strip_prefix('=').unwrap_or(attached).to_string(), origin));
             } else if let Some(next) = args.get(i).map(AsRef::as_ref) {
                 if !(kind == FlagValue::Optional && looks_like_another_flag(next)) {
-                    out.push(next.to_string()); i += 1;
+                    out.push((next.to_string(), i)); i += 1;
                 }
             }
             break;

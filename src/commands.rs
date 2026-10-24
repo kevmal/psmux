@@ -2318,6 +2318,58 @@ fn requote(args: &[&str]) -> String {
     args.iter().map(|a| crate::util::quote_arg_if_needed(a)).collect::<Vec<_>>().join(" ")
 }
 
+/// Change only target tokens; retain every other byte of the original line.
+fn rewrite_resolved_pane_tokens(cmd: &str, canonical: &[(String, usize)], normalized: &[String]) -> io::Result<String> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "pane target token origins did not match command");
+    let prefix = normalized.len().checked_sub(canonical.len()).ok_or_else(invalid)?;
+    let raw = crate::config::tokens_with_offsets(cmd);
+    let changed: std::collections::BTreeSet<usize> = canonical.iter().enumerate()
+        .filter(|(i, (arg, _))| *arg != normalized[prefix + i])
+        .map(|(_, (_, origin))| *origin).collect();
+    let mut edits = Vec::new();
+    for origin in changed {
+        let (start, token) = raw.get(origin + 1).ok_or_else(invalid)?;
+        let replacement = canonical.iter().enumerate().filter(|(_, (_, index))| *index == origin)
+            .map(|(i, _)| crate::util::quote_arg_if_needed(&normalized[prefix + i])).collect::<Vec<_>>().join(" ");
+        edits.push((*start, *start + token.len(), replacement));
+    }
+    if prefix > 0 {
+        let (start, command) = raw.first().ok_or_else(invalid)?;
+        let at = *start + command.len();
+        edits.push((at, at, format!(" {}", normalized[..prefix].join(" "))));
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut result = cmd.to_string();
+    for (start, end, text) in edits { result.replace_range(start..end, &text); }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests_target_token_spans {
+    use super::*;
+
+    #[test]
+    fn only_target_spans_change_in_raw_config_and_shell_templates() {
+        for (line, expected) in [
+            ("set-option -pt s:.+ @x '  #literal  '", "set-option -pt %2 @x '  #literal  '"),
+            ("set-option -pts:.+ @x \"#{pane_id}  x\"", "set-option -p -t %2 @x \"#{pane_id}  x\""),
+            ("run-shell --target=s:.+ 'echo \\\"x\\\"; echo #{pane_id}'", "run-shell -t %2 'echo \\\"x\\\"; echo #{pane_id}'"),
+        ] {
+            let tokens = parse_command_line(line);
+            let canonical = crate::cli::canonical_command_tokens(&tokens[0], &tokens[1..]);
+            let args: Vec<&str> = canonical.iter().map(|(arg, _)| arg.as_str()).collect();
+            let normalized = crate::cli::normalize_pane_target_args(&tokens[0], &args, None,
+                |_| Ok(vec!["%2".to_string()])).unwrap();
+            assert_eq!(rewrite_resolved_pane_tokens(line, &canonical, &normalized).unwrap(), expected);
+        }
+        let line = "command-prompt -p'(search down)' { send -X search-backward -- '%%' }";
+        let tokens = parse_command_line(line);
+        let canonical = crate::cli::canonical_command_tokens(&tokens[0], &tokens[1..]);
+        let normalized = canonical.iter().map(|(arg, _)| arg.clone()).collect::<Vec<_>>();
+        assert_eq!(rewrite_resolved_pane_tokens(line, &canonical, &normalized).unwrap(), line);
+    }
+}
+
 fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()> {
     // Quotes group and are removed here, as tmux's command parser does and as
     // the server's own command line handler (connection.rs) already does. A
@@ -2325,8 +2377,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
     // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
     let parsed_tokens = parse_command_line(cmd);
+    let canonical_args = parsed_tokens.first().map(|command| crate::cli::canonical_command_tokens(command, &parsed_tokens[1..])).unwrap_or_default();
     let original_tokens: Vec<String> = if let Some(command) = parsed_tokens.first() {
-        std::iter::once(command.clone()).chain(crate::cli::canonical_command_args(command, &parsed_tokens[1..])).collect()
+        std::iter::once(command.clone()).chain(canonical_args.iter().map(|(arg, _)| arg.clone())).collect()
     } else { Vec::new() };
     let original_parts: Vec<&str> = original_tokens.iter().map(String::as_str).collect();
     if original_parts.is_empty() { return Ok(()); }
@@ -2356,14 +2409,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
     };
     let normalized_primary = crate::cli::scoped_pane_targets(original_parts[0], &original_parts[1..], None).iter().any(|target| target.flag == 't');
-    let pane_args_changed = !normalized.iter().map(String::as_str).eq(original_parts[1..].iter().copied());
+    let normalized_command = rewrite_resolved_pane_tokens(cmd, &canonical_args, &normalized)?;
     let tokens: Vec<String> = std::iter::once(original_parts[0].to_string()).chain(normalized).collect();
-    // Raw-tail consumers (copy prompts, config formats, shell templates) need
-    // their original quoting. Requote only when pane identity actually changed.
-    let normalized_command = if pane_args_changed {
-        tokens.iter().map(|token| if token.contains('#') { crate::util::quote_arg(token) }
-            else { crate::util::quote_arg_if_needed(token) }).collect::<Vec<_>>().join(" ")
-    } else { cmd.to_string() };
     let cmd = normalized_command.as_str();
     let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }

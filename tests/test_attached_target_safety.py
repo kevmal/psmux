@@ -112,6 +112,19 @@ class Attached(RelativeTargets):
             self.invoke_args(route, session, args, fail=True)
             assert self.state(session) == before, (route, args, "state changed after rejection")
             self.cases.append(dict(route=route, args=args, unchanged=True, ok=True))
+        source_pane = self.run("list-panes", "-t", destination, "-F", "#{pane_id}").stdout.strip()
+        destination_pane = self.run("list-panes", "-t", f"{session}:{windows[2]}", "-F", "#{pane_id}").stdout.strip()
+        for spelling in ("clustered", "long"):
+            flags = ["-ds" + session + ":" + source_pane, "-t" + session + ":" + destination_pane] if spelling == "clustered" else ["-d", "--source=" + session + ":" + source_pane, "--target=" + session + ":" + destination_pane]
+            self.invoke_args(route, session, ["swap-window", *flags])
+            expected = [windows[0], windows[2], windows[1]] if spelling == "clustered" else windows
+            assert self.window_ids(session) == expected
+            # Baseline and tmux select the destination slot WITH -d, which
+            # now contains the original source window. An unrelated active
+            # window is not an oracle for swap-window -d.
+            assert self.active(session) == windows[1]
+            self.cases.append(dict(route=route, command="swap-window", spelling=spelling, source_and_baseline_focus=True, ok=True))
+        self.run("select-window", "-t", f"{session}:{windows[0]}")
         ids = self.run("list-panes", "-t", f"{session}:{windows[0]}", "-F", "#{pane_id}").stdout.splitlines()
         self.invoke_args(route, session, ["swap-pane", "-ds" + session + ":" + ids[1], "-t" + session + ":" + ids[2]])
         assert self.run("list-panes", "-t", f"{session}:{windows[0]}", "-F", "#{pane_id}").stdout.splitlines() == [ids[0], ids[2], ids[1]]

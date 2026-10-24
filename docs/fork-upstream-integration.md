@@ -220,7 +220,11 @@ to a missing target. No installed shim was changed.
 The attached-target runtime suite covers both input consumers (send and paste),
 primary/source failures, window scope, exact victim identity, nested dispatch,
 in-server commands, long forms and flag-shaped data. Full CI includes it with
-the prior target suites. No user binding or configuration was edited.
+the prior target suites. No user binding or configuration was edited. Swap-window -d retains the
+baseline 144a46c destination-selection rule, matching current
+[tmux cmd-swap-window.c](https://github.com/tmux/tmux/blob/master/cmd-swap-window.c).
+An unrelated active window is not preserved by that command; the explicit
+source, exchanged window identities and PIDs are the routing oracle.
 
 ## Validation and safety boundaries
 
@@ -244,7 +248,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-664 focused Rust checks passed after the getopt and raw-tail corrections. They cover passive closes
+665 focused Rust checks passed after the getopt and raw-tail corrections. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use
