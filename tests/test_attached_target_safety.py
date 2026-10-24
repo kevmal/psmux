@@ -84,7 +84,7 @@ class Attached(RelativeTargets):
     def state(self, session):
         return self.run("list-panes", "-s", "-t", session + ":", "-F",
                         "#{window_id}|#{window_active}|#{window_layout}|#{pane_id}|#{pane_pid}|"
-                        "#{pane_active}|#{pane_width}|#{pane_height}|#{@getopt-window}|#{@getopt-pane}").stdout
+                        "#{pane_active}|#{pane_width}|#{pane_height}|#{window_zoomed_flag}|#{@getopt-window}|#{@getopt-pane}").stdout
 
     def mutations(self, route):
         session, windows = self.fixture(panes=True)
@@ -97,6 +97,9 @@ class Attached(RelativeTargets):
             for target in [["-t" + bad], ["-" + cluster + bad], ["-" + cluster, bad],
                            ["--target=" + bad], ["--target", bad], ["--target-pane=" + destination]]:
                 commands.append([command, *target])
+        for command in ("zoom-pane", "send-key", "send-text", "send-paste"):
+            commands.append([command, "--target-pane=" + bad])
+            commands.append([command, "-t"])
         for command, prefix, key in [("set-option", "wt", "@getopt-window"),
                                      ("set-option", "wat", "@getopt-window"),
                                      ("set-option", "pt", "@getopt-pane"),

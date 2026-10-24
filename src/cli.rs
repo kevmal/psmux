@@ -361,6 +361,8 @@ mod tests_pane_selector_guard {
         let argv = super::canonical_argv(["psmux", "-L", "private", "send-keys", "-ltalpha:%2", "TOKEN"].iter().map(|s| s.to_string()).collect());
         assert_eq!(argv, ["psmux", "-L", "private", "send-keys", "-l", "-t", "alpha:%2", "TOKEN"]);
         assert!(super::validate_flag_arguments("kill-window", &["--target-pane=S:%2"]).is_err());
+        assert!(super::validate_flag_arguments("send-key", &["-t"]).is_err());
+        assert!(super::validate_flag_arguments("zoom-pane", &["--target-pane=S:%2"]).is_err());
     }
 
     #[test]
@@ -533,8 +535,12 @@ fn looks_like_another_flag(token: &str) -> bool {
 ///   * an OPTIONAL value (`::`) is never mandatory, and is not consumed when
 ///     the next token looks like another flag.
 pub fn validate_flag_arguments<S: AsRef<str>>(command: &str, args: &[S]) -> Result<(), String> {
-    let Some(template) = args_template(command) else {
-        return Ok(());
+    let template = match args_template(command) {
+        Some(template) => template,
+        // Internal pane commands use the same target/source grammar as
+        // canonical_command_tokens, even without a tmux catalog entry.
+        None if !scoped_pane_targets(command, &[], Some("%0")).is_empty() => "t:s:",
+        None => return Ok(()),
     };
     let extra = psmux_extra_flags(command);
     let kind_of = |flag: char| match flag_value_kind(template, flag) {

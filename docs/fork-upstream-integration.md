@@ -193,6 +193,11 @@ in-server execution do it before target extraction. The control send coalescer
 also canonicalizes before it can merge any input; otherwise it could discard
 a long target before ordinary dispatch saw it.
 
+Internal pane extensions without a tmux catalog template use the same
+target/source grammar for argument validation as for canonicalization.
+Unknown long targets and missing -t arguments therefore fail before zoom,
+input or other internal requests can mutate current state.
+
 --target and --source (separate or =value) are compatible aliases of -t/-s
 where those flags take values. Unsupported long flags report an error.
 Required/optional value boundaries, -- and first-operand boundaries follow
