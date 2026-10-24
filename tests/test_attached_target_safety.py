@@ -97,7 +97,7 @@ class Attached(RelativeTargets):
             for target in [["-t" + bad], ["-" + cluster + bad], ["-" + cluster, bad],
                            ["--target=" + bad], ["--target", bad], ["--target-pane=" + destination]]:
                 commands.append([command, *target])
-        for command in ("zoom-pane", "send-key", "send-text", "send-paste"):
+        for command in ("zoom-pane", "send-key", "send-text", "send-paste", "new-pane", "newp"):
             commands.append([command, "--target-pane=" + bad])
             commands.append([command, "-t"])
         for command, prefix, key in [("set-option", "wt", "@getopt-window"),

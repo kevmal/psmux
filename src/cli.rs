@@ -253,7 +253,7 @@ pub(crate) fn scoped_pane_targets<'a>(command: &str, args: &[&'a str], fallback_
     let pane_command = matches!(command,
         "capture-pane" | "clear-history" | "clock-mode" | "copy-mode"
         | "display-message" | "join-pane" | "kill-pane" | "last-pane"
-        | "move-pane" | "new-pane" | "paste-buffer" | "pipe-pane"
+        | "move-pane" | "new-pane" | "newp" | "paste-buffer" | "pipe-pane"
         | "resize-pane" | "respawn-pane" | "select-pane" | "send-keys"
         | "send-prefix" | "split-window" | "swap-pane" | "zoom-pane"
         | "run-shell" | "if-shell" | "source-file"
@@ -363,6 +363,7 @@ mod tests_pane_selector_guard {
         assert!(super::validate_flag_arguments("kill-window", &["--target-pane=S:%2"]).is_err());
         assert!(super::validate_flag_arguments("send-key", &["-t"]).is_err());
         assert!(super::validate_flag_arguments("zoom-pane", &["--target-pane=S:%2"]).is_err());
+        assert!(super::validate_flag_arguments("newp", &["--target-pane=S:%2"]).is_err());
     }
 
     #[test]
