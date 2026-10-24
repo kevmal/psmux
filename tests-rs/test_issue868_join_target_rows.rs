@@ -23,6 +23,32 @@ fn switch(spec: &str) -> Option<Result<(), String>> {
 const FLOAT: &str = "size or position can't split a floating pane";
 
 #[test]
+fn cross_session_join_resolves_a_single_stable_id_before_extracting() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    for (reply, valid) in [("%7\n", true), ("OK\n%7\n", true),
+        ("ERROR: can't find pane\n", false), ("%7\n%8\n", false), ("", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command.trim(), "display-message -p -t :.+ #{pane_id}");
+            socket.write_all(reply.as_bytes()).unwrap();
+        });
+        let result = super::resolve_join_pane(port, "unit-only", ":.+");
+        assert_eq!(result.is_ok(), valid);
+        if valid { assert_eq!(result.unwrap(), "%7"); }
+        peer.join().unwrap();
+    }
+}
+
+#[test]
 fn join_refuses_a_floating_pane_by_index() {
     assert_eq!(join("X:0.2"), Some(Err(FLOAT.to_string())));
     assert_eq!(join("X:.2"), Some(Err(FLOAT.to_string())));

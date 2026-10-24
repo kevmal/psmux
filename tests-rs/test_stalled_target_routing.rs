@@ -337,9 +337,8 @@ fn multi_target_requests_preserve_the_original_implicit_source() {
 #[test]
 fn in_server_relative_pane_refusals_precede_process_or_option_mutation() {
     let mut a = app();
-    for command in ["respawn-pane -k -t s:.+", "set-option -p -t s:.- @probe WRONG",
-        "swap-pane -s s:.+ -t s:%4", "join-pane -s s:.- -t s:%4",
-        "respawn-pane -k -t %bad", "respawn-pane -k -t s:@10.%bad"] {
+    for command in ["respawn-pane -k -t %bad", "respawn-pane -k -t s:@10.%bad",
+        "set-option -p -t s:.bad @probe WRONG", "swap-pane -s s:%bad -t s:%4"] {
         let before = active(&a);
         let count = crate::tree::count_panes(&a.windows[0].root);
         let error = crate::commands::execute_command_string(&mut a, command).unwrap_err();
@@ -362,10 +361,65 @@ fn select_pane_relative_targets_resolve_once_to_stable_ids() {
     }
     assert!(resolve_relative_pane_target(&a, "other:.+").is_err());
     assert!(resolve_relative_pane_target(&a, "s:missing.+").is_err());
-    // Local execution has no normalization round trip, so it must refuse.
-    assert!(crate::commands::execute_command_string(&mut a, "select-pane -t s:.+").is_err());
-    assert!(crate::commands::execute_command_string(&mut a, "select-pane -dt s:.-").is_err());
+    let output = crate::cli::normalize_pane_target_args("select-pane", &["-t", "s:.+"], None,
+        |specs| crate::server::pane_target::resolve_all(&a, &specs.iter().map(|spec| spec.to_string()).collect::<Vec<_>>())).unwrap();
+    assert_eq!(output, ["-t", "%2"]);
     assert_eq!(active(&a), (0, 1));
+}
+
+#[test]
+fn full_pane_resolution_preserves_navigation_symbols_and_identity() {
+    let mut a = app();
+    a.windows[0].pane_mru = vec![1, 3, 2];
+    a.marked_pane = Some((1, 4));
+    for (raw, expected) in [("s:.+2", 3), ("s:.-2", 2), ("s:.{next}", 2),
+        ("s:.{previous}", 3), ("s:.!", 3), ("s:.{last}", 3),
+        ("s:.{top-left}", 1), ("s:.{bottom-left}", 3), ("s:.TOP", 1),
+        ("s:.{down-of}", 2), ("s:.{up-of}", 3), ("~", 4), ("{marked}", 4),
+        ("s:@11.%4", 4), ("s:.%4", 4), (".%4", 4), ("s:%2", 2)] {
+        assert_eq!(crate::server::pane_target::resolve_pane(&a, raw).unwrap(), expected, "{raw}");
+        assert_eq!(active(&a), (0, 1), "lookup moved focus");
+    }
+    for raw in ["s:@11.%2", "other:%1", "%bad", "s:@10.%bad", "s:missing.0", "=", "{mouse}"] {
+        assert!(crate::server::pane_target::resolve_pane(&a, raw).is_err(), "{raw}");
+    }
+    a.pane_base_index = 5;
+    assert_eq!(crate::server::pane_target::resolve_pane(&a, "s:.5").unwrap(), 1);
+    assert_eq!(crate::server::pane_target::resolve_pane(&a, "s:.+").unwrap(), 2);
+}
+
+#[test]
+fn binding_commands_forward_resolved_identity_without_changing_focus() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    let mut a = app();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    a.control_port = Some(listener.local_addr().unwrap().port());
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut auth = String::new();
+        reader.read_line(&mut auth).unwrap();
+        assert!(auth.starts_with("AUTH "));
+        socket.write_all(b"OK\n").unwrap();
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        command
+    });
+    crate::commands::execute_command_string(&mut a, "select-pane -t :.+").unwrap();
+    assert_eq!(peer.join().unwrap().trim(), "select-pane -t %2");
+    assert_eq!(active(&a), (0, 1), "only the queued stable-id command changes focus");
+
+    // Mouse bindings acquire event identity before the ordinary command path.
+    for raw in ["select-pane -t =", "select-pane -t {mouse}"] {
+        let command = crate::mouse_keys::resolve_mouse_targets(raw, 3);
+        let tokens = crate::commands::parse_command_line(&command);
+        let args: Vec<_> = tokens[1..].iter().map(String::as_str).collect();
+        let normalized = crate::cli::normalize_pane_target_args(&tokens[0], &args, None,
+            |specs| crate::server::pane_target::resolve_all(&a, &specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())).unwrap();
+        assert_eq!(normalized, ["-t", "%3"]);
+    }
 }
 
 #[test]

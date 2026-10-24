@@ -122,75 +122,64 @@ pane selection, rejection, cross-window swaps and move-window source identity. I
 uses only private namespaces/config/data and default-registry file snapshots.
 Pure tests exercise resolve/wrap/focus/re-resolve and target disappearance.
 
-### Third review: one pane-selector policy at every ingress
+### Pane selectors resolve before parsing and mutation
 
-`0fb79a5b` was still blocked: respawn-pane and pane-option writes discarded
-`:.+`/`:.-` and changed the current pane. The correction is a shared grammar
-guard in `cli::pane_selector_error`, used before command dispatch on the CLI,
-one-shot/raw TCP, control mode, nested dispatch and in-server command route.
-CLI preflight matters because a fire-and-forget command cannot reliably return
-a later server error to its caller.
+Independent review reproduced relative pane respawn/option operations falling
+back to the current pane, and malformed `%bad` / `@id.%bad` ids disappearing
+inside the permissive numeric parser. A temporary blanket refusal policy was
+insufficient because valid navigation and config targets must keep working.
 
-This integration **rejects unsupported relative/symbolic pane selectors**.
-Use `session:%N`, a qualified stable window/pane id, or an existing numeric
-pane index for those commands. This deliberately narrows their accepted
-target grammar: no command may discard a selector and use the current pane.
-The supported select-pane `:.+`/`:.-` forms are resolved read-only to a stable
-`%id` before TCP/control dispatch, including pane attributes/input toggles.
-This preserves the built-in prefix-o cycle. Resolution errors/timeouts never
-dispatch the original relative string. Nested/local execution without this
-normalization step refuses the selector. Direction flags such as
-`select-pane -R` remain available.
-Window-only commands keep the independent full window resolver and stable-id
-fix; their relative window syntax is not reinterpreted as a pane operation.
+All supported explicit pane endpoints now resolve read-only to stable `%id`
+values before legacy parsing. A single immutable server snapshot resolves both
+source and destination together for swaps/joins/moves, including an omitted
+endpoint. Every command then uses those ids; no relative selector is evaluated
+a second time after temporary request focus. A deleted id remains an error.
+An empty window with `.%id` follows the pane to its owning window; an explicit
+`@window.%id` must match that owner.
 
-The guard covers process replacement/deletion, pane options/attributes/hooks,
-input/paste, capture/display, resize/split/new-pane, pipe/history/modes, pane
-swaps/moves/joins, pane UI and internal input/mouse commands, and pane context
-for run-shell/if-shell/source-file. Source `-s` is checked for swap/join/move/
-break-pane and copy-mode. Option scope and target values are read with the
-existing per-command getopt templates, so `-pt...`, clustered/attached values,
-value-taking flags, `--`, shell operands and target-shaped option/title data
-do not bypass or accidentally trigger the guard. Aliases share the same rule.
+The resolver supports +/- offsets, next/previous/last aliases, marked targets,
+corners/edges and directional selectors with existing layout helpers. Numeric
+indices respect pane-base-index. Explicit sessions are validated against the
+server reached; colliding ids in another session cannot be substituted.
+Mouse `=`/`{mouse}` is converted to the mouse event's stable pane by the existing
+mouse binding preprocessing; without an event, it reports missing context.
+Malformed ids, invalid offsets and unsupported/ambiguous fields fail before
+mutation. Window-only commands keep the separate complete window resolver.
+The target grammar follows [tmux cmd-find.c](https://github.com/tmux/tmux/blob/master/cmd-find.c)
+and [window.c](https://github.com/tmux/tmux/blob/master/window.c); this uses
+psmux's existing geometry and direction code.
 
-`tests/test_pane_selector_safety.py` checks every audited command with both
-`:.+` and `:.-` through CLI, raw LF TARGET and control mode, plus representative
-offset/symbolic/composite selectors and every pane source. Rejections must be
-explicit errors and leave pane process identities, layout, focus, options and
-probe input unchanged. Supported relative select navigation and title-only
-attributes must reach the correct stable pane and preserve the real focus.
-Respawn probes permit only an explicit unsupported
-target in the private namespace; they must fail before any process replacement.
-Pure tests also prove that nested dispatch sends no request on refusal, and
-in-server commands return an error before mutating a stub fixture.
+The shared ingress walk uses each command's getopt template. Aliases,
+clustered/attached flags, value-taking flags, `--`, titles, option values and
+shell operands retain their proper boundaries. It covers pane process
+operations, options/attributes/hooks, input/paste, capture/display,
+resize/split, pipes/history/modes, pane UI/internal commands, context for
+run-shell/if-shell/source-file and all pane source `-s` endpoints. Well-formed
+missing CANFAIL context for run/if/source keeps its existing no-target format
+semantics, while malformed fields are errors. Nested control branches normalize
+before dispatch too. In-server binding/config execution resolves from AppState
+and forwards targeted focus handlers over the existing canonical command path;
+commands that own their targets locally retain their direct implementation.
+Control dispatch now also handles pipe-pane, clear-history, send-prefix,
+clock-mode and set-pane-title using the same backend requests as one-shot mode.
 
-### Fourth review: malformed fields must not disappear
+### Binding compatibility
 
-The expanded independent matrix also reproduced raw/control
-`respawn-pane -k -t %bad` and `-t @1.%bad` replacing the current process.
-The permissive parser omitted the invalid id and the handler received no pane.
-The shared ingress guard now rejects malformed `%`/`@` ids and nonnumeric pane
-fields before omitted fields can drive focus or mutation, for every
-pane-scoped primary/source target and alias.
-Bare and session-qualified targets use the same rule. This also protects pane
-option writes, attributes, sends, captures, pipes and structural operations.
-Ambiguous nonnumeric dot fields in pane-scoped targets are refused; use a
-qualified stable pane id when a window/session name contains dots. Window-only
-commands keep their separate full window resolver.
+No user config or binding was edited. The canonical user .tmux.conf was
+inspected: its launcher, tag, find-window, pane-naming and session-menu bindings
+contain no explicit relative pane targets. Prompt values and shell operands
+remain data. Prefix-o's `select-pane -t :.+` resolves once to the next stable
+pane; default untargeted swaps, directional navigation, resize, zoom,
+splits and copy/paste retain their handlers. Mouse event targets are expanded
+before this resolver. Focused checks cover prefix-o at the wire and in-server
+binding entry points, default swap/rotate inverses, nested commands and mouse
+normalization. This is not a claim that every external popup/script or host
+keyboard/terminal combination was exercised.
 
-The pane matrix includes `%bad` and `@id.%bad` for every audited command and
-source on all three routes, plus dedicated bare-target respawn/option probes.
-Each refusal must leave process ids, layout, focus, options and input unchanged.
-Nested/local pure fixtures also prove malformed targets send no request and
-cannot replace a process or change options.
-
-The preceding candidate's hosted release run also exposed a timing assumption
-in the original 187-check safety fixture: killing a window's only pane first
-terminates the child, then dead-PTY cleanup removes the window. The fixture now
-waits up to five seconds for that specific private window to disappear, keeping
-the original correct-victim and active-survivor assertions. It never treats
-another window disappearing as success, and reports exit/reply/window evidence
-on a failure. Production completion/EOF semantics are unchanged.
+The old 187-check fixture now waits at most five seconds for its specific
+last-pane victim window to disappear after child termination and dead-PTY
+cleanup, keeping its original correct-victim/active-survivor assertions.
+Production completion and EOF behavior are unchanged.
 
 ## Validation and safety boundaries
 
@@ -214,7 +203,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-245 focused Rust tests passed after the pane-selector correction. They cover passive closes
+258 focused Rust tests passed after the full pane-resolution correction. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use

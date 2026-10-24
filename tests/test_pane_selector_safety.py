@@ -51,15 +51,15 @@ COMMANDS += [(command, []) for command in (
 class PaneSelectors(RelativeTargets):
     def run(self, *args, check=True):
         # The delivery harness forbids respawn entirely. This dedicated test
-        # permits only explicit relative/symbolic-target rejection probes in
+        # permits only explicit malformed-target rejection probes in
         # its own private namespace, never a concrete or default target.
         if args and args[0] in ("respawn-pane", "respawnp"):
             assert "-t" in args
             target = args[args.index("-t") + 1]
             body = target.split(':', 1)[-1]
             assert target.startswith(("alpha:", "%", "@"))
-            assert (any(s in body for s in (".+", ".-", ".!", ".{"))
-                    or body == "%bad" or body.endswith(".%bad"))
+            assert (body == "%bad" or body.endswith(".%bad")
+                    or body in (".+x", ".-x", ".{not-a-pane}", ".bad") or body.endswith(".%"))
             cmd = [self.binary, "-L", self.ns, *args]
             p = subprocess.run(cmd, env=self.env, capture_output=True, encoding="utf-8",
                                errors="replace", timeout=20)
@@ -103,8 +103,7 @@ def main():
                          "--", *test.probe_args("E")).stdout.strip()
         wait_for(lambda: "target_routing_probe" in test.run("capture-pane", "-p", "-t", f"alpha:{extra}").stdout)
         first_window = test.run("display-message", "-p", "-t", test.A, "#{window_id}").stdout.strip()
-        specs = [".+", ".-", ".+2", ".-2", ".!", ".{last}", ".{top-left}",
-                 f"{first_window}.+", f"{first_window}.-", "%bad", f"{first_window}.%bad"]
+        specs = ["%bad", f"{first_window}.%bad", ".+x", ".-x", ".{not-a-pane}", ".bad", f"{first_window}.%"]
         for route in ("cli", "raw", "control"):
             count = 0
             for spec in specs:
@@ -127,7 +126,7 @@ def main():
                     # The control parser refuses some internal/UI commands
                     # before dispatch. An explicit unknown-command error is
                     # also fail-closed; it must still preserve all state/input.
-                    assert ("unsupported relative or symbolic pane target" in reply or "invalid pane target" in reply
+                    assert ("invalid pane target" in reply
                             or route == "control" and f"parse error: unknown command: {command}" in reply), (route, command, spec, reply)
                     assert snapshot(test) == initial, (route, command, spec, "state/input changed after refusal")
                     test.cases.append(dict(route=route, command=command, args=tail, target=spec, ok=True))
@@ -160,7 +159,7 @@ def main():
                 assert active == pane_ids[start], (route, spec, "title-only selection changed focus")
                 test.cases.append(dict(route=route, command="select-pane -T resolves stable relative target", target=spec, ok=True))
                 count += 1
-            print(f"PASS {route}: {count} pane-scope cases; unsupported selectors refused, supported select attributes reach the stable target", flush=True)
+            print(f"PASS {route}: {count} pane-scope cases; malformed targets refused, supported select attributes reach the stable target", flush=True)
     except BaseException as exc:
         error = repr(exc)
         raise

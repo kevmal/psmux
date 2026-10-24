@@ -277,8 +277,14 @@ pub fn orchestrate_cross_session_join(
     let (tgt_port, tgt_key) = resolve_session(tgt_session)?;
     let src_addr = format!("127.0.0.1:{}", src_port);
 
+    // Resolve on each owning server before extraction. Parsing a relative
+    // pane here drops its selector; extraction/injection would then use the
+    // current pane. Stable identities also survive intervening focus changes.
+    let src_spec = resolve_join_pane(src_port, &src_key, src_spec)?;
+    let tgt_spec = resolve_join_pane(tgt_port, &tgt_key, tgt_spec)?;
+
     // The target window and pane must exist before anything moves.
-    validate_join_target(tgt_port, &tgt_key, &crate::cli::parse_target(tgt_spec))
+    validate_join_target(tgt_port, &tgt_key, &crate::cli::parse_target(&tgt_spec))
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
 
     // 2. Tell source to extract the pane and start forwarding
@@ -367,6 +373,18 @@ pub fn orchestrate_cross_session_join(
     }
 
     Ok(())
+}
+
+fn resolve_join_pane(port: u16, key: &str, spec: &str) -> io::Result<String> {
+    let command = crate::pane::requote_argv(&["display-message", "-p", "-t", spec, "#{pane_id}"]);
+    let response = send_to_session(port, key, &command)?;
+    let mut lines = response.lines().filter(|line| *line != "OK");
+    let id = lines.next().unwrap_or_default();
+    if lines.next().is_none() && id.strip_prefix('%').is_some_and(|id| id.parse::<usize>().is_ok()) {
+        Ok(id.to_string())
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, format!("can't resolve pane {}: {}", spec, response.trim())))
+    }
 }
 
 #[cfg(test)]

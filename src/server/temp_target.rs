@@ -13,6 +13,7 @@ use crate::types::{AppState, TempTarget};
 pub(crate) fn resolve_command_window(app: &AppState, raw: &str, index_ok: bool)
     -> Result<crate::types::WindowTarget, String>
 {
+    if matches!(raw, "=" | "{mouse}") { return Err("no mouse target for this command".into()); }
     let raw = crate::cli::strip_exact_match_prefix(raw);
     if raw.is_empty() { return Err("can't find window: ".to_string()); }
     if let Some((session, _)) = raw.split_once(':') {

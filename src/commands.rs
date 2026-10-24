@@ -2324,7 +2324,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     // whitespace split kept them: a copy mode prompt's `rename-window '%%'`
     // named the window `'TEST'`, quotes included, and `'a b'` became `'a`
     // (#789 follow up). Arms that hand `cmd` on whole are unaffected.
-    let tokens = parse_command_line(cmd);
+    let original_tokens = parse_command_line(cmd);
+    let original_parts: Vec<&str> = original_tokens.iter().map(String::as_str).collect();
+    if original_parts.is_empty() { return Ok(()); }
+    let normalized = crate::cli::normalize_pane_target_args(original_parts[0], &original_parts[1..], None,
+        |specs| crate::server::pane_target::resolve_all(app, &specs.iter().map(|spec| spec.to_string()).collect::<Vec<_>>()))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let normalized_primary = crate::cli::scoped_pane_targets(original_parts[0], &original_parts[1..], None).iter().any(|target| target.flag == 't');
+    let tokens: Vec<String> = std::iter::once(original_parts[0].to_string()).chain(normalized).collect();
+    let normalized_command = crate::pane::requote_argv(&tokens);
+    let cmd = normalized_command.as_str();
     let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
     if parts.is_empty() { return Ok(()); }
 
@@ -2332,13 +2341,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         app.status_message = Some((error.clone(), std::time::Instant::now(), None));
         return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
     }
-    // This local executor has no request/reply normalization step. The TCP
-    // routes support select-pane +/- by rewriting to %id first; local/nested
-    // execution without that step must refuse, never silently use current.
-    if crate::server::connection::select_pane_target_arg(&parts[1..])
-        .is_some_and(|target| crate::cli::relative_select_pane_target(parts[0], target)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "unsupported relative or symbolic pane target in local command (use an explicit pane id)"));
+    // Targeted local commands whose handlers act on current focus use the
+    // existing TCP executor with their resolved identity. Options and explicit
+    // two-ended operations already own their stable targets locally.
+    if normalized_primary && !matches!(parts[0], "set-option" | "set" | "show-options" | "show"
+        | "set-hook" | "show-hooks" | "paste-buffer" | "pasteb"
+        | "swap-pane" | "swapp" | "join-pane" | "joinp" | "move-pane" | "movep") {
+        if let Some(port) = app.control_port {
+            send_control_to_port(port, &format!("{}\n", cmd), &app.session_key)?;
+            return Ok(());
+        }
     }
 
     // Issue #635: this is the route menus, hooks, confirm dialogs, the command

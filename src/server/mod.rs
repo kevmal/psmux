@@ -3,6 +3,7 @@ pub(crate) mod options;
 pub(crate) mod option_catalog;
 pub(crate) mod connection;
 pub(crate) mod temp_target;
+pub(crate) mod pane_target;
 pub(crate) mod source_job;
 // #798: the shared server's only entry, behind PSMUX_SERVER_MODE.
 pub(crate) mod shared;
@@ -3936,6 +3937,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // (issue #545), never a silent fallback to the active window.
                 // The resolved form (stable ids) is what the command's own
                 // requests then carry in CtrlReq::Targeted.
+                CtrlReq::ResolvePaneTargets { specs, resp } => {
+                    let _ = resp.send(pane_target::resolve_all(&app, &specs));
+                }
                 CtrlReq::ResolveTarget { kind, spec, resp } => {
                     let result = crate::commands::resolve_in_server_target(&app, kind, &spec);
                     if let Err(ref msg) = result {

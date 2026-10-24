@@ -3975,6 +3975,11 @@ pub enum CtrlReq {
         target: String,
         resp: mpsc::Sender<Result<TempTarget, String>>,
     },
+    /// Read-only, atomic lookup of every pane endpoint before dispatch.
+    ResolvePaneTargets {
+        specs: Vec<String>,
+        resp: mpsc::Sender<Result<Vec<String>, String>>,
+    },
     KillSession,
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),

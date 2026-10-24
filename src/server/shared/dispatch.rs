@@ -439,6 +439,9 @@ pub(crate) fn dispatch(
                     let _ = resp.send(text);
                 }
                 // copied from server/mod.rs run_server (line 3676 at 86a78100)
+                CtrlReq::ResolvePaneTargets { specs, resp } => {
+                    let _ = resp.send(crate::server::pane_target::resolve_all(&app, &specs));
+                }
                 CtrlReq::ResolveTarget { kind, spec, resp } => {
                     let result = crate::commands::resolve_in_server_target(&app, kind, &spec);
                     if let Err(ref msg) = result {

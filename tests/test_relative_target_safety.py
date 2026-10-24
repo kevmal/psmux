@@ -132,7 +132,7 @@ class RelativeTargets(Contract):
             self.cases.append(dict(route=route, command="rename/options/select", target=spec, ok=True))
 
         # Supported select-pane +/- forms resolve once to a stable pane id;
-        # commands without a relative-pane resolver must refuse the syntax.
+        # display queries must use the same resolved identity.
         self.focus(session, windows, 0)
         panes = self.run("list-panes", "-t", f"{session}:{windows[0]}", "-F", "#{pane_id}").stdout.splitlines()
         assert len(panes) == 3
@@ -142,15 +142,17 @@ class RelativeTargets(Contract):
             actual = self.run("display-message", "-p", "-t", session + ":", "#{pane_id}").stdout.strip()
             assert actual == panes[wanted], (route, spec, actual, panes)
             self.cases.append(dict(route=route, command="select-pane resolves relative pane once", target=spec, ok=True))
-            # kill-pane has no relative-pane resolver. It must reject this
-            # syntax, rather than drop +/- and kill the currently active pane.
+            # A subsequent relative read resolves from the newly active pane,
+            # without changing focus or the process identities.
             before = self.run("list-panes", "-s", "-t", session + ":", "-F",
                               "#{window_id}|#{pane_id}|#{pane_pid}").stdout
-            self.invoke(route, session, "kill-pane", spec, fail=True)
+            reply = self.invoke(route, session, "display-message", spec, "-p", "#{pane_id}")
+            expected_read = panes[(wanted + (1 if spec == ".+" else -1)) % len(panes)]
+            assert expected_read in reply.splitlines(), (route, spec, reply, expected_read)
             after = self.run("list-panes", "-s", "-t", session + ":", "-F",
                              "#{window_id}|#{pane_id}|#{pane_pid}").stdout
             assert before == after, (route, spec, before, after)
-            self.cases.append(dict(route=route, command="kill-pane rejects unsupported relative pane", target=spec, ok=True))
+            self.cases.append(dict(route=route, command="relative display resolves once without focus changes", target=spec, ok=True))
         self.close_fixture(session)
         print(f"PASS {route}: rename/options/select and relative panes", flush=True)
 

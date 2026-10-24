@@ -200,11 +200,23 @@ pub(crate) fn relative_select_pane_target(command: &str, target: &str) -> bool {
     matches!(pane, "+" | "-")
 }
 
-/// Reject pane selectors that the legacy numeric parser would discard.
-/// This guard is shared by CLI, TCP/control and in-server command ingress:
-/// an unsupported relative/symbolic pane must never become the current pane.
-/// Window-only targets deliberately keep their own complete window resolver.
-pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target: Option<&str>) -> Option<String> {
+pub(crate) fn bare_pane_selector(token: &str) -> bool {
+    matches!(token, "!" | "~" | "=" | "{marked}" | "{mouse}" | "{active}" | "{current}"
+        | "{next}" | "{previous}" | "{last}" | "{up-of}" | "{down-of}" | "{left-of}" | "{right-of}"
+        | "{top}" | "{bottom}" | "{left}" | "{right}" | "{top-left}" | "{top-right}" | "{bottom-left}" | "{bottom-right}")
+        || matches!(token.to_ascii_lowercase().as_str(), "top" | "bottom" | "left" | "right" | "top-left" | "top-right" | "bottom-left" | "bottom-right")
+        || token.strip_prefix(['+', '-']).is_some_and(|n| n.is_empty() || n.parse::<u32>().is_ok_and(|n| n > 0 && n <= i32::MAX as u32))
+}
+
+/// Pane endpoints identified using each command's getopt grammar.
+pub(crate) struct PaneTargetArg<'a> {
+    pub flag: char,
+    pub value: &'a str,
+    pub token: Option<usize>,
+    pub attached: Option<usize>,
+}
+
+pub(crate) fn scoped_pane_targets<'a>(command: &str, args: &[&'a str], fallback_target: Option<&'a str>) -> Vec<PaneTargetArg<'a>> {
     let command = args_entry(command).map(|entry| entry.0).unwrap_or_else(|| canonical_command(command));
     let template = args_template(command).unwrap_or("");
     let extra = psmux_extra_flags(command);
@@ -215,6 +227,7 @@ pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target:
     // shell command, option value, title or separator is data, not a target.
     while let Some(token) = args.get(i).copied() {
         if token == "--" || token == "-" || !token.starts_with('-') { break; }
+        let token_index = i;
         i += 1;
         for (offset, flag) in token.char_indices().skip(1) {
             flags.push(flag);
@@ -226,13 +239,13 @@ pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target:
             if kind == FlagValue::None { continue; }
             let attached = &token[offset + flag.len_utf8()..];
             let value = if !attached.is_empty() {
-                Some(attached)
+                Some((attached, token_index, Some(offset + flag.len_utf8())))
             } else if let Some(next) = args.get(i).copied() {
                 if kind == FlagValue::Optional && looks_like_another_flag(next) { None }
-                else { i += 1; Some(next) }
+                else { let index = i; i += 1; Some((next, index, None)) }
             } else { None };
             if matches!(flag, 't' | 's') {
-                if let Some(value) = value { targets.push((flag, value)); }
+                if let Some((value, token, attached)) = value { targets.push(PaneTargetArg { flag, value, token: Some(token), attached }); }
             }
             break;
         }
@@ -256,12 +269,16 @@ pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target:
         | "rectangle-toggle" | "copy-yank" | "focus-in" | "focus-out")
         || (matches!(command, "set-option" | "show-options" | "set-hook" | "show-hooks") && flags.contains('p'));
     let pane_source = matches!(command, "join-pane" | "move-pane" | "swap-pane" | "break-pane" | "copy-mode");
-    let explicit_target = targets.iter().any(|(flag, _)| *flag == 't');
+    let explicit_target = targets.iter().any(|target| target.flag == 't');
     if pane_command && !explicit_target {
-        if let Some(target) = fallback_target { targets.push(('t', target)); }
+        if let Some(value) = fallback_target { targets.push(PaneTargetArg { flag: 't', value, token: None, attached: None }); }
     }
-    targets.into_iter().find_map(|(flag, target)| {
-        if !(flag == 't' && pane_command || flag == 's' && pane_source) { return None; }
+    targets.into_iter().filter(|target| target.flag == 't' && pane_command || target.flag == 's' && pane_source).collect()
+}
+
+pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target: Option<&str>) -> Option<String> {
+    scoped_pane_targets(command, args, fallback_target).into_iter().find_map(|arg| {
+        let target = if arg.value == "=" { arg.value } else { strip_exact_match_prefix(arg.value) };
         let body = target.split_once(':').map(|(_, body)| body).unwrap_or(target);
         let invalid = || Some(format!("invalid pane target: {}", target));
         // parse_target is deliberately permissive and drops malformed ids.
@@ -277,15 +294,55 @@ pub(crate) fn pane_selector_error(command: &str, args: &[&str], fallback_target:
         if let Some(id) = pane.and_then(|pane| pane.strip_prefix('%')) {
             if id.parse::<usize>().is_err() { return invalid(); }
         }
-        if selector.starts_with(['+', '-', '{']) || matches!(selector, "!" | "~" | "=") {
-            // select-pane's +/- forms are normalized to a stable %id before
-            // dispatch; this preserves the built-in prefix-o pane cycle.
-            if flag == 't' && relative_select_pane_target(command, target) && matches!(selector, "+" | "-") { return None; }
-            Some(format!("unsupported relative or symbolic pane target: {} (use an explicit pane id)", target))
-        } else if pane.is_some_and(|pane| !pane.is_empty() && !pane.starts_with('%') && pane.parse::<usize>().is_err()) {
+        if selector.starts_with(['+', '-']) {
+            let n = &selector[1..];
+            if n.is_empty() || n.parse::<u32>().is_ok_and(|n| n > 0 && n <= i32::MAX as u32) { return None; }
+            return invalid();
+        }
+        let symbolic = bare_pane_selector(selector);
+        if symbolic { None }
+        else if selector.starts_with('{') { invalid() }
+        else if pane.is_some_and(|pane| !pane.is_empty() && !pane.starts_with('%') && pane.parse::<usize>().is_err()) {
             invalid()
         } else { None }
     })
+}
+
+/// Resolve all explicit endpoints together, then replace only their flag
+/// values. Shell operands, titles, option values and -- data are preserved.
+pub(crate) fn normalize_pane_target_args<F>(command: &str, args: &[&str], fallback: Option<&str>, resolve: F) -> Result<Vec<String>, String>
+where F: FnOnce(&[&str]) -> Result<Vec<String>, String> {
+    if let Some(error) = pane_selector_error(command, args, fallback) { return Err(error); }
+    let mut targets = scoped_pane_targets(command, args, fallback);
+    let multi = matches!(command, "swap-pane" | "swapp" | "join-pane" | "joinp" | "move-pane" | "movep");
+    if multi && !targets.is_empty() {
+        for flag in ['s', 't'] {
+            if !targets.iter().any(|target| target.flag == flag) {
+                targets.push(PaneTargetArg { flag, value: "", token: None, attached: None });
+            }
+        }
+    }
+    if matches!(command, "break-pane" | "breakp") && !targets.iter().any(|target| target.flag == 's') {
+        targets.push(PaneTargetArg { flag: 's', value: "", token: None, attached: None });
+    }
+    if command == "copy-mode" && !targets.is_empty() && !targets.iter().any(|target| target.flag == 't') {
+        targets.push(PaneTargetArg { flag: 't', value: "", token: None, attached: None });
+    }
+    let mut output: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    if targets.is_empty() { return Ok(output); }
+    let specs: Vec<&str> = targets.iter().map(|target| target.value).collect();
+    let ids = resolve(&specs)?;
+    if ids.len() != targets.len() { return Err("pane target resolution did not complete".into()); }
+    let mut prefix = Vec::new();
+    for (target, id) in targets.into_iter().zip(ids) {
+        match (target.token, target.attached) {
+            (Some(token), Some(offset)) => output[token] = format!("{}{}", &args[token][..offset], id),
+            (Some(token), None) => output[token] = id,
+            (None, _) => { prefix.push(format!("-{}", target.flag)); prefix.push(id); }
+        }
+    }
+    prefix.extend(output);
+    Ok(prefix)
 }
 
 #[cfg(test)]
@@ -293,7 +350,7 @@ mod tests_pane_selector_guard {
     use super::pane_selector_error;
 
     #[test]
-    fn every_pane_command_and_alias_rejects_relative_targets() {
+    fn every_pane_command_and_alias_accepts_supported_selectors_for_resolution() {
         for cmd in ["respawn-pane", "respawnp", "resp", "kill-pane", "killp",
             "set-option", "set", "show-options", "show-option", "show",
             "select-pane", "selectp", "last-pane", "lastp", "resize-pane", "resizep",
@@ -308,9 +365,8 @@ mod tests_pane_selector_guard {
             for selector in ["s:.+", "s:.-", "s:.+2", "s:.-2", "s:.!", "s:.{last}", "s:.{top-left}", "s:@2.+", "s:0.-"] {
                 let mut args = scope.clone();
                 args.extend(["-t", selector]);
-                let rejected = !super::relative_select_pane_target(cmd, selector);
-                assert_eq!(pane_selector_error(cmd, &args, None).is_some(), rejected, "{cmd} {selector}");
-                assert_eq!(pane_selector_error(cmd, &scope, Some(selector)).is_some(), rejected, "TARGET {selector} {cmd}");
+                assert!(pane_selector_error(cmd, &args, None).is_none(), "{cmd} {selector}");
+                assert!(pane_selector_error(cmd, &scope, Some(selector)).is_none(), "TARGET {selector} {cmd}");
             }
         }
     }
@@ -318,10 +374,10 @@ mod tests_pane_selector_guard {
     #[test]
     fn source_panes_and_attached_clustered_targets_are_checked() {
         for cmd in ["swap-pane", "join-pane", "move-pane", "break-pane", "copy-mode"] {
-            assert!(pane_selector_error(cmd, &["-s", "s:.+", "-t", "s:@2.%4"], None).is_some(), "{cmd}");
-            assert!(pane_selector_error(cmd, &["-ss:.-"], None).is_some(), "{cmd}");
+            assert!(pane_selector_error(cmd, &["-s", "s:.+", "-t", "s:@2.%4"], None).is_none(), "{cmd}");
+            assert!(pane_selector_error(cmd, &["-ss:.-"], None).is_none(), "{cmd}");
         }
-        assert!(pane_selector_error("set", &["-pts:.+", "@probe", "value"], None).is_some());
+        assert!(pane_selector_error("set", &["-pts:.+", "@probe", "value"], None).is_none());
         assert!(pane_selector_error("select-pane", &["-dt", "s:.-"], None).is_none());
     }
 
@@ -349,7 +405,7 @@ mod tests_pane_selector_guard {
             "scroll-up", "scroll-down", "pane-scroll", "pane-mouse", "mouse-down",
             "mouse-down-right", "mouse-down-middle", "mouse-drag", "mouse-up",
             "mouse-up-right", "mouse-up-middle", "mouse-move", "copy-drag-begin", "mouse-key", "mouse-forward"] {
-            assert!(pane_selector_error(cmd, &[], Some("s:.+")).is_some(), "{cmd}");
+            assert!(pane_selector_error(cmd, &[], Some("s:.+")).is_none(), "{cmd}");
         }
     }
 
@@ -357,7 +413,7 @@ mod tests_pane_selector_guard {
     fn malformed_pane_and_window_fields_never_become_current_pane() {
         for command in ["respawn-pane", "kill-pane", "set-option", "select-pane", "resize-pane",
             "send-keys", "capture-pane", "pipe-pane", "display-message", "swap-pane", "join-pane", "move-pane"] {
-            for target in ["%bad", "%", "s:%bad", "s:@1.%bad", "@1.%bad", "s:@bad", "s:.bad", "s:0.%", "s:@.0", "s:@1.%2.bad"] {
+            for target in ["%bad", "%", "s:%bad", "s:@1.%bad", "@1.%bad", "s:@bad", "s:.bad", "s:0.%", "s:@.0", "s:@1.%2.bad", "=%bad", "=@1.%bad"] {
                 let args = if command == "set-option" { vec!["-p", "-t", target] } else { vec!["-t", target] };
                 assert!(pane_selector_error(command, &args, None).is_some(), "{command} {target}");
             }
@@ -365,6 +421,32 @@ mod tests_pane_selector_guard {
         for command in ["swap-pane", "join-pane", "move-pane", "break-pane", "copy-mode"] {
             assert!(pane_selector_error(command, &["-s", "%bad", "-t", "s:@1.%1"], None).is_some(), "{command}");
         }
+    }
+
+    #[test]
+    fn pane_endpoints_resolve_together_without_rewriting_data() {
+        let args = ["-s", "s:.+", "-t", "s:.-", "-d"];
+        let output = super::normalize_pane_target_args("swap-pane", &args, None, |specs| {
+            assert_eq!(specs, &["s:.+", "s:.-"]);
+            Ok(vec!["%2".into(), "%3".into()])
+        }).unwrap();
+        assert_eq!(output, ["-s", "%2", "-t", "%3", "-d"]);
+        let output = super::normalize_pane_target_args("set", &["-pt", "s:.+", "@probe", "literal -t s:.-"], None, |specs| {
+            assert_eq!(specs, &["s:.+"]);
+            Ok(vec!["%2".into()])
+        }).unwrap();
+        assert_eq!(output, ["-pt", "%2", "@probe", "literal -t s:.-"]);
+        let output = super::normalize_pane_target_args("swap-pane", &["-t", "s:.+"], None, |specs| {
+            assert_eq!(specs, &["s:.+", ""]);
+            Ok(vec!["%2".into(), "%1".into()])
+        }).unwrap();
+        assert_eq!(output, ["-s", "%1", "-t", "%2"]);
+        let output = super::normalize_pane_target_args("break-pane", &["-t", "s:9"], None, |specs| {
+            assert_eq!(specs, &[""]);
+            Ok(vec!["%2".into()])
+        }).unwrap();
+        assert_eq!(output, ["-s", "%2", "-t", "s:9"]);
+        assert!(super::normalize_pane_target_args("respawn-pane", &["-t", "%bad"], None, |_| panic!("malformed target reached resolution")).is_err());
     }
 }
 

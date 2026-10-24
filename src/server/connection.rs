@@ -505,6 +505,12 @@ fn bare_target_rewrite(
     args: &[&str],
     tx: &mpsc::Sender<CtrlReq>,
 ) -> Result<Option<Vec<String>>, String> {
+    if !crate::cli::scoped_pane_targets(cmd, args, None).is_empty() || matches!(cmd, "break-pane" | "breakp") {
+        let normalized = crate::cli::normalize_pane_target_args(cmd, args, None, |specs| {
+            resolve_pane_specs(tx, specs)
+        })?;
+        return Ok(Some(normalized));
+    }
     let end = crate::cli::outer_target_scan_end(cmd, args).min(args.len());
     let Some(i) = args[..end].iter().position(|a| *a == "-t") else { return Ok(None) };
     let Some(t) = args.get(i + 1) else { return Ok(None) };
@@ -527,6 +533,16 @@ fn bare_target_rewrite(
         _ if relative => Err("relative pane target did not resolve".into()),
         _ => Ok(None),
     }
+}
+
+fn resolve_pane_specs(tx: &mpsc::Sender<CtrlReq>, specs: &[&str]) -> Result<Vec<String>, String> {
+    if specs.iter().all(|spec| spec.strip_prefix('%').is_some_and(|id| id.parse::<usize>().is_ok())) {
+        return Ok(specs.iter().map(|spec| spec.to_string()).collect());
+    }
+    let (resp, result) = mpsc::channel();
+    tx.send(CtrlReq::ResolvePaneTargets { specs: specs.iter().map(|spec| spec.to_string()).collect(), resp })
+        .map_err(|_| "server disconnected before pane resolution".to_string())?;
+    result.recv_timeout(Duration::from_secs(60)).map_err(|_| "pane target resolution did not complete".to_string())?
 }
 
 /// Does `cmd`'s outer `-t` name a session that must be THIS server's own?
@@ -2523,12 +2539,18 @@ if control_echo || control_quiet || control_noecho {
         // bare_target_rewrite); an error is this command's %error.
         let ctrl_resolved_args: Vec<String>;
         let mut ctrl_target_err: Option<String> = None;
+        let mut ctrl_resolution_failed = false;
         let cmd_args: Vec<&str> = match bare_target_rewrite(cmd_name, &cmd_args, &tx_ctrl) {
             Ok(Some(new)) => {
                 ctrl_resolved_args = new;
                 ctrl_resolved_args.iter().map(String::as_str).collect()
             }
             Ok(None) => cmd_args,
+            Err(e) if target_can_fail(cmd_name) && !e.starts_with("invalid pane target:") => {
+                ctrl_resolution_failed = true;
+                ctrl_resolved_args = without_outer_target(cmd_name, &cmd_args).iter().map(|arg| arg.to_string()).collect();
+                ctrl_resolved_args.iter().map(String::as_str).collect()
+            }
             Err(e) => {
                 ctrl_target_err = Some(e);
                 cmd_args
@@ -2660,7 +2682,7 @@ if control_echo || control_quiet || control_noecho {
         let mut ctrl_command_target: Option<crate::types::TempTarget> = None;
         // A CMD_FIND_CANFAIL command whose -t named nothing (see the one shot
         // route's `target_failed`).
-        let mut ctrl_target_failed = false;
+        let mut ctrl_target_failed = ctrl_resolution_failed;
         // Issue #793: a `sess:...` target naming another session is
         // "can't find session" here, never this server's own panes.
         let ctrl_target_session = explicit_target_session(cmd_name, ctrl_raw_target.as_deref());
@@ -2969,7 +2991,9 @@ if line.trim().starts_with("TARGET ") {
     // Issue #558: keep the spec raw for relative pane forms, but drop the
     // tmux '=' exact-match marker so name compares in handlers (kill-session)
     // see the plain session name. parse_target strips it internally anyway.
-    global_raw_target = Some(crate::cli::strip_exact_match_prefix(target_spec).to_string());
+    // A lone '=' is the mouse target, not an empty exact-match name.
+    global_raw_target = Some(if target_spec == "=" { target_spec }
+        else { crate::cli::strip_exact_match_prefix(target_spec) }.to_string());
     let parsed = parse_target(target_spec);
     global_target_win = parsed.window;
     global_target_win_is_id = parsed.window_is_id;
@@ -3150,7 +3174,7 @@ let target_line_args: Vec<&str>;
 let probe_args: &[&str] = match global_raw_target.as_deref() {
     Some(g) if ((crate::cli::bare_target_token(g)
         && crate::commands::in_server_target_kind(cmd).is_some())
-        || crate::cli::relative_select_pane_target(cmd, g))
+        || crate::cli::scoped_pane_targets(cmd, &args, Some(g)).iter().any(|target| target.flag == 't' && target.token.is_none()))
         && !args[..crate::cli::outer_target_scan_end(cmd, &args).min(args.len())].contains(&"-t") =>
     {
         target_line_args = ["-t", g].into_iter().chain(args.iter().copied()).collect();
@@ -3159,12 +3183,24 @@ let probe_args: &[&str] = match global_raw_target.as_deref() {
     _ => &args,
 };
 let resolved_target_args: Vec<String>;
+let mut resolution_failed = false;
 let args: Vec<&str> = match bare_target_rewrite(cmd, probe_args, &tx) {
     Ok(Some(new)) => {
         resolved_target_args = new;
         resolved_target_args.iter().map(String::as_str).collect()
     }
     Ok(None) => args,
+    Err(e) if target_can_fail(cmd) && !e.starts_with("invalid pane target:") => {
+        resolution_failed = true;
+        resolved_target_args = without_outer_target(cmd, probe_args).iter().map(|arg| arg.to_string()).collect();
+        global_target_win = None;
+        global_target_win_is_id = false;
+        global_target_win_name = None;
+        global_target_pane = None;
+        global_pane_is_id = false;
+        global_raw_target = None;
+        resolved_target_args.iter().map(String::as_str).collect()
+    }
     Err(e) => {
         // An attached client sees it in the status bar (set by the server).
         if !persistent {
@@ -3336,7 +3372,7 @@ let selectp_owns_target = matches!(cmd, "select-pane" | "selectp");
 let mut command_target: Option<crate::types::TempTarget> = None;
 // A CMD_FIND_CANFAIL command whose -t named nothing: tmux runs it with an
 // empty target, so its formats expand with no session, window or pane.
-let mut target_failed = false;
+let mut target_failed = resolution_failed;
 // Issue #793: a `sess:...` target naming another session is tmux's "can't
 // find session", checked before the command touches anything.
 let target_session = explicit_target_session(cmd, raw_target.as_deref());
@@ -6919,11 +6955,12 @@ fn dispatch_control_command(
     target_failed: bool,
 ) -> bool {
     // Nested if-shell/control dispatch must obey the same guard as ingress.
-    // The outer connection normalizes supported select-pane relative targets
-    // to %id before dispatch. A nested path without that normalization fails
+    // The outer connection normalizes all supported pane targets to %id
+    // before dispatch. A nested path without that normalization fails
     // closed instead of applying a relative operation to the current pane.
-    if raw_target.is_some_and(|target| crate::cli::relative_select_pane_target(cmd, target)) {
-        let _ = resp_tx.send("\u{0001}ERR\u{0001}unsupported relative or symbolic pane target in nested dispatch".into());
+    if crate::cli::scoped_pane_targets(cmd, args, raw_target).iter()
+        .any(|target| !target.value.strip_prefix('%').is_some_and(|id| id.parse::<usize>().is_ok())) {
+        let _ = resp_tx.send("\u{0001}ERR\u{0001}pane target was not normalized before dispatch".into());
         return true;
     }
     if let Some(error) = crate::cli::pane_selector_error(cmd, args, raw_target) {
@@ -7221,6 +7258,39 @@ fn dispatch_control_command(
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(capture_print_text(text));
             }
+            true
+        }
+        "pipe-pane" | "pipep" => {
+            let input = args.contains(&"-I");
+            let output = args.contains(&"-O") || !input;
+            let toggle = args.contains(&"-o");
+            let start = args.iter().position(|arg| !matches!(*arg, "-I" | "-O" | "-o")).unwrap_or(args.len());
+            let (reply, result) = mpsc::channel();
+            let _ = tx.send(CtrlReq::PipePane(args[start..].join(" "), input, output, toggle, Some(reply)));
+            let response = result.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| "ERROR: pipe-pane did not complete".into());
+            if let Some(error) = response.strip_prefix("ERROR:") {
+                let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error.trim()));
+            } else { let _ = resp_tx.send(response); }
+            true
+        }
+        "clear-history" | "clearhist" => {
+            let _ = tx.send(CtrlReq::ClearHistory);
+            let _ = resp_tx.send(String::new());
+            true
+        }
+        "send-prefix" => {
+            let _ = tx.send(CtrlReq::SendPrefix);
+            let _ = resp_tx.send(String::new());
+            true
+        }
+        "clock-mode" => {
+            let _ = tx.send(CtrlReq::ClockMode);
+            let _ = resp_tx.send(String::new());
+            true
+        }
+        "set-pane-title" => {
+            let _ = tx.send(CtrlReq::SetPaneTitle(args.join(" ")));
+            let _ = resp_tx.send(String::new());
             true
         }
         "kill-pane" | "killp" => {
@@ -8398,7 +8468,18 @@ fn dispatch_control_command(
             for sub in crate::config::split_chained_commands_pub(chosen) {
                 let toks = parse_command_line(&sub);
                 let Some(name) = toks.first().map(|s| s.as_str()) else { continue };
-                let sub_args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+                let original_args: Vec<&str> = toks[1..].iter().map(|s| s.as_str()).collect();
+                let mut sub_resolution_failed = false;
+                let normalized = match crate::cli::normalize_pane_target_args(name, &original_args, None,
+                    |specs| resolve_pane_specs(tx.inner, specs)) {
+                    Ok(args) => args,
+                    Err(error) if target_can_fail(name) && !error.starts_with("invalid pane target:") => {
+                        sub_resolution_failed = true;
+                        without_outer_target(name, &original_args).iter().map(|arg| arg.to_string()).collect()
+                    }
+                    Err(error) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error)); return true; }
+                };
+                let sub_args: Vec<&str> = normalized.iter().map(String::as_str).collect();
                 let sub_raw = sub_args.windows(2).find(|w| w[0] == "-t").map(|w| w[1]);
                 let pt = sub_raw.map(parse_target).unwrap_or_default();
                 let filtered = without_outer_target(name, &sub_args);
@@ -8406,7 +8487,7 @@ fn dispatch_control_command(
                 // naming nothing is its error, and a good one is what its
                 // requests run against.
                 let mut sub_target: Option<crate::types::TempTarget> = None;
-                let mut sub_failed = false;
+                let mut sub_failed = sub_resolution_failed;
                 if sub_raw.is_some() {
                     let mut spec = crate::types::TempTarget::from_parsed(&pt);
                     spec.session = explicit_target_session(name, sub_raw);
@@ -8423,6 +8504,15 @@ fn dispatch_control_command(
                     }
                 }
                 let sub_tx = TargetedSender::new(tx.inner, sub_target);
+                // The outer control ingress performs focus commands before
+                // dispatch. A branch needs that same permanent selection.
+                if matches!(name, "select-pane" | "selectp")
+                    && !sub_args.iter().any(|arg| matches!(*arg, "-T" | "-P" | "-d" | "-e")) {
+                    for request in select_pane_requests(&sub_args, sub_raw, pt.window, pt.window_is_id,
+                        pt.window_name.as_deref(), pt.pane, pt.pane_is_id) {
+                        let _ = tx.inner.send(request);
+                    }
+                }
                 let (stx, srx) = mpsc::channel::<String>();
                 let answered = dispatch_control_command(
                     name, &filtered, &sub_tx, stx, pt.pane, pt.pane_is_id, sub_raw, client_id, sub_failed,

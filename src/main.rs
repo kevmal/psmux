@@ -1401,7 +1401,13 @@ fn run_main() -> io::Result<()> {
                 .map(|c| crate::cli::coerce_bare_window_target(c, target))
                 .unwrap_or_else(|| target.to_string());
             // Extract just the session name for port file lookup
-            let parsed_target = crate::cli::parse_target(&target);
+            let pane_scope_args: Vec<&str> = command_index.map(|index| args[index + 1..].iter().map(String::as_str).collect()).unwrap_or_default();
+            let pane_selector_route = command_index.is_some_and(|index| {
+                crate::cli::bare_pane_selector(&target)
+                    && crate::cli::scoped_pane_targets(&args[index], &pane_scope_args, Some(&target)).iter().any(|target| target.flag == 't')
+            });
+            let parsed_target = if pane_selector_route { crate::types::ParsedTarget::default() }
+                else { crate::cli::parse_target(&target) };
             let has_explicit_session = parsed_target.session.is_some();
             let session = parsed_target.session.unwrap_or_else(|| "default".to_string());
             // Store the full target for the server to parse, with $N resolved
