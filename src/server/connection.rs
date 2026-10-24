@@ -773,6 +773,20 @@ if control_echo || control_noecho {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
 
+        let normalized_args = match crate::cli::normalize_window_target_args(cmd_name, &cmd_args) {
+            Ok(args) => args,
+            Err(error) => {
+                let mut ws = write_lock.lock().unwrap();
+                if control_echo { let _ = writeln!(ws, "{}", trimmed); }
+                let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
+                let _ = writeln!(ws, "{}", error);
+                let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
+                let _ = ws.flush();
+                continue;
+            }
+        };
+        let cmd_args: Vec<&str> = normalized_args.iter().map(String::as_str).collect();
+
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
         let mut ctrl_target_win_is_id = false;
@@ -1045,6 +1059,18 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
+
+let normalized_args = match crate::cli::normalize_window_target_args(cmd, &args) {
+    Ok(args) => args,
+    Err(error) => {
+        if persistent { let _ = tx.send(CtrlReq::StatusMessage(error.clone())); }
+        let _ = writeln!(write_stream, "ERROR: {}", error);
+        let _ = write_stream.flush();
+        line.clear();
+        continue;
+    }
+};
+let args: Vec<&str> = normalized_args.iter().map(String::as_str).collect();
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;

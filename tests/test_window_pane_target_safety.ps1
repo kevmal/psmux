@@ -82,7 +82,7 @@ try {
     Check ($after -notmatch [regex]::Escape($victim[1] + ':')) 'pane target killed its own window'
     Check ($after -match [regex]::Escape($survivor[1] + ':survivor')) 'active survivor window remains alive'
 
-    $r = Px -Command @('rename-window', '-t', "${Session}:$($survivor[2])", 'renamed-survivor')
+    $r = Px -Command @('rename-window', "--target=${Session}:$($survivor[2])", 'renamed-survivor')
     Check ($r.Code -eq 0 -and (Windows) -match [regex]::Escape($survivor[1] + ':renamed-survivor:1')) 'rename-window resolves a pane target'
     $null = Px -Command @('rename-window', '-t', "${Session}:$($survivor[2])", 'survivor')
     foreach ($command in @('kill-pane', 'unlink-window')) {
@@ -116,20 +116,48 @@ try {
         Check ($r.Code -ne 0) "$command rejects a malformed source"
         Check ((State) -eq $before) "$command cannot substitute the active source"
     }
+    foreach ($targetFlags in @(
+        "-t${Session}:%bad", "-t=${Session}:%bad", "--target ${Session}:%bad", "--target=${Session}:%bad",
+        "-at ${Session}:%bad", "-at${Session}:%bad", "-at=${Session}:%bad",
+        "-t${Session}:%999999", '-t', '-at', '--target', '--target=', '-t=', '-1tbad', '-_tbad', '-Ztbad')) {
+        $before = State
+        $r = Px -Command (@('kill-window') + ($targetFlags -split ' '))
+        Check ($r.Code -ne 0) "CLI rejects explicit target spelling $targetFlags"
+        Check ((State) -eq $before) 'CLI target spelling cannot kill the active window'
+    }
     foreach ($control in @($false, $true)) {
+        foreach ($targetFlags in @(
+            "-t${Session}:%bad", "-t=${Session}:%bad", "--target ${Session}:%bad", "--target=${Session}:%bad",
+            "-at ${Session}:%bad", "-at${Session}:%bad", "-at=${Session}:%bad",
+            "-t${Session}:%999999", '-t', '-at', '--target', '--target=', '-t=', '-1tbad', '-_tbad', '-Ztbad')) {
+            $before = State
+            $reply = Tcp "kill-window $targetFlags" -Control:$control
+            Check ($reply -match 'ERROR:|%error ') "server rejects explicit target spelling $targetFlags (control=$control)"
+            Check ((State) -eq $before) "target spelling cannot kill the active window (control=$control)"
+        }
         foreach ($command in @('kill-window', 'kill-pane', 'select-window', 'rename-window', 'respawn-window', 'unlink-window', 'rotate-window', 'select-layout', 'next-layout', 'previous-layout', 'set-window-option')) {
             $before = State
             $tail = if ($command -eq 'rename-window') { ' WRONG' } else { '' }
             if ($command -eq 'set-window-option') { $tail = ' @window-target-probe WRONG' }
-            $reply = Tcp "$command -t ${Session}:%bad$tail" -Control:$control
+            $reply = Tcp "$command -t${Session}:%bad$tail" -Control:$control
             Check ($reply -match 'ERROR:|%error ') "server rejects malformed pane for $command (control=$control)"
             Check ((State) -eq $before) "server preserves all state after $command failure (control=$control)"
+        }
+        foreach ($command in @('move-window', 'swap-window', 'link-window')) {
+            foreach ($sourceFlags in @("-s${Session}:%bad", "--source=${Session}:%bad", "-ds${Session}:%bad", '-s')) {
+                $before = State
+                $destination = if ($sourceFlags -eq '-s') { '' } else { " --target=${Session}:9" }
+                $reply = Tcp "$command $sourceFlags$destination" -Control:$control
+                Check ($reply -match 'ERROR:|%error ') "server rejects source spelling $sourceFlags for $command (control=$control)"
+                Check ((State) -eq $before) "$command cannot substitute an active source (control=$control)"
+            }
         }
         $r = Px -Command @('new-window', '-d', '-t', $Session, '-n', 'socket-victim', 'cmd.exe /k')
         if ($r.Code -ne 0) { throw $r.Output }
         $panes = Px -Command @('list-panes', '-s', '-t', $Session, '-F', '#{window_name}|#{window_id}|#{pane_id}')
         $victim = ($panes.Output -split "`r?`n" | Where-Object { $_ -like 'socket-victim|*' }) -split '\|'
-        $reply = Tcp "kill-window -t ${Session}:$($victim[2])" -Control:$control
+        $flags = if ($control) { "--target=${Session}:$($victim[2])" } else { "-t${Session}:$($victim[2])" }
+        $reply = Tcp "kill-window $flags" -Control:$control
         Check ($reply -notmatch 'ERROR:|%error ') "server accepts pane target (control=$control)"
         $after = Windows
         Check ($after -notmatch [regex]::Escape($victim[1] + ':')) "server kills only pane's window (control=$control)"

@@ -643,11 +643,18 @@ fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
     // first would mis-split `-L=foo` into `-L` + `=foo`.
-    let args: Vec<String> = crate::cli::normalize_attached_target_flag(
+    let mut args: Vec<String> = crate::cli::normalize_attached_target_flag(
         crate::cli::normalize_attached_global_args(
             crate::cli::normalize_flag_equals(env::args().collect()),
         ),
     );
+    if let Some(command) = process_command_index(&args) {
+        let normalized = crate::cli::normalize_window_target_args(&args[command],
+            &args[command + 1..].iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        args.truncate(command + 1);
+        args.extend(normalized);
+    }
     
     // Set console code page to UTF-8 early so ALL output paths (CLI commands
     // like capture-pane, list-sessions, display-message, etc.) correctly
