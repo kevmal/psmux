@@ -153,6 +153,79 @@ pub fn normalize_attached_target_flag(args: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Canonicalize window-command targets at every external boundary, including
+/// raw/control clients which do not pass through main's argv normalization.
+/// Never let an unrecognized explicit target turn into an untargeted mutation.
+pub fn normalize_window_target_args(command: &str, args: &[&str]) -> Result<Vec<String>, String> {
+    let (value_flags, boolean_flags, options_command) = match command {
+        "kill-window" | "killw" | "kill-pane" | "killp" => ("t", "a", false),
+        "select-window" | "selectw" => ("t", "lnp", false),
+        "rename-window" | "renamew" | "next-layout" | "nextl"
+        | "previous-layout" | "prevl" => ("t", "", false),
+        "unlink-window" | "unlinkw" => ("t", "k", false),
+        "rotate-window" | "rotatew" => ("t", "DU", false),
+        "select-layout" | "selectl" => ("t", "Enop", false),
+        "respawn-window" | "respawnw" => ("tce", "k", false),
+        "link-window" | "linkw" => ("st", "abdk", false),
+        "move-window" | "movew" => ("st", "abdkr", false),
+        "swap-window" | "swapw" => ("st", "d", false),
+        "resize-window" | "resizew" => ("txy", "aADLRU", false),
+        "set-option" | "set" | "set-window-option" | "setw" => ("t", "aFgopqsuUw", true),
+        "show-options" | "show" | "show-option"
+        | "show-window-options" | "showw" | "show-window-option" => ("t", "Agpqsvw", true),
+        _ => return Ok(args.iter().map(|s| s.to_string()).collect()),
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--" || (options_command && !arg.starts_with('-')) {
+            out.extend(args[i..].iter().map(|s| s.to_string()));
+            break;
+        }
+        let long = arg.strip_prefix("--");
+        let option = if let Some(long) = long {
+            let (flag, attached) = long.split_once('=').map(|(f, v)| (f, Some(v)))
+                .unwrap_or((long, None));
+            let flag = match flag {
+                "target" => 't',
+                "source" if value_flags.contains('s') => 's',
+                _ => return Err(format!("unknown flag: {}", arg)),
+            };
+            Some((flag, String::new(), attached))
+        } else if arg.starts_with('-') {
+            let mut option = None;
+            for (offset, flag) in arg.char_indices().skip(1) {
+                if value_flags.contains(flag) {
+                    let tail = &arg[offset + 1..];
+                    option = Some((flag, arg[1..offset].to_string(),
+                        (!tail.is_empty()).then(|| tail.strip_prefix('=').unwrap_or(tail))));
+                    break;
+                }
+                if !boolean_flags.contains(flag) { return Err(format!("unknown flag: -{}", flag)); }
+            }
+            option
+        } else { None };
+        if let Some((flag, prefix, attached)) = option {
+            let value = match attached {
+                Some(value) => value,
+                None => {
+                    i += 1;
+                    args.get(i).copied().ok_or_else(|| format!("-{} requires a value", flag))?
+                }
+            };
+            if value.is_empty() { return Err(format!("-{} requires a value", flag)); }
+            if !prefix.is_empty() { out.push(format!("-{}", prefix)); }
+            out.push(format!("-{}", flag));
+            out.push(value.to_string());
+        } else {
+            out.push(arg.to_string());
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
 pub fn deferred_command_start<S: AsRef<str>>(command: &str, args: &[S]) -> Option<usize> {
     let value_options: &[&str] = match command {
         "bind-key" | "bind" => &["-T"],
@@ -1011,3 +1084,7 @@ mod tests_issue558_eq_prefix;
 #[cfg(test)]
 #[path = "../tests-rs/test_discussion571_attached_global_args.rs"]
 mod tests_discussion571_attached_global_args;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_window_target_args.rs"]
+mod tests_window_target_args;

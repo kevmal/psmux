@@ -182,6 +182,16 @@ fn cli_pane_index_exists(idx_spec: &str) -> Option<bool> {
     if any { Some(false) } else { None }
 }
 
+/// Window mutations need the server's result, including raw target validation
+/// that the CLI cannot perform (and targets that went stale after its probe).
+fn send_control_checked(line: String) -> io::Result<()> {
+    let response = crate::session::send_control_with_response(line)?;
+    if let Some(error) = response.trim().strip_prefix("ERROR:") {
+        return Err(io::Error::new(io::ErrorKind::Other, error.trim().to_string()));
+    }
+    Ok(())
+}
+
 /// Returns Some(true)/Some(false) for whether pane index `idx_spec` exists in
 /// the window identified by `window_spec` (@id, index, or name), or None when
 /// the server could not be queried. Uses `list-panes -a` so every row carries
@@ -633,11 +643,18 @@ fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
     // first would mis-split `-L=foo` into `-L` + `=foo`.
-    let args: Vec<String> = crate::cli::normalize_attached_target_flag(
+    let mut args: Vec<String> = crate::cli::normalize_attached_target_flag(
         crate::cli::normalize_attached_global_args(
             crate::cli::normalize_flag_equals(env::args().collect()),
         ),
     );
+    if let Some(command) = process_command_index(&args) {
+        let normalized = crate::cli::normalize_window_target_args(&args[command],
+            &args[command + 1..].iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        args.truncate(command + 1);
+        args.extend(normalized);
+    }
     
     // Set console code page to UTF-8 early so ALL output paths (CLI commands
     // like capture-pane, list-sessions, display-message, etc.) correctly
@@ -2110,7 +2127,7 @@ fn run_main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            "kill-pane" | "killp" => { send_control("kill-pane\n".to_string())?; return Ok(()); }
+            "kill-pane" | "killp" => { send_control_checked("kill-pane\n".to_string())?; return Ok(()); }
             "capture-pane" | "capturep" => {
                 // Parse optional flags - cmd_args[0] is command, start from 1
                 let mut cmd = "capture-pane".to_string();
@@ -2313,7 +2330,7 @@ fn run_main() -> io::Result<()> {
                 // it covers the ':' window form this arm used to check plus
                 // the pane forms it never did.
                 cmd.push('\n');
-                send_control(cmd)?;
+                send_control_checked(cmd)?;
                 return Ok(());
             }
             // list-panes - List all panes
@@ -3300,7 +3317,7 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 cmd.push('\n');
-                send_control(cmd)?;
+                send_control_checked(cmd)?;
                 return Ok(());
             }
             // display-panes - Show pane numbers
@@ -3446,7 +3463,7 @@ fn run_main() -> io::Result<()> {
                 // cmd_args[0] is the command, cmd_args[1] should be the new name
                 if let Some(name) = cmd_args.get(1) {
                     if !name.starts_with('-') {
-                        send_control(format!("rename-window {}\n", crate::util::quote_arg(name)))?;
+                        send_control_checked(format!("rename-window {}\n", crate::util::quote_arg(name)))?;
                     }
                 }
                 return Ok(());
@@ -3790,7 +3807,7 @@ fn run_main() -> io::Result<()> {
                     }
                     return Ok(());
                 }
-                match send_control(format!("{}\n", cmd_str)) {
+                match send_control_checked(format!("{}\n", cmd_str)) {
                     Ok(()) => {},
                     Err(e) if e.to_string().contains("no session") => {
                         eprintln!("warning: no active session; option will take effect when set inside a session or via config file");
@@ -4002,13 +4019,13 @@ fn run_main() -> io::Result<()> {
                 }
                 
                 if next {
-                    send_control("next-layout\n".to_string())?;
+                    send_control_checked("next-layout\n".to_string())?;
                 } else if prev {
-                    send_control("previous-layout\n".to_string())?;
+                    send_control_checked("previous-layout\n".to_string())?;
                 } else if let Some(l) = layout {
-                    send_control(format!("select-layout {}\n", l))?;
+                    send_control_checked(format!("select-layout {}\n", l))?;
                 } else {
-                    send_control("select-layout\n".to_string())?;
+                    send_control_checked("select-layout\n".to_string())?;
                 }
                 return Ok(());
             }
@@ -4413,12 +4430,12 @@ fn run_main() -> io::Result<()> {
             }
             // next-layout - Cycle to next layout
             "next-layout" => {
-                send_control("next-layout\n".to_string())?;
+                send_control_checked("next-layout\n".to_string())?;
                 return Ok(());
             }
             // previous-layout - Cycle to previous layout
             "previous-layout" => {
-                send_control("previous-layout\n".to_string())?;
+                send_control_checked("previous-layout\n".to_string())?;
                 return Ok(());
             }
             // choose-tree / choose-window / choose-session — interactive TUI choosers.
@@ -4666,7 +4683,7 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 cmd.push('\n');
-                send_control(cmd)?;
+                send_control_checked(cmd)?;
                 return Ok(());
             }
             // customize-mode - tmux 3.2+ customize mode
@@ -4683,18 +4700,18 @@ fn run_main() -> io::Result<()> {
             }
             // respawn-window - Respawn active pane in window
             "respawn-window" | "respawnw" => {
-                send_control("respawn-window\n".to_string())?;
+                send_control_checked("respawn-window\n".to_string())?;
                 return Ok(());
             }
             // link-window - Link a window
             "link-window" | "linkw" => {
                 let full = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
-                send_control(format!("{}\n", full))?;
+                send_control_checked(format!("{}\n", full))?;
                 return Ok(());
             }
             // unlink-window - Unlink a window
             "unlink-window" | "unlinkw" => {
-                send_control("unlink-window\n".to_string())?;
+                send_control_checked("unlink-window\n".to_string())?;
                 return Ok(());
             }
             _ => {

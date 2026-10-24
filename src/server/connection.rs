@@ -200,6 +200,54 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].to_string())
 }
 
+/// Shared by one-shot and control mode. Keep the raw target until the server
+/// can resolve it atomically with the operation; parse_target's absent window
+/// does NOT mean that an explicit pane target denotes the active window.
+fn window_target_request(cmd: &str, args: &[&str], raw: Option<&str>)
+    -> Option<(CtrlReq, mpsc::Receiver<Result<(), String>>)>
+{
+    let (resp, rx) = mpsc::channel();
+    if matches!(cmd, "link-window" | "linkw") {
+        return Some((CtrlReq::LinkWindowTarget {
+            src: flag_value(args, "-s"), dst: raw.map(str::to_string), resp,
+        }, rx));
+    }
+    let target = raw?.to_string();
+    if matches!(cmd, "kill-window" | "killw") {
+        return Some((CtrlReq::KillWindowTarget { target, resp }, rx));
+    }
+    let request = match cmd {
+        "rename-window" | "renamew" => CtrlReq::RenameWindow(args.first()?.to_string()),
+        "respawn-window" | "respawnw" => CtrlReq::RespawnWindow,
+        "unlink-window" | "unlinkw" => CtrlReq::UnlinkWindow,
+        "rotate-window" | "rotatew" => CtrlReq::RotateWindow(args.contains(&"-D")),
+        "select-layout" | "selectl" => CtrlReq::SelectLayout(
+            args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"tiled").to_string()),
+        "next-layout" | "nextl" => CtrlReq::NextLayout,
+        "previous-layout" | "prevl" => CtrlReq::PrevLayout,
+        "select-window" | "selectw" => {
+            if args.contains(&"-n") { CtrlReq::NextWindow }
+            else if args.contains(&"-p") { CtrlReq::PrevWindow }
+            else if args.contains(&"-l") { CtrlReq::LastWindow }
+            else { CtrlReq::SelectWindow(0) } // resolved server-side
+        }
+        "kill-pane" | "killp" => CtrlReq::KillPane,
+        _ => return None,
+    };
+    Some((CtrlReq::WindowTargetCommand { target, request: Box::new(request), resp }, rx))
+}
+
+fn window_target_result(rx: mpsc::Receiver<Result<(), String>>) -> Result<(), String> {
+    rx.recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| Err("targeted command timed out".to_string()))
+}
+
+fn targets_window_options(cmd: &str, args: &[&str]) -> bool {
+    matches!(cmd, "set-window-option" | "setw" | "show-window-options" | "showw" | "show-window-option")
+        || (matches!(cmd, "set-option" | "set" | "show-options" | "show")
+            && crate::cli::has_short_flag(args, 'w'))
+}
+
 fn requote_command_tail(args: &[&str]) -> String {
     args.iter().map(|t| {
         if t.is_empty() {
@@ -725,6 +773,20 @@ if control_echo || control_noecho {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
 
+        let normalized_args = match crate::cli::normalize_window_target_args(cmd_name, &cmd_args) {
+            Ok(args) => args,
+            Err(error) => {
+                let mut ws = write_lock.lock().unwrap();
+                if control_echo { let _ = writeln!(ws, "{}", trimmed); }
+                let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
+                let _ = writeln!(ws, "{}", error);
+                let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
+                let _ = ws.flush();
+                continue;
+            }
+        };
+        let cmd_args: Vec<&str> = normalized_args.iter().map(String::as_str).collect();
+
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
         let mut ctrl_target_win_is_id = false;
@@ -756,6 +818,8 @@ if control_echo || control_noecho {
 
         let filtered_args = without_outer_target(cmd_name, &cmd_args);
 
+        let targeted_window = window_target_request(cmd_name, &filtered_args, ctrl_raw_target.as_deref());
+
         // Apply target focus
         // tmux parity (#592): select-pane -T/-P is title/style-only (see the
         // one-shot path below) — route it through the validated temp focus
@@ -781,7 +845,9 @@ if control_echo || control_noecho {
         let ctrl_capture_by_id = matches!(cmd_name, "capture-pane" | "capturep") && ctrl_pane_is_id && ctrl_target_pane.is_some();
         let skip_pane_focus = matches!(cmd_name, "display-message" | "display" | "swap-pane" | "swapp") || skip_target_focus || ctrl_capture_by_id;
         let mut focus_err: Option<String> = None;
-        if is_focus_cmd {
+        if targeted_window.is_some() {
+            // Resolution and dispatch happen together below.
+        } else if is_focus_cmd {
             if let Some(wid) = ctrl_target_win {
                 if ctrl_target_win_is_id {
                     let _ = tx_ctrl.send(CtrlReq::FocusWindowById(wid));
@@ -804,9 +870,11 @@ if control_echo || control_noecho {
             // instead of silently executing against the active window.
             let want_win = (ctrl_target_win.is_some() || ctrl_target_win_name.is_some()) && !skip_target_focus;
             let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
-            if want_win || want_pane {
+            let window_target = ctrl_raw_target.clone().filter(|_| targets_window_options(cmd_name, &filtered_args));
+            if want_win || want_pane || window_target.is_some() {
                 let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
                 let _ = tx_ctrl.send(CtrlReq::FocusTargetTemp {
+                    window_target,
                     win: if want_win { ctrl_target_win } else { None },
                     win_is_id: ctrl_target_win_is_id,
                     win_name: if want_win { ctrl_target_win_name.clone() } else { None },
@@ -814,7 +882,8 @@ if control_echo || control_noecho {
                     pane_is_id: ctrl_pane_is_id,
                     resp: focus_s,
                 });
-                if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
+                if let Err(e) = focus_r.recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| Err("target lookup timed out".to_string())) {
                     focus_err = Some(e);
                 }
             }
@@ -822,7 +891,14 @@ if control_echo || control_noecho {
 
         // Dispatch command (use a oneshot for the response)
         let (resp_s, resp_r) = mpsc::channel::<String>();
-        let response_result = if let Some(err) = focus_err {
+        let response_result = if let Some((request, rx)) = targeted_window {
+            let result = tx_ctrl.send(request).map_err(|_| "server disconnected".to_string())
+                .and_then(|_| window_target_result(rx));
+            Some(Ok(match result {
+                Ok(()) => String::new(),
+                Err(e) => format!("\u{0001}ERR\u{0001}{}", e),
+            }))
+        } else if let Some(err) = focus_err {
             // Unresolvable -t target: skip dispatch entirely and surface
             // the diagnostic through the %error path (sentinel encoding,
             // same as dispatcher-signalled errors).
@@ -984,6 +1060,18 @@ loop {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
 
+let normalized_args = match crate::cli::normalize_window_target_args(cmd, &args) {
+    Ok(args) => args,
+    Err(error) => {
+        if persistent { let _ = tx.send(CtrlReq::StatusMessage(error.clone())); }
+        let _ = writeln!(write_stream, "ERROR: {}", error);
+        let _ = write_stream.flush();
+        line.clear();
+        continue;
+    }
+};
+let args: Vec<&str> = normalized_args.iter().map(String::as_str).collect();
+
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;
 let mut target_win_is_id: bool = global_target_win_is_id;
@@ -1015,6 +1103,16 @@ while i < target_scan_end {
 }
 // Remove this command's target while retaining targets in deferred commands.
 let args = without_outer_target(cmd, &args);
+if let Some((request, rx)) = window_target_request(cmd, &args, raw_target.as_deref()) {
+    let result = tx.send(request).map_err(|_| "server disconnected".to_string())
+        .and_then(|_| window_target_result(rx));
+    if let Err(e) = result {
+        let _ = writeln!(write_stream, "ERROR: {}", e);
+        let _ = write_stream.flush();
+    }
+    line.clear();
+    continue;
+}
 // tmux parity (#592): `select-pane -T`/`-P` is a title/style-only
 // operation — tmux's cmd-select-pane.c sets the title and returns
 // before any activation. Classify it as a NON-focus command so it takes
@@ -1077,9 +1175,11 @@ if is_focus_cmd {
     // into it, capture-pane read it) at rc=0.
     let want_win = (target_win.is_some() || target_win_name.is_some()) && !skip_target_focus;
     let want_pane = target_pane.is_some() && !skip_pane_focus && targeted_kill_pane_id.is_none();
-    if want_win || want_pane {
+    let window_target = raw_target.clone().filter(|_| targets_window_options(cmd, &args));
+    if want_win || want_pane || window_target.is_some() {
         let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
         let _ = tx.send(CtrlReq::FocusTargetTemp {
+            window_target,
             win: if want_win { target_win } else { None },
             win_is_id: target_win_is_id,
             win_name: if want_win { target_win_name.clone() } else { None },
@@ -1087,7 +1187,8 @@ if is_focus_cmd {
             pane_is_id,
             resp: focus_s,
         });
-        if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
+        if let Err(e) = focus_r.recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|_| Err("target lookup timed out".to_string())) {
             // Unresolvable target: report (tmux: "can't find window: X",
             // exit 1, zero side effects) and skip the command entirely.
             let _ = writeln!(write_stream, "ERROR: {}", e);
@@ -1726,29 +1827,8 @@ match cmd {
         if !persistent { break; }
     }
     "kill-window" | "killw" => {
-        // Resolve the -t target server-side. The generic temp-focus block is
-        // skipped for kill-window (see skip_target_focus): focusing a target
-        // that fails to resolve silently left the PREVIOUS window focused and
-        // the bare KillWindow then killed it — `kill-window -t sess:typo`
-        // destroyed whatever was active (tmux: "can't find window", no kill).
-        if target_win.is_some() || target_win_name.is_some() {
-            let (resp_s, resp_r) = mpsc::channel();
-            let _ = tx.send(CtrlReq::KillWindowTarget {
-                win: target_win,
-                win_is_id: target_win_is_id,
-                name: target_win_name.clone(),
-                resp: resp_s,
-            });
-            if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
-                // persistent clients see it in the status bar (set server-side)
-            }
-        } else {
-            let _ = tx.send(CtrlReq::KillWindow);
-        }
+        // Explicit targets were dispatched atomically above.
+        let _ = tx.send(CtrlReq::KillWindow);
     }
     "kill-session" | "kill-ses" => {
         // If -t <target> is given, kill that session instead of self.
@@ -4149,29 +4229,9 @@ fn dispatch_control_command(
             true
         }
         "kill-window" | "killw" => {
-            // Resolve any -t target server-side and error on a miss instead
-            // of killing the active window (same fix as the one-shot path).
-            let parsed = raw_target.map(parse_target);
-            let (t_win, t_win_is_id, t_name) = match parsed {
-                Some(pt) => (pt.window, pt.window_is_id, pt.window_name),
-                None => (None, false, None),
-            };
-            if t_win.is_some() || t_name.is_some() {
-                let (resp_s, resp_r) = mpsc::channel();
-                let _ = tx.send(CtrlReq::KillWindowTarget {
-                    win: t_win,
-                    win_is_id: t_win_is_id,
-                    name: t_name,
-                    resp: resp_s,
-                });
-                match resp_r.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
-                    _ => { let _ = resp_tx.send(String::new()); }
-                }
-            } else {
-                let _ = tx.send(CtrlReq::KillWindow);
-                let _ = resp_tx.send(String::new());
-            }
+            // Explicit targets were dispatched atomically by the caller.
+            let _ = tx.send(CtrlReq::KillWindow);
+            let _ = resp_tx.send(String::new());
             true
         }
         "unlink-window" | "unlinkw" => {

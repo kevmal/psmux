@@ -91,6 +91,19 @@ fn parses_session_qualified_window_id() {
 }
 
 #[test]
+fn malformed_window_targets_cannot_resize_the_current_window() {
+    let mut app = app_with_two_windows();
+    let original = app.windows[0].area;
+    for raw in ["test:%bad", "test:@bad", "test:.%bad", "test:@3.%bad"] {
+        let result = parse_resize_window(&["-x", "120"], Some(raw))
+            .and_then(|request| apply_resize_window(&mut app, &request));
+        assert!(result.is_err(), "{raw}");
+        assert_eq!(app.windows[0].area, original);
+    }
+    assert_eq!(target_from_raw(Some("my.session")), Ok(WindowTarget::Current));
+}
+
+#[test]
 fn parses_tmux_adjustment_flags_with_priority() {
     let request = parse_resize_window(&["-DR", "5"], None).unwrap();
     assert_eq!(request.direction, Some(ResizeDirection::Right));

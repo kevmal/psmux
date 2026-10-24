@@ -1278,6 +1278,31 @@ impl AppState {
         let missing = || format!("can't find window: {}", body);
         if self.windows.is_empty() { return Err(missing()); }
         let last_pos = self.windows.len() - 1;
+        // Pane IDs identify their containing window. Do not discard this part
+        // of the target and turn a failed lookup into the current window.
+        if let Some(id) = body.strip_prefix('%') {
+            let id = id.parse::<usize>().map_err(|_| missing())?;
+            return crate::tree::find_pane_by_id_global(self, id)
+                .map(|(pos, _)| WindowTarget::Pos(pos)).ok_or_else(missing);
+        }
+        if let Some((window, pane)) = body.rsplit_once('.') {
+            if window.is_empty() || pane.starts_with('%') || pane.parse::<usize>().is_ok() {
+                if window.is_empty() && pane.starts_with('%') {
+                    return self.resolve_window_spec(pane, false);
+                }
+                let pos = self.resolve_window_spec(window, false)?.pos().ok_or_else(missing)?;
+                let found = if let Some(id) = pane.strip_prefix('%') {
+                    id.parse::<usize>().ok()
+                        .and_then(|id| crate::tree::find_pane_by_id_global(self, id))
+                        .map(|(owner, _)| owner == pos).unwrap_or(false)
+                } else {
+                    pane.parse::<usize>().ok()
+                        .map(|p| p < crate::tree::count_panes(&self.windows[pos].root))
+                        .unwrap_or(false)
+                };
+                return if found { Ok(WindowTarget::Pos(pos)) } else { Err(missing()) };
+            }
+        }
         // `sess:` with nothing after it (and a bare `-t sess`) means the
         // session's current window.
         if body.is_empty() { return Ok(WindowTarget::Pos(self.active_idx.min(last_pos))); }
@@ -1798,6 +1823,9 @@ pub enum CtrlReq {
     /// carries a window-name target. `pane` carries a %id when `pane_is_id`
     /// is set, otherwise a positional pane index within the target window.
     FocusTargetTemp {
+        /// Window-option commands retain their raw target even when parsing
+        /// produced no window/pane fields (for example `session:%bad`).
+        window_target: Option<String>,
         win: Option<usize>,
         win_is_id: bool,
         win_name: Option<String>,
@@ -1912,13 +1940,17 @@ pub enum CtrlReq {
     KillWindow,
     /// kill-window with an explicit window target. The server resolves the
     /// target itself and reports an unresolvable one as an error instead of
-    /// killing whatever window happens to be active (tmux parity: tmux says
-    /// "can't find window: X" and kills nothing). `win` carries an index or,
-    /// when `win_is_id` is set, an @id; `name` carries a window-name target.
+    /// killing whatever window happens to be active. The RAW target retains
+    /// pane IDs and invalid syntax, so neither can become an untargeted kill.
     KillWindowTarget {
-        win: Option<usize>,
-        win_is_id: bool,
-        name: Option<String>,
+        target: String,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// Resolve an explicit target and execute its operation in the SAME server
+    /// turn. A failed parse/lookup must never become an active-window command.
+    WindowTargetCommand {
+        target: String,
+        request: Box<CtrlReq>,
         resp: mpsc::Sender<Result<(), String>>,
     },
     KillSession,
@@ -2063,6 +2095,11 @@ pub enum CtrlReq {
     },
     /// link-window: (source window index, target insertion index)
     LinkWindow(Option<usize>, Option<usize>),
+    LinkWindowTarget {
+        src: Option<String>,
+        dst: Option<String>,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     UnlinkWindow,
     /// Set session group (used by new-session -t)
     SetSessionGroup(String),
