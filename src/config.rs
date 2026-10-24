@@ -1731,18 +1731,6 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
     let window_scope = window_command || flags.contains('w');
     let pane_scope = flags.contains('p');
     let mut target = parsed.target.map(strip_wrapping_quotes).unwrap_or_default().to_string();
-    if !is_global && !target.is_empty() && (pane_scope || window_scope) {
-        let resolved = if pane_scope {
-            crate::server::pane_target::resolve_pane(app, &target).map(|id| format!("%{}", id))
-        } else {
-            crate::server::temp_target::resolve_window_command_target(app, &target)
-                .and_then(|target| target.win.map(|id| format!("@{}", id)).ok_or_else(|| "no current window".to_string()))
-        };
-        match resolved {
-            Ok(id) => target = id,
-            Err(error) => { warn_config(app, error); return; }
-        }
-    }
 
     if i >= toks.len() { warn_config(app, "set-option requires an option name"); return; }
 
@@ -1771,6 +1759,19 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
     {
         warn_config(app, error);
         return;
+    }
+
+    if !is_global && !target.is_empty() && (pane_scope || window_scope) {
+        let resolved = if pane_scope {
+            crate::server::pane_target::resolve_pane(app, &target).map(|id| format!("%{}", id))
+        } else {
+            crate::server::temp_target::resolve_window_command_target(app, &target)
+                .and_then(|target| target.win.map(|id| format!("@{}", id)).ok_or_else(|| "no current window".to_string()))
+        };
+        match resolved {
+            Ok(id) => target = id,
+            Err(error) => { warn_config(app, error); return; }
+        }
     }
 
     // #728: `-p` writes the target PANE's own table, through the same writer

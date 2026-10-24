@@ -195,7 +195,9 @@ a long target before ordinary dispatch saw it.
 
 Internal pane extensions without a tmux catalog template use the same
 target/source grammar for argument validation as for canonicalization.
-Unknown long targets and missing -t arguments therefore fail before zoom,
+Config option-name and scope errors retain their established diagnostic
+precedence before read-only target lookup. Unknown long targets and missing
+-t arguments fail before zoom,
 input or other internal requests can mutate current state.
 
 --target and --source (separate or =value) are compatible aliases of -t/-s
@@ -253,7 +255,7 @@ must still arrive exactly once in only the intended panes.
 `--probe-open-pr7` is a focused regression: it reports the requested and
 remaining pane ids and now asserts that the correct window was removed.
 
-665 focused Rust checks passed after the getopt and raw-tail corrections. They cover passive closes
+666 focused Rust checks passed after the getopt and raw-tail corrections. They cover passive closes
 (including warm claim and factored
 exchange), pending-read classification, stable-target wrapping/restore,
 profile/shim precedence, compiled defaults and option reset parity. They use
