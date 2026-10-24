@@ -87,15 +87,18 @@ rebind the prefix, the new key is bound to `send-prefix` for you.
 | `Prefix + w` | Interactive session/window/pane chooser (`choose-tree`) |
 | `Prefix + &` | Kill current window (with confirmation) |
 | `Prefix + ,` | Rename current window |
-| `Prefix + '` | Prompt for window index (jump to any window) |
+| `Prefix + '` | Prompt for a window index or name and select it (`select-window -t ':%%'`, as tmux) |
+| `Prefix + .` | Prompt for an index and move the current window there (`move-window`) |
 | `Prefix + 0-9` | Select window by number |
 
-**Gotcha: `select-window-index` is not a real command.** `Prefix + '` is bound to
-`select-window-index`, which looks like a command but is a client only pseudo command. It exists
-solely so the client can open the window index prompt. It is not accepted by any command dispatcher,
-so `psmux select-window-index` fails with "unknown command", and it cannot be used from a config
-line, from a hook, or from `run-shell`. Rebinding another key to it does work, because key bindings
-go through the client.
+`Prefix + '` is bound to `command-prompt -T window-target -p index "select-window -t ':%%'"`, as in
+tmux, so the prompt has the same editing keys and history as any other prompt.
+
+**Gotcha: `select-window-index` is not a real command.** Before #821 `Prefix + '` was bound to
+`select-window-index`, a client only name for a window index box of the client's own. A key bound
+to that name still opens the prompt above, so a config that binds it keeps working, but no command
+dispatcher accepts it: `psmux select-window-index` fails with "unknown command", and it cannot be
+used from a config line, from a hook, or from `run-shell`.
 
 ### Pane Splitting
 
@@ -190,26 +193,36 @@ so muscle memory carries over.
 
 | Key | Action |
 |-----|--------|
-| `Up` / `k` / `h` | Move selection up |
-| `Down` / `j` / `l` | Move selection down |
+| `Up` / `k` / `C-p` | Move selection up |
+| `Down` / `j` / `C-n` | Move selection down |
+| `Left` / `h` / `-` | choose-tree: collapse the selected row (or its parent). choose-session: move up |
+| `Right` / `l` / `+` | choose-tree: expand the selected row. choose-session: move down |
 | `g` / `Home` | Jump to first entry |
 | `G` / `End` | Jump to last entry |
-| `PageUp` / `PageDown` | Move selection by 10 rows |
-| `1`..`9`, `0` | Append digit to the jump buffer (Enter consumes it) |
+| `PageUp` / `PageDown` / `C-b` / `C-f` | Move selection by one page (the height of the list) |
+| `0`..`9`, `M-a`.. | choose-tree: jump to that line and switch at once |
+| `1`..`9`, `0` | choose-session: append digit to the jump buffer (Enter consumes it) |
 | `Backspace` | Edit the jump buffer |
-| `Enter` | Switch to the selected entry (or to the jump buffer index if non-empty) |
+| `Enter` | Switch to the selected entry (or to the jump buffer index if non-empty). A window or pane of another session switches to that session on that window or pane |
 | `f` | Enter session-name filter mode (choose-session only) |
 | `p` | Toggle live preview |
-| `x` | Kill the highlighted entry (session in choose-session, window in choose-tree) |
-| `Esc` | Clear an active session filter; otherwise close the chooser |
+| `x` | Kill the highlighted entry (session in choose-session, window in choose-tree), with confirmation |
+| `Esc` | Answer a pending kill question with no; otherwise clear an active session filter; otherwise close the chooser |
+| `q` / `C-g` | Close the chooser (`q` types into an active session filter instead) |
 
 In the session picker, `f` starts filter mode, which matches session names
 case-insensitively as you type. `Backspace` edits the filter. `Esc` with filter
 text entered clears the filter and shows every session again; `Esc` with no
 filter text closes the picker.
 
-`q` does **not** close these two choosers. Every printable key other than the ones above is
-swallowed so it cannot leak into the focused pane, and `q` falls into that group. Use `Esc`.
+`x` puts up a `y/n` question before it kills, as `Prefix + x` and
+`Prefix + &` do, and as tmux's chooser does. Only `y` kills; every other key
+cancels, including `Enter`, which inside a chooser is the key that activates a
+row. The chooser stays open behind the question either way.
+
+`q` closes these choosers as it closes every tmux mode. Every other printable key not listed
+above is swallowed so it cannot leak into the focused pane. The pane's cursor is hidden while a
+chooser is open, as tmux hides it for every mode tree mode.
 
 ### Buffer Chooser (choose-buffer)
 
@@ -221,12 +234,13 @@ Open with `Prefix + =`.
 | `Down` / `j` / `l` | Move selection down |
 | `g` / `Home` | Jump to first buffer |
 | `G` / `End` | Jump to last buffer |
-| `PageUp` / `PageDown` | Move selection by 10 rows |
+| `C-p` / `C-n` | Move selection up / down |
+| `PageUp` / `PageDown` / `C-b` / `C-f` | Move selection by one page (the height of the list) |
 | `1`..`9`, `0` | Append digit to the jump buffer |
 | `Backspace` | Edit the jump buffer |
 | `Enter` | Paste the selected buffer (or the jump buffer index if non-empty) |
 | `d` / `Delete` | Delete the selected buffer and stay open |
-| `Esc` / `q` | Close the chooser |
+| `Esc` / `q` / `C-g` | Close the chooser |
 
 ### Keys Viewer (list-keys)
 
@@ -409,11 +423,29 @@ stays put, use the scrolling keys below.
 | `g` | Top of scrollback |
 | `G` | Bottom (live output) |
 | `z` | Centre the cursor line in the pane (scroll-middle) |
-| `r` | Toggle following live output (see below) |
+| `r` | Copy the pane's current output into copy mode once (refresh-from-pane, see below) |
 
-`r` is a psmux extension with no tmux equivalent. Copy mode normally anchors the view so new output
-cannot shift the text under your cursor. `r` releases that anchor, so the pane follows live output
-again and jumps to the bottom of the history. Press `r` again to re-anchor.
+A full page is the pane height minus two lines and a half page is half the pane height, the same
+amounts tmux uses (`window_copy_pageup1` in `window-copy.c`). A pane two rows tall or shorter moves
+one line. The view moves and the cursor stays on its row, except at the top or bottom of the
+history, where the cursor is pulled along so repeated presses reach the first or last line.
+
+Copy mode reads a copy of the pane taken when it opened, so new output cannot shift the text under
+your cursor. `r` is tmux's `refresh-from-pane`: it takes that copy again once, so everything the
+pane printed since becomes reachable, and it keeps the line at the top of the view where it was, the
+way tmux 3.7 does (`window_copy_cmd_refresh_from_pane` in `window-copy.c`). The new lines land
+below the view; `G` goes to them. Like tmux it clears the selection and stays in copy mode.
+`send-keys -X refresh-now` is the same command under the name OpenBSD's current manual uses.
+
+To follow output continuously instead, tmux after 3.7c has an automatic refresh, and psmux has it too:
+`send-keys -X refresh-on`, `refresh-off` and `refresh-toggle`. While it is on, copy mode takes a
+new copy whenever the pane prints. It follows the output while the cursor sits on the last row at the
+live bottom, keeps your place anywhere else, and pauses while a selection is being made. To get the
+newer tmux binding:
+
+```tmux
+bind-key -T copy-mode-vi r send-keys -X refresh-toggle
+```
 
 ### Screen Position
 
@@ -422,6 +454,7 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `H` | Jump to top of visible area |
 | `M` | Jump to middle of visible area |
 | `L` | Jump to bottom of visible area |
+| `P` | Hide or show the position indicator in the top-right corner |
 
 ### Character Find
 
@@ -439,7 +472,8 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `X` | Set the mark at the cursor |
 | `Alt+x` | Exchange the cursor and the mark |
 
-`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started.
+`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started. The marked line is drawn in
+`copy-mode-mark-style` (`bg=red,fg=black`) with the marked cell's colours swapped, as tmux draws it.
 
 ### Bracket / Paragraph
 
@@ -456,15 +490,16 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `Space` | Begin character selection at the cursor |
 | `V` | Begin line selection at the cursor |
 | `Ctrl+Space` | Set the selection anchor at the cursor |
-| `v` | Toggle rectangle mode on the selection (does not start one) |
-| `Ctrl+v` | Force rectangle mode on the selection |
+| `v` / `Ctrl+v` | Toggle rectangle mode (does not start a selection) |
 | `o` | Swap cursor/anchor ends |
+| `Esc` | Clear the selection and stay in copy mode (`mode-keys vi`) |
 
 **psmux follows tmux here, not vi.** In vi, `v` starts a character selection. In tmux and in psmux,
 `v` is `rectangle-toggle`: it flips the selection between character mode and block mode and does not
 set an anchor, so pressing `v` on its own selects nothing. Use `Space` (or `Ctrl+Space`) to start a
-selection and `V` to start a line selection. `Ctrl+v` differs from `v` in that it always switches to
-rectangle mode rather than toggling out of it. If you want vi muscle memory, rebind it:
+selection and `V` to start a line selection. Pressed before `Space`, `v` makes the selection a
+rectangle from the start, as in tmux. Builds before discussion #694 began a character selection on
+`v` despite this table; if you got used to that, rebind it:
 
 ```tmux
 bind-key -T copy-mode-vi v send-keys -X begin-selection
@@ -492,6 +527,19 @@ Search covers the whole scrollback, not just the rows on screen. A match that is
 scrolls the view to it, parked a quarter of a screen from the bottom the way tmux does, and
 `?` stops at the nearest match above the cursor.
 
+Every match on screen is drawn in `copy-mode-match-style` (`bg=cyan,fg=black`) and the one under the
+cursor in `copy-mode-current-match-style` (`bg=magenta,fg=black`), tmux's defaults. As in tmux the
+highlight stays while you move with `n`, `N` and the cursor keys, and goes when a command that
+changes the selection or the mark runs (`Space`, `Esc`, `V`, `v`, `X`, `z`, `%`, `^`).
+
+### Goto Line
+
+| Key | Action |
+|-----|--------|
+| `:` | Ask for a line number and move the view to it (`mode-keys vi` only) |
+
+See [Copy Mode Goto Line Prompt](#copy-mode-goto-line-prompt) for what the number counts.
+
 ### Text Objects & Registers
 
 | Key | Action |
@@ -505,7 +553,8 @@ scrolls the view to it, parked a quarter of a screen from the bottom the way tmu
 
 | Key | Action |
 |-----|--------|
-| `Esc` / `q` / `]` | Exit copy mode |
+| `q` / `]` | Exit copy mode |
+| `Esc` | Clear the selection and stay in copy mode with `mode-keys vi`; exit with `mode-keys emacs` |
 | `Ctrl+C` / `Ctrl+G` | Exit copy mode |
 
 ### Copy Mode Search Prompt
@@ -514,10 +563,43 @@ Opened by `/`, `?`, `Ctrl+s` or `Ctrl+r`. While it is open the copy mode keys ar
 
 | Key | Action |
 |-----|--------|
-| Any character | Append to the search pattern |
-| `Backspace` | Delete the last character |
+| Any character, `Space` included | Insert at the cursor |
+| `Left` / `Right` | Move the cursor |
+| `Home` / `Ctrl+a` | Move to the start |
+| `End` / `Ctrl+e` | Move to the end |
+| `Backspace` | Delete the character before the cursor |
+| `Delete` / `Ctrl+d` | Delete the character under the cursor |
+| `Ctrl+u` / `Ctrl+k` / `Ctrl+w` | Clear the line / cut to the end / cut the word before the cursor |
+| `Up` / `Down` | Recall earlier searches |
 | `Enter` | Accept the search and jump to the match |
-| `Esc` | Cancel the search |
+| `Esc` / `Ctrl+c` / `Ctrl+g` | Cancel the search |
+
+These are the keys of tmux's prompt editor that apply here. The cursor is drawn on the status line
+where it sits, and the prompt scrolls when the search term is longer than the line, so the cursor
+stays on screen. `Ctrl+b` and `Ctrl+f` also move the cursor, but `Ctrl+b` is the default prefix, which
+the client takes first. The goto line prompt takes the same editing keys.
+
+### Copy Mode Goto Line Prompt
+
+Opened by `:` with `mode-keys vi`, which is the key tmux binds it to in `copy-mode-vi`. While it is
+open the copy mode keys are inactive.
+
+| Key | Action |
+|-----|--------|
+| Any character | Append to the line number |
+| `Backspace` | Delete the last character |
+| `Enter` | Move the view to that line |
+| `Esc` | Cancel and leave the view where it was |
+
+What the number counts follows `copy-mode-line-numbers`, so it always matches the gutter on screen:
+
+| `copy-mode-line-numbers` | The number means |
+|-----|--------|
+| `absolute`, `relative`, `hybrid` | A line of the whole buffer, counting the oldest retained line as 1 |
+| `off`, `default` | How many lines back from the live bottom to scroll |
+
+A line number past the end is clamped to the end, and anything that is not a number leaves the view
+alone. The same rules apply to `send-keys -X goto-line <n>`.
 
 ### Emacs Copy Mode
 
@@ -533,10 +615,16 @@ differently in its `copy-mode` and `copy-mode-vi` tables:
 | `Ctrl+e` | Scroll down one line | End of line |
 | `Ctrl+y` | Scroll up one line | Nothing |
 | `J` / `K` | Scroll down / up one line | Nothing |
+| `g` / `G` | History top / bottom | Nothing (use `M-<` / `M->`) |
 
 In vi mode `Ctrl+e` scrolls, so use `$` (or `End`) to reach the end of the line there. This is
 tmux's split: `copy-mode` binds `Ctrl+e` to end-of-line and leaves `Ctrl+y`, `J` and `K` unbound,
 while `copy-mode-vi` binds `Ctrl+e` and `J` to scroll down and `Ctrl+y` and `K` to scroll up.
+
+tmux spells history-top/history-bottom `g` / `G` in `copy-mode-vi` only; the `copy-mode` table
+uses `M-<` / `M->`. psmux used to answer a bare `g` in both tables, so a stray `g` - a prompt
+letter typed into a pane that was still in copy mode, say - threw the view to the top of the
+scrollback. `g` / `G` are now vi-only and `M-<` / `M->` work in both.
 
 These keys behave the same under both settings: `Ctrl+p` / `Ctrl+n` move the cursor up / down,
 `Ctrl+Up` / `Ctrl+Down` scroll one line, `Ctrl+a` goes to line start, `Alt+f` / `Alt+b` move by
@@ -548,8 +636,12 @@ word, `Alt+v` pages up, `Alt+w` copies and exits, `Ctrl+s` / `Ctrl+r` search for
 When in copy mode:
 - The pane border turns **yellow**
 - `[copy mode]` appears in the title
-- A scroll position indicator shows in the top-right corner
+- A position indicator shows in the top-right corner, which `P` hides and shows
 - Mouse drag-select copies to Windows clipboard on release
+
+`P` is tmux's `toggle-position`, bound in both copy-mode tables. The indicator comes back the next
+time you enter copy mode, because the setting belongs to that visit rather than to the pane.
+`copy-mode -H` opens copy mode with it already hidden.
 
 ## Mouse Bindings
 
@@ -582,11 +674,90 @@ Key names for `bind-key` and `send-keys`:
 | Shift+Tab | `BTab` (sends `ESC [ Z`) |
 | Ctrl+Backspace | `C-BSpace` (writes `0x08`, the native Windows encoding, so PSReadLine runs BackwardKillWord; `M-BSpace` writes `ESC 0x7f`). A terminal that sends a bare `0x08` for Ctrl+Backspace is seen as `C-h`, which is also what tmux reports for it |
 | Non-ASCII keys | Any single Unicode character: `ы`, `é`, `ß`, with the usual modifiers (`M-ф`, `C-ы`, `S-ы`). `list-keys` prints the character as typed |
-| Mouse key names | tmux's mouse names (`WheelUpPane`, `MouseDown1Pane`, `DoubleClick1Pane`, and so on), `Any`, `None`, `Mouse`, `FocusIn`/`FocusOut`, `PasteStart`/`PasteEnd` and `UserN` are accepted so a ported tmux config loads, but psmux does not act on them |
+| Mouse key names | tmux's mouse names (`WheelUpPane`, `MouseDown1Pane`, `MouseDrag1Border`, `DoubleClick1Pane`, `WheelDownStatus`, and so on, with `C-`, `M-` and `S-`) are real keys: `bind`, `unbind` and `list-keys` take them. The wheel over a pane runs them (see [Mouse key bindings](#mouse-key-bindings)); the other mouse names are stored and listed but psmux's built-in mouse handling still acts on clicks, drags and the status line. `Any`, `None`, `Mouse`, `FocusIn`/`FocusOut`, `PasteStart`/`PasteEnd` and `UserN` are accepted so a ported tmux config loads, but psmux does not act on them |
 
 Aliases are accepted for several of these: `Return` for `Enter`, `Esc` for `Escape`,
 `BSpace` for `Backspace`, `PPage` or `PgUp` for `PageUp`, `NPage` or `PgDn` for `PageDown`,
 `IC` for `Insert`, `DC` for `Delete`, `BackTab` for `BTab`.
+
+### Mouse key bindings
+
+A wheel notch over a pane is the tmux key `WheelUpPane` or `WheelDownPane`, with `C-`, `M-`
+or `S-` when a modifier is held, and it is looked up the way tmux looks it up: in the
+`copy-mode` (or `copy-mode-vi`) table while the pane is in copy mode, then in `root`.
+
+| Situation | What happens |
+|-----------|--------------|
+| Nothing changed | The built-in defaults, listed by `list-keys`: root `WheelUpPane` enters copy mode and scrolls, the copy-mode `WheelUpPane` / `WheelDownPane` scroll 3 lines and leave copy mode at the bottom, and a program that asked for the mouse gets the wheel |
+| `bind -n WheelUpPane ...`, `bind -T copy-mode-vi WheelDownPane ...` | Your command runs instead. `-t =`, `-t=` and `{mouse}` name the pane under the pointer, and `send-keys -M` hands the wheel to the program in it |
+| `unbind -n WheelUpPane` | The key is gone, as in tmux: the wheel no longer enters copy mode, and only reaches a program that enabled mouse reporting |
+| A modified wheel (`C-WheelUpPane`) with nothing bound | As in tmux: a program with mouse reporting on gets it (with the Ctrl bit), a shell prompt gets nothing, copy mode ignores it |
+| `set -g ctrl-wheel-zoom on` | Ctrl+wheel in Windows Terminal zooms the font before any binding is consulted |
+| The wheel over the status line | `WheelUpStatus` / `WheelDownStatus`, `previous-window` / `next-window` by default as in tmux; bind or unbind them like any key |
+| The end of a drag (`MouseDragEnd1Pane` in `copy-mode` / `copy-mode-vi`) | The default copies and leaves copy mode. `unbind -T copy-mode-vi MouseDragEnd1Pane` keeps the selection in copy mode after the drag, and a binding (`send -X copy-selection-no-clear`, ...) runs instead. A drag at the shell prompt follows it too: with the default changed, the drag ends in copy mode, as in tmux |
+
+The press and drag of the left button in a pane (`MouseDown1Pane`, `MouseDrag1Pane`), a drag
+on a pane separator (`MouseDrag1Border`), a click on the status line (`MouseDown1Status`) and
+the right button (`MouseDown3Pane`) follow the same rules: while a key keeps its built-in default
+psmux behaves exactly as before; a binding (with or without `C-` / `M-`) runs instead; unbound,
+the event goes to the program only if it asked for the mouse. A binding to tmux's own default
+command for a key (`bind -n MouseDrag1Border resize-pane -M`, `bind -n MouseDown1Status
+switch-client -t=`) keeps psmux's built-in behaviour.
+
+Double and triple clicks follow tmux's click timer: a second left press within 300 ms of the
+first is `SecondClick1Pane` (no default), a third within 300 ms of the second is
+`TripleClick1Pane`, and when the 300 ms run out after a second press it is `DoubleClick1Pane`.
+The defaults are tmux's: a double click selects the word under the pointer and a triple click the
+line, enter copy mode for it, show it for 0.3 s, copy it (paste buffer and Windows clipboard) and
+leave copy mode; over a program that asked for the mouse the program gets the clicks instead, and
+with `pwsh-mouse-selection` on psmux's own word and line selection is used. The status line has
+`SecondClick1Status`, `DoubleClick1Status` and `TripleClick1Status` with no default. The window is
+300 ms as in tmux, which has no option for it (`KEYC_CLICK_TIMEOUT`).
+
+### Right click paste in programs that track the mouse
+
+A program that turns on mouse reporting (Claude Code, OpenCode, vim with `mouse=a`) receives the
+right click itself, as in tmux, so psmux's right click paste does not happen there. To paste the
+Windows clipboard on a right click everywhere, through the bracketed paste route the program
+expects ([#796](https://github.com/psmux/psmux/issues/796)):
+
+```tmux
+bind -n MouseDown3Pane { refresh-client -l ; paste-buffer -p }
+```
+
+or keep the plain right click and paste on Alt+right click:
+
+```tmux
+bind -n M-MouseDown3Pane { refresh-client -l ; paste-buffer -p }
+```
+
+`refresh-client -l` stores the Windows clipboard as a new paste buffer (tmux asks the terminal for
+its clipboard; psmux reads it directly, so it is there before `paste-buffer` runs), and
+`paste-buffer -p` wraps it in bracketed paste markers when the program asked for them.
+
+A binding's command list can be written as a tmux brace block, on one line or several:
+
+```
+bind -n F8 { set -g @a 1; set -g @b 2 }
+bind -n F9 {
+  if -F '#{pane_in_mode}' { send -X cancel } { copy-mode }
+}
+```
+
+`list-keys` prints the block as its command list (`set -g @a 1 \; set -g @b 2`).
+
+### Extended keys from the host terminal
+
+A host terminal that reports modified keys in the `CSI u` form (Windows Terminal with
+extended keys on, WezTerm, Kitty, xterm with `modifyOtherKeys`) is understood on both
+input paths, so `Shift+Enter`, `Ctrl+Enter` and the like reach a bound key or the pane
+as the key they are (#654). A `CSI u` that arrives inside a paste stays text.
+
+Known boundary: under Git Bash's mintty the psmux client runs behind Cygwin's
+pseudo console, and that conhost drops a `CSI u` it does not recognise before psmux
+sees it when virtual terminal input is off. Modified keys reported that way do not
+reach psmux there. This is a limitation of the host, not something psmux can recover;
+Windows Terminal and WezTerm are the hosts where extended keys are verified.
 
 A key name psmux cannot parse is never dropped silently. `psmux bind-key WheelUpPain ...` prints
 `unknown key: WheelUpPain` and exits 1, like tmux; the same line in a config file is reported in

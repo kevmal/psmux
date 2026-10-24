@@ -45,9 +45,12 @@ psmux send-keys -p
 # Repeat a key N times
 psmux send-keys -N 5 Up
 
-# Send a copy mode command by name (see "Copy Mode Commands (send-keys -X)")
+# Send a copy mode command by name (see "Copy Mode Commands (send-keys -X)").
+# The pane must already be in copy mode; otherwise, as in tmux, the command
+# fails with "not in a mode" (exit 1). -N repeats a motion.
+psmux copy-mode
 psmux send-keys -X begin-selection
-psmux send-keys -X cursor-up
+psmux send-keys -X -N 5 cursor-up
 psmux send-keys -X copy-selection-and-cancel
 
 # Send a dash-leading operand: `--` ends option parsing (#562)
@@ -179,6 +182,12 @@ psmux display-popup -E "git log --oneline -20"
 
 # Keep popup open after command finishes
 psmux display-popup -K "echo done"
+
+# Title the frame, pick its lines and colours (tmux flags)
+psmux display-popup -T "Logs" -b rounded -S "fg=#3b434d" -s "bg=colour235" "Get-Content app.log -Wait"
+
+# No frame: the command draws its own and gets the whole 80x24 area
+psmux display-popup -B -E -w 80 -h 24 "lazygit"
 ```
 
 ## Menus
@@ -393,7 +402,7 @@ not part of it. Capture again after any split you want to keep.
 | `#{pane_current_command}` | Foreground process name |
 | `#{pane_current_path}` | Current working directory of the pane. Under `wsl` or `ssh` this needs shell integration, see [the FAQ](faq.md) |
 | `#{pane_path}` | Path the pane announced over `OSC 7` or `OSC 9;9`, untranslated, empty if none |
-| `#{pane_start_command}` | Command the pane was started with |
+| `#{pane_start_command}` | Command the pane was started with, **empty** when it was started with the default shell. A `--` argv is reported as its token list, a single command string is quoted when it contains spaces (tmux `args_escape`). A respawn replaces it only when the respawn carried a command of its own |
 | `#{pane_pid}` | PID of the pane's shell |
 | `#{pane_tty}` | Pseudo terminal name, for example `/dev/pty1` |
 | `#{pane_in_mode}` | `1` if the pane is in copy mode or another mode |
@@ -444,12 +453,21 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 
 ### Client variables
 
+Each of these describes one client: the row's client in `list-clients -F`, the client named by
+`display-message -c`, and otherwise the most recently active client of the session. With no
+client attached, the identity variables (`client_name`, `client_pid`, `client_readonly`,
+`client_flags`, `client_control_mode`) are empty, as in tmux.
+
 | Variable | Description |
 |----------|-------------|
+| `#{client_name}` / `#{client_tty}` | Name of the client, `/dev/pts/<pid>`. Unique across the `-L` namespace and kept when the client switches session |
+| `#{client_pid}` | PID of the attached client process (a TUI, `attach -r` or `-CC` client) |
+| `#{client_readonly}` | `1` for a client attached with `attach -r` (or `-f read-only`), else `0` |
+| `#{client_flags}` | tmux style flag list, for example `attached,read-only,UTF-8` (also `focused`, `control-mode`) |
+| `#{client_control_mode}` | `1` for a `-CC` control mode client |
 | `#{client_width}` / `#{client_height}` | Size of the client terminal |
 | `#{client_prefix}` | `1` if the prefix key was pressed |
 | `#{client_key_table}` | Key table the client is currently in, for example `root` |
-| `#{client_pid}` | PID of the client process |
 | `#{client_session}` / `#{client_last_session}` | Current and previous session of the client |
 | `#{client_activity}` / `#{client_created}` | Timestamps for the client |
 | `#{client_activity_string}` / `#{client_created_string}` | The same, already formatted |
@@ -466,10 +484,16 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 | `#{server_instance}` | Stable identity of the `-L` namespace. Constant while the namespace is up, whichever of its servers answers; changes only after a genuine restart. Empty for a namespace that has no server |
 | `#{version}` | psmux version, for example `3.3.7` |
 | `#{start_time}` | Server start time |
-| `#{socket_path}` | Path of the server's discovery files |
+| `#{socket_path}` | The server that answered: `<psmux dir>/default`, `<psmux dir>/<label>` under `-L`, or the `-S` path |
 | `#{history_size}` | Lines currently held in the pane's scrollback |
 | `#{alternate_on}` | `1` if the pane is on the alternate screen |
-| `#{current_file}` | Config file being parsed, during config parsing |
+| `#{mouse_any_flag}` | `1` if the pane has any mouse tracking mode on (DECSET 1000, 1002 or 1003) |
+| `#{mouse_standard_flag}` | `1` if the pane enabled normal tracking, DECSET 1000 (or X10 tracking, DECSET 9) |
+| `#{mouse_button_flag}` | `1` if the pane enabled button event tracking, DECSET 1002 |
+| `#{mouse_all_flag}` | `1` if the pane enabled any event tracking, DECSET 1003 |
+| `#{mouse_utf8_flag}` | `1` if the pane enabled UTF-8 mouse reporting, DECSET 1005 |
+| `#{mouse_sgr_flag}` | `1` if the pane enabled SGR mouse reporting, DECSET 1006 |
+| `#{current_file}` | Config file being parsed, during config parsing and while a command read from it runs |
 
 ### Options as format variables
 
@@ -508,9 +532,6 @@ rather than live state. They exist for tmux format compatibility. Do not build l
 | `#{pane_start_path}` / `#{pane_tabs}` | empty |
 | `#{cursor_flag}` | `0` |
 | `#{scroll_region_upper}` | `0` |
-| `#{client_name}` / `#{client_tty}` | `client0` |
-| `#{client_control_mode}` | `0` |
-| `#{client_flags}` | `focused` |
 | `#{client_termfeatures}` | a fixed string |
 | `#{client_utf8}` | `1` |
 | `#{client_cell_width}` / `#{client_cell_height}` | a fixed value |
@@ -758,12 +779,15 @@ fire.
 | `after-new-window` | A window is created |
 | `after-split-window` | A pane is split |
 | `after-kill-pane` | A pane is killed |
-| `after-select-window` | A different window becomes active |
-| `after-select-pane` | A different pane becomes active |
+| `after-select-window` | A different window becomes active. Fires ONCE per `select-window`; it fired twice before issue #690 |
+| `before-select-window` | A `select-window` is about to switch, before the window changes |
+| `after-select-pane` | A `select-pane` moved the active pane. It does NOT fire when the target pane is already the active one, and `-T`, `-P`, `-m`, `-M`, `-e` and `-d` never fire it, because none of them moves the pane (tmux `cmd-select-pane.c`). Before issue #691 the `-t` form fired `after-select-window` instead of this |
+| `after-select-layout` | A layout is applied with `select-layout` |
 | `after-rename-window` | A window is renamed |
 | `after-rename-session` | The session is renamed |
 | `after-resize-pane` | A pane is resized |
-| `after-swap-pane` | Two panes are swapped |
+| `after-swap-pane` | Two panes are swapped. A psmux extension: upstream tmux gives `swap-pane` no hook |
+| `after-swap-window` | Two windows are swapped. A psmux extension, symmetric with `after-swap-pane` |
 | `after-rotate-window` | Panes in a window are rotated |
 | `after-break-pane` | A pane is broken out into its own window |
 | `after-join-pane` | A pane is joined into a window |
@@ -771,16 +795,17 @@ fire.
 | `client-attached` | A client attaches, and once at server start |
 | `client-detached` | A client detaches |
 | `client-resized` | The client terminal is resized |
-| `client-session-changed` | A client switches to a different session |
-| `session-created` | A session is created, at server start |
+| `client-session-changed` | A client starts looking at this session, which in psmux means it attaches to this session's server. See the note on one server per session below |
+| `session-created` | Fires ONCE, at server start. See the note below: it has to be set in a config file to be registered in time |
 | `session-closed` | The session ends |
 | `pane-died` | A pane's process exits |
 | `pane-exited` | Fired alongside `pane-died` when a pane's process exits |
-| `pane-focus-in` | Focus enters a pane |
-| `pane-focus-out` | Focus leaves a pane |
+| `pane-focus-in` | Focus enters a pane: a different pane becomes active, or the client's terminal regains focus. Requires `focus-events on`, which is off by default, exactly as in tmux |
+| `pane-focus-out` | Focus leaves a pane, under the same `focus-events` condition |
+| `pane-mode-changed` | A pane enters or leaves copy mode, clock mode or a chooser |
 | `pane-set-clipboard` | A pane writes the clipboard through OSC 52 |
-| `window-linked` | A window is linked into the session |
-| `window-unlinked` | A window is unlinked |
+| `window-linked` | A window joins the session's window list: `new-window`, `break-pane` or `link-window` |
+| `window-unlinked` | A window leaves it: `kill-window` or `unlink-window` |
 | `window-closed` | A window goes away |
 | `alert-activity` | Activity detected in a monitored window |
 | `alert-silence` | Silence detected in a monitored window |
@@ -790,8 +815,30 @@ There is no `after-new-session` hook in psmux. It is accepted by `set-hook`, lik
 name, but nothing ever fires it. Use `session-created` instead.
 
 These tmux hook names are likewise accepted and never fired: `after-copy-mode`,
-`after-set-option`, `session-renamed`, `session-window-changed`, `window-renamed`,
-`window-pane-changed`, `pane-mode-changed`, `client-focus-in`, `client-focus-out`.
+`after-set-option`, `after-bind-key`, `after-unbind-key`, `after-source`,
+`after-kill-window`, `after-move-window`, `after-link-window`, `after-unlink-window`,
+`session-renamed`, `session-window-changed`, `window-renamed`, `window-pane-changed`,
+`client-focus-in`, `client-focus-out`.
+
+### One server per session, and the two hooks it shapes
+
+psmux runs one server process per session, so `app.hooks` belongs to a session and a hook set
+in one session cannot see anything that happens in another. Two hooks in the table above are
+shaped by that:
+
+* `session-created` fires once, at server start, which is the only moment it can: a new session
+  is a new process whose hook map is empty until its config is read. So
+  `psmux set-hook -g session-created "..."` in a running session can never fire, and the hook
+  has to come from a config file:
+
+  ```powershell
+  # in ~/.psmux.conf, or a file passed with -f
+  set-hook -g session-created "display-message 'session ready'"
+  ```
+
+* `client-session-changed` fires when a client attaches to this session, because attaching IS
+  the client changing which session it looks at. tmux fires it from the same place, for an
+  attach and a `switch-client` alike (`server-client.c` `server_client_set_session`).
 
 ### Removing Hooks
 
@@ -1024,6 +1071,12 @@ This is useful for running completely separate psmux environments, for example o
 development and one for monitoring. On disk the state files become `<namespace>__<session>.*`
 under `~\.psmux\`.
 
+Because `__` joins the namespace and the session name on disk, a session in the default
+namespace (no `-L`) cannot have `__` in its name: `new-session` and `rename-session` refuse it
+with `invalid session: NAME`. A session named `a__b` would otherwise share its files with
+session `b` of `-L a`. Under `-L` any name works, including one that starts with the namespace
+itself (`psmux -L work new-session -s work__x`, then `-t work__x`).
+
 ## Key Binding Management
 
 ```powershell
@@ -1234,6 +1287,17 @@ bind-key -T copy-mode-vi y send-keys -X copy-selection-and-cancel
 bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle
 ```
 
+`send-keys -X` needs a pane that is already in copy mode, exactly as in tmux: on
+any other pane it prints `not in a mode` and exits 1. `-N <count>` repeats the
+commands that take a count (cursor, word, page and scroll motions, search
+again); the rest run once.
+
+`list-keys -T copy-mode-vi` (or `-T copy-mode` for `mode-keys emacs`) prints
+the keys the built-in copy mode handles, as the `send-keys -X` command each one
+runs, together with your own bindings in those tables. `unbind-key -T
+copy-mode-vi <key>` takes a built-in key away (it then does nothing, as in
+tmux), and `unbind-key -a -T copy-mode-vi` takes all of them.
+
 ### Movement
 
 | Name | Description |
@@ -1255,6 +1319,7 @@ bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle
 | `middle-line` | Move to the middle visible line |
 | `bottom-line` | Move to the bottom visible line |
 | `history-top` | Move to the top of the scrollback |
+| `goto-line <n>` | Move the view to line `n`, counted the way `copy-mode-line-numbers` counts |
 | `history-bottom` | Move to the live bottom of the scrollback |
 | `next-paragraph` | Move to the next blank line |
 | `previous-paragraph` | Move to the previous blank line |
@@ -1291,7 +1356,7 @@ bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle
 |------|-------------|
 | `begin-selection` | Start a selection at the cursor |
 | `stop-selection` | Stop extending the selection without clearing it |
-| `clear-selection` | Discard the selection |
+| `clear-selection` | Discard the selection and stay in copy mode (Escape with `mode-keys vi`) |
 | `select-line` | Select the whole current line |
 | `select-word` | Select the word under the cursor |
 | `rectangle-toggle` | Toggle block (rectangular) selection |
@@ -1321,11 +1386,10 @@ viewport scrolls to bring an off screen match into view.
 | Name | Description |
 |------|-------------|
 | `cancel` | Leave copy mode |
-| `refresh-from-pane` | Toggle live refresh of the copy mode view from the running pane (psmux extension) |
-| `refresh-toggle` | Synonym of `refresh-from-pane` (psmux extension) |
+| `refresh-from-pane` | Copy the pane's current output into copy mode once, keeping the line at the top of the view (tmux 3.4 to 3.7c, bound to `r`). `refresh-now` is an accepted synonym |
+| `refresh-on` / `refresh-off` / `refresh-toggle` | Turn on, off or toggle automatic refresh: copy mode takes a new copy whenever the pane prints, following the output while the cursor is on the last row at the live bottom, and pausing during a selection (tmux after 3.7c) |
 
-`copy-line`, `refresh-from-pane` and `refresh-toggle` have no tmux equivalent. Everything else in
-these tables is named the same way it is in tmux.
+`copy-line` has no tmux equivalent. Everything else in these tables is named the same way it is in tmux.
 
 ## Session Groups
 
@@ -1422,6 +1486,15 @@ psmux -t alpha list-panes -F '#{pane_id} #{pane_left},#{pane_top}'
 
 `move-pane` behaves the same way and also removes the pane from the source window. Use `-h` or
 `-v` to choose the split direction and `-d` to avoid focusing the transplanted pane.
+
+The moved pane belongs to its new session from then on, as in tmux. If it was the last pane of
+the source session, that session is gone (`ls` and `has-session` no longer see it and the name is
+free again), and `kill-session` on the source no longer touches a pane that was moved out of it.
+The source server process keeps hosting the console in the background and exits by itself when the
+pane exits or is killed. If that process is ended some other way, the pane in the new session
+turns dead like any exited pane: `pane-exited` or `pane-died` fires and `remain-on-exit` decides
+whether it stays. One difference from tmux remains: pane ids are per server in psmux, so the moved
+pane gets a new `%id` in its new session.
 
 ## Mouse Wire Commands
 

@@ -9,7 +9,7 @@
 #    `select-pane` before EVERY mouse click, so one plain click after an
 #    external `send-keys -X cancel` silently re-entered copy mode.
 #    Four arms shared the defect: cancel, copy-selection-and-cancel,
-#    copy-pipe-and-cancel, copy-end-of-line.
+#    copy-pipe-and-cancel, copy-end-of-line-and-cancel.
 #
 # 2) `new-window -- prog args...` named the window `--`
 #    9bfdfc3 (#582) kept the `--` marker at the head of the command string so
@@ -89,7 +89,10 @@ $rd = New-Object System.IO.StreamReader($stream)
 $wr.WriteLine("AUTH $authKey"); $null = $rd.ReadLine()
 $wr.WriteLine("PERSISTENT")
 
-foreach ($exitCmd in @("cancel", "copy-selection-and-cancel", "copy-end-of-line")) {
+# copy-end-of-line itself stays in copy mode in tmux (window-copy.c
+# window_copy_do_copy_end_of_line returns REDRAW unless cancel is set); the
+# exit arm that shares the defect is its -and-cancel form.
+foreach ($exitCmd in @("cancel", "copy-selection-and-cancel", "copy-end-of-line-and-cancel")) {
     & $PSMUX copy-mode -t $SA 2>&1 | Out-Null
     Start-Sleep -Milliseconds 400
     $entered = Fmt $SA '#{pane_in_mode}'
@@ -116,6 +119,17 @@ Start-Sleep -Milliseconds 700
 $stillIn = Fmt $SA '#{pane_in_mode}'
 if ($stillIn -eq "1") { Write-Pass "a pane really in copy mode still keeps it across select-pane" }
 else { Write-Fail "select-pane dropped a genuine copy mode (mode=$stillIn)" }
+& $PSMUX send-keys -t $SA -X cancel 2>&1 | Out-Null
+Start-Sleep -Milliseconds 400
+
+# tmux parity: plain copy-end-of-line copies and stays in copy mode.
+& $PSMUX copy-mode -t $SA 2>&1 | Out-Null
+Start-Sleep -Milliseconds 400
+& $PSMUX send-keys -t $SA -X copy-end-of-line 2>&1 | Out-Null
+Start-Sleep -Milliseconds 600
+$eolMode = Fmt $SA '#{pane_in_mode}'
+if ($eolMode -eq "1") { Write-Pass "-X copy-end-of-line stays in copy mode, as in tmux" }
+else { Write-Fail "-X copy-end-of-line left copy mode (mode=$eolMode); tmux stays" }
 & $PSMUX send-keys -t $SA -X cancel 2>&1 | Out-Null
 $tcp.Close()
 Kill-Sess $SA

@@ -1,0 +1,662 @@
+// A command's -t target travels with the request it applies to.
+//
+// The defect: the CLI route sent a target as its own request,
+// FocusTargetTemp, which switched the server's focus and left it switched
+// until "the next request that is not a temp focus", from anyone.  Measured
+// on 2358d49 with tests\test_stalled_server_target_routing.ps1: six targeted
+// commands fired at once put `send-keys -t s:0.1` keys into pane 0.0 or into
+// window 1, and `kill-pane -t s:0.2` killed pane 0.0, with or without a
+// server stall; and `send-keys -N 3 -t s:0.1 Q` with nothing else running
+// typed one Q into 0.1 and two into the active pane.
+//
+// The contract now (tmux's, cmd-queue.c cmdq_fire_command + cmd-find.c
+// cmd_find_target): ValidateTarget resolves the target read only into stable
+// ids, every request of the command carries it (CtrlReq::Targeted, sent by
+// TargetedSender), and the server loop focuses, runs and restores within that
+// one request.  These tests pin the pieces; the E2E pins the loop.
+// Registered from src/server/temp_target.rs.
+
+use super::*;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::server::connection::TargetedSender;
+use crate::types::{CtrlReq, LayoutKind, Node, TempTarget};
+
+fn make_pane(id: usize) -> crate::types::Pane {
+    let (master, writer) = crate::util::stub_pane_pty(portable_pty::PtySize { rows: 10, cols: 40, pixel_width: 0, pixel_height: 0 });
+    let epoch = Instant::now() - Duration::from_secs(2);
+    crate::types::Pane {
+        master,
+        writer,
+        child: crate::util::StubChild::exited(),
+        term: Arc::new(Mutex::new(vt100::Parser::new(10, 40, 0))),
+        last_rows: 10,
+        last_cols: 40,
+        id,
+        title: format!("pane{id}"),
+        title_locked: false,
+        child_pid: None,
+        data_version: Arc::new(AtomicU64::new(0)),
+        last_title_check: epoch,
+        last_infer_title: epoch,
+        dead: false,
+        last_text_input: None,
+        last_special_key: None,
+        vt_bridge_cache: None,
+        vti_mode_cache: None,
+        mouse_input_cache: None,
+        win32_input_latched: false, input_off: false,
+        scroll_fg_cache: None,
+        mouse_proto_owner: None,
+        wheel_auth: None,
+        cursor_shape: Arc::new(AtomicU8::new(0)),
+        bell_pending: Arc::new(AtomicBool::new(false)),
+        cpr_pending: Arc::new(AtomicBool::new(false)),
+        color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        copy_state: None,
+        live_term: None,
+        pane_style: None,
+        pane_options: Default::default(),
+        squelch_until: None,
+        output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        spawned_at: None,
+        start_command: String::new(),
+        cwd_hint: None,
+    }
+}
+
+fn make_window(id: usize, name: &str, pane_ids: &[usize]) -> crate::types::Window {
+    let root = if pane_ids.len() == 1 {
+        Node::Leaf(make_pane(pane_ids[0]))
+    } else {
+        Node::Split {
+            kind: LayoutKind::Vertical,
+            sizes: vec![100 / pane_ids.len() as u16; pane_ids.len()],
+            children: pane_ids.iter().map(|&p| Node::Leaf(make_pane(p))).collect(),
+        }
+    };
+    crate::types::Window {
+        root,
+        active_path: if pane_ids.len() == 1 { vec![] } else { vec![0] },
+        name: name.to_string(),
+        id,
+        area: ratatui::layout::Rect::new(0, 0, 40, 10),
+        window_size: None,
+        window_options: Default::default(),
+        activity_flag: false,
+        bell_flag: false,
+        silence_flag: false,
+        last_output_time: Instant::now(),
+        last_seen_version: 0,
+        manual_rename: false,
+        layout_index: 0,
+        pane_mru: vec![],
+        zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
+    }
+}
+
+/// Session `s`: window 0 (@10, "main") with panes %1 %2 %3, window 1
+/// (@11, "other") with pane %4.  Active: window 0, pane %1.
+pub(crate) fn app() -> AppState {
+    let mut app = AppState::new("s".to_string());
+    app.window_base_index = 0;
+    app.pane_base_index = 0;
+    app.windows.push(make_window(10, "main", &[1, 2, 3]));
+    app.windows.push(make_window(11, "other", &[4]));
+    app.active_idx = 0;
+    app
+}
+
+pub(super) fn active(app: &AppState) -> (usize, usize) {
+    let w = &app.windows[app.active_idx];
+    (app.active_idx, crate::tree::get_active_pane_id(&w.root, &w.active_path).unwrap())
+}
+
+fn pane_index(i: usize) -> TempTarget {
+    TempTarget { pane: Some(i), ..Default::default() }
+}
+
+fn window_index(i: usize) -> TempTarget {
+    TempTarget { win: Some(i), ..Default::default() }
+}
+
+#[test]
+fn validation_resolves_to_stable_ids() {
+    let app = app();
+    // s:0.1 -> %2 (the active window's second pane)
+    let r = resolve_temp_target(&app, &pane_index(1)).unwrap();
+    assert_eq!(r, TempTarget { win: None, win_is_id: false, win_name: None, pane: Some(2), pane_is_id: true, session: None, pane_check_only: false });
+    assert!(r.is_resolved());
+    // s:1 -> @11, no pane part (the window's active pane when it runs)
+    let r = resolve_temp_target(&app, &window_index(1)).unwrap();
+    assert_eq!(r, TempTarget { win: Some(11), win_is_id: true, win_name: None, pane: None, pane_is_id: false, session: None, pane_check_only: false });
+    // s:other.0 -> @11 + %4
+    let t = TempTarget { win_name: Some("other".into()), pane: Some(0), ..Default::default() };
+    let r = resolve_temp_target(&app, &t).unwrap();
+    assert_eq!((r.win, r.pane), (Some(11), Some(4)));
+    assert!(r.is_resolved());
+    // %3 stays %3
+    let t = TempTarget { pane: Some(3), pane_is_id: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap().pane, Some(3));
+    // Resolution changes nothing.
+    assert_eq!(active(&app), (0, 1));
+}
+
+#[test]
+fn validation_reports_tmux_messages_for_missing_targets() {
+    let app = app();
+    assert_eq!(resolve_temp_target(&app, &window_index(7)).unwrap_err(), "can't find window: 7");
+    assert_eq!(resolve_temp_target(&app, &pane_index(5)).unwrap_err(), "can't find pane: 5");
+    let t = TempTarget { pane: Some(99), pane_is_id: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap_err(), "can't find pane: %99");
+    let t = TempTarget { win: Some(77), win_is_id: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap_err(), "can't find window: @77");
+    let t = TempTarget { win_name: Some("nope".into()), ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap_err(), "can't find window: nope");
+}
+
+#[test]
+fn apply_focuses_the_target_and_restore_puts_the_real_focus_back() {
+    let mut app = app();
+    let mut saved = None;
+    apply_temp_target(&mut app, &mut saved, &TempTarget { win: Some(11), win_is_id: true, pane: Some(4), pane_is_id: true, ..Default::default() }).unwrap();
+    assert_eq!(active(&app), (1, 4));
+    assert_eq!(app.temp_focus_saved_active, Some(0), "#{{window_active}} must still see the real window");
+    restore_temp_focus(&mut app, &mut saved);
+    assert_eq!(active(&app), (0, 1));
+    assert_eq!(saved, None);
+    assert_eq!(app.temp_focus_saved_active, None);
+}
+
+/// The defect in one picture: three requests in one server batch, a
+/// targeted one from client X, an untargeted one from client Y (or a pane
+/// output wake), and another targeted one from client Z.  Each must act on
+/// its own pane: X on %2, Y on the real active pane %1, Z on %4.  Under
+/// FocusTargetTemp, X's focus request and its command were two requests, and
+/// whatever landed between them ran against %2 or put %1 back before X's
+/// command ran.
+#[test]
+fn interleaved_requests_each_act_on_their_own_target() {
+    let mut app = app();
+    let mut saved = None;
+    let x = resolve_temp_target(&app, &pane_index(1)).unwrap();
+    let z = resolve_temp_target(&app, &window_index(1)).unwrap();
+    let batch: Vec<(&str, Option<TempTarget>)> = vec![("X", Some(x)), ("Y", None), ("Z", Some(z))];
+    let mut acted_on = Vec::new();
+    for (who, target) in batch {
+        // The server loop: restore, unwrap and apply, run, restore.
+        restore_temp_focus(&mut app, &mut saved);
+        if let Some(t) = target {
+            apply_temp_target(&mut app, &mut saved, &t).unwrap();
+        }
+        acted_on.push((who, active(&app).1));
+        restore_temp_focus(&mut app, &mut saved);
+    }
+    assert_eq!(acted_on, vec![("X", 2), ("Y", 1), ("Z", 4)]);
+    assert_eq!(active(&app), (0, 1));
+}
+
+/// A resolved target names the pane, not a position: after the panes of
+/// window 0 are reordered (a swap-pane in between), `s:0.1` resolved
+/// earlier still means %2, never whatever now sits at index 1.
+#[test]
+fn a_resolved_target_survives_a_structural_change() {
+    let mut app = app();
+    let mut saved = None;
+    let t = resolve_temp_target(&app, &pane_index(1)).unwrap();
+    if let Node::Split { children, .. } = &mut app.windows[0].root {
+        children.swap(0, 1); // index 1 is now %1
+    }
+    app.windows[0].active_path = vec![1]; // still %1 active
+    apply_temp_target(&mut app, &mut saved, &t).unwrap();
+    assert_eq!(active(&app).1, 2);
+    restore_temp_focus(&mut app, &mut saved);
+    assert_eq!(active(&app).1, 1);
+}
+
+/// A target that vanished after validation fails to apply and changes
+/// nothing, so the server drops the request instead of running it against
+/// the active pane.
+#[test]
+fn a_vanished_target_is_not_applied() {
+    let mut app = app();
+    let mut saved = None;
+    let t = resolve_temp_target(&app, &window_index(1)).unwrap();
+    app.windows.pop();
+    assert_eq!(apply_temp_target(&mut app, &mut saved, &t).unwrap_err(), "can't find window: @11");
+    assert_eq!(saved, None);
+    assert_eq!(active(&app), (0, 1));
+}
+
+/// Every request a targeted command sends carries the target, not just the
+/// first (send-keys -N 3 sends three), and an untargeted command's requests
+/// pass through untouched.
+#[test]
+fn targeted_sender_wraps_every_request() {
+    let (tx, rx) = mpsc::channel::<CtrlReq>();
+    let t = TempTarget { pane: Some(2), pane_is_id: true, ..Default::default() };
+    let s = TargetedSender::new(&tx, Some(t.clone()));
+    for _ in 0..3 {
+        s.send(CtrlReq::SendKeys(vec!["Q".into()], true)).unwrap();
+    }
+    for _ in 0..3 {
+        match rx.try_recv().unwrap() {
+            CtrlReq::Targeted(got, inner) => {
+                assert_eq!(got, t);
+                assert!(matches!(*inner, CtrlReq::SendKeys(..)));
+            }
+            _ => panic!("a request of a targeted command went out without its target"),
+        }
+    }
+    let plain = TargetedSender::new(&tx, None);
+    plain.send(CtrlReq::ClearHistory).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::ClearHistory));
+}
+
+/// Exercise the complete resolve -> wrap -> focus -> re-resolve data flow.
+/// With three windows, keeping the raw `:+` would select window 12 here,
+/// even though validation selected window 11. Other self-resolving window
+/// requests (unlink and option reads/writes) need the same stable identity.
+#[test]
+fn self_resolving_window_requests_keep_the_validated_identity() {
+    for raw in ["s:+", "s:-", "s:+1", "s:{next}", "s:{previous}", "s:{end}", "s:+.+", "s:-.-"] {
+        let mut a = app();
+        a.windows.push(make_window(12, "third", &[5]));
+        let resolved = resolve_window_command_target(&a, raw).unwrap();
+        let expected = resolved.win.unwrap();
+        let (tx, rx) = mpsc::channel();
+        let s = TargetedSender::new(&tx, Some(resolved));
+        let (ack, _) = mpsc::channel();
+        let (out, _) = mpsc::channel();
+        s.send(CtrlReq::KillWindowTarget { target: raw.into(), resp: ack.clone() }).unwrap();
+        s.send(CtrlReq::UnlinkWindowReq { target: Some(raw.into()), resp: ack }).unwrap();
+        s.send(CtrlReq::SetWindowOption { target: raw.into(), option: "@probe".into(),
+            value: "yes".into(), unset: false, append: false, only_if_unset: false,
+            quiet: false, resp: out.clone() }).unwrap();
+        s.send(CtrlReq::ShowWindowOptionsFor(out.clone(), raw.into(), crate::server::options::WindowListing::Local)).unwrap();
+        s.send(CtrlReq::ShowWindowOptionValue(out, "@probe".into(), raw.into())).unwrap();
+        for _ in 0..5 {
+            let CtrlReq::Targeted(t, req) = rx.try_recv().unwrap() else { panic!("missing stable wrapper") };
+            let mut saved = None;
+            apply_temp_target(&mut a, &mut saved, &t).unwrap();
+            let carried = match *req {
+                CtrlReq::KillWindowTarget { target, .. }
+                | CtrlReq::SetWindowOption { target, .. }
+                | CtrlReq::ShowWindowOptionsFor(_, target, _)
+                | CtrlReq::ShowWindowOptionValue(_, _, target) => target,
+                CtrlReq::UnlinkWindowReq { target, .. } => target.unwrap(),
+                _ => panic!("unexpected request"),
+            };
+            assert_eq!(carried, format!("@{expected}"), "{raw}");
+            let again = resolve_window_command_target(&a, &carried).unwrap();
+            assert_eq!(again.win, Some(expected), "{raw} advanced twice");
+            restore_temp_focus(&mut a, &mut saved);
+            // Disappearance after validation must not redirect to current.
+            let removed = a.windows.iter().position(|w| w.id == expected).unwrap();
+            let window = a.windows.remove(removed);
+            assert!(resolve_window_command_target(&a, &carried).is_err());
+            a.windows.insert(removed, window);
+        }
+    }
+}
+
+#[test]
+fn targeted_global_window_option_table_is_not_rewritten() {
+    let (tx, rx) = mpsc::channel();
+    let t = TempTarget { win: Some(11), win_is_id: true, ..Default::default() };
+    let (out, _) = mpsc::channel();
+    TargetedSender::new(&tx, Some(t)).send(CtrlReq::ShowWindowOptionValue(
+        out, "@probe".into(), crate::server::options::GLOBAL_WINDOW_TABLE.into())).unwrap();
+    let CtrlReq::Targeted(_, req) = rx.try_recv().unwrap() else { panic!("missing wrapper") };
+    let CtrlReq::ShowWindowOptionValue(_, _, target) = *req else { panic!("wrong request") };
+    assert_eq!(target, crate::server::options::GLOBAL_WINDOW_TABLE);
+}
+
+#[test]
+fn multi_target_requests_preserve_the_original_implicit_source() {
+    let (tx, rx) = mpsc::channel();
+    let t = TempTarget { win: Some(11), win_is_id: true, ..Default::default() };
+    let sender = TargetedSender::new(&tx, Some(t));
+    let (ack, _) = mpsc::channel();
+    sender.send(CtrlReq::SwapWindow { src: None, dst: "s:+".into(), detach: true, resp: ack.clone() }).unwrap();
+    sender.send(CtrlReq::MoveWindow { src: None, dst: Some("s:+3".into()), detach: true,
+        kill: false, renumber: false, after: false, before: false, resp: ack.clone() }).unwrap();
+    sender.send(CtrlReq::SwapPaneSrcDst { src: None, dst: "s:@11.%4".into(), detach: true, resp: ack }).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::SwapWindow { src: None, .. }));
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::MoveWindow { src: None, .. }));
+    assert!(matches!(rx.try_recv().unwrap(), CtrlReq::SwapPaneSrcDst { src: None, .. }));
+}
+
+#[test]
+fn in_server_relative_pane_refusals_precede_process_or_option_mutation() {
+    let mut a = app();
+    for command in ["respawn-pane -k -t %bad", "respawn-pane -k -t s:@10.%bad",
+        "set-option -p -t s:.bad @probe WRONG", "swap-pane -s s:%bad -t s:%4"] {
+        let before = active(&a);
+        let count = crate::tree::count_panes(&a.windows[0].root);
+        let error = crate::commands::execute_command_string(&mut a, command).unwrap_err();
+        assert!(error.to_string().contains("pane target"));
+        assert_eq!(active(&a), before);
+        assert_eq!(crate::tree::count_panes(&a.windows[0].root), count);
+    }
+}
+
+#[test]
+fn select_pane_relative_targets_resolve_once_to_stable_ids() {
+    let mut a = app();
+    for (raw, expected) in [("s:.+", 2), ("s:.-", 3), ("s:@10.+", 2), ("s:main.-", 3), ("s:+.+", 4)] {
+        let resolved = resolve_relative_pane_target(&a, raw).unwrap();
+        assert_eq!(resolved.pane, Some(expected), "{raw}");
+        assert!(resolved.pane_is_id);
+        assert_eq!(active(&a), (0, 1));
+        let id = crate::commands::resolve_in_server_target(&a, crate::commands::InServerTarget::Pane, raw).unwrap();
+        assert_eq!(id, Some(format!("%{expected}")));
+    }
+    assert!(resolve_relative_pane_target(&a, "other:.+").is_err());
+    assert!(resolve_relative_pane_target(&a, "s:missing.+").is_err());
+    let output = crate::cli::normalize_pane_target_args("select-pane", &["-t", "s:.+"], None,
+        |specs| crate::server::pane_target::resolve_all(&a, &specs.iter().map(|spec| spec.to_string()).collect::<Vec<_>>())).unwrap();
+    assert_eq!(output, ["-t", "%2"]);
+    assert_eq!(active(&a), (0, 1));
+}
+
+#[test]
+fn full_pane_resolution_preserves_navigation_symbols_and_identity() {
+    let mut a = app();
+    a.windows[0].pane_mru = vec![1, 3, 2];
+    a.marked_pane = Some((1, 4));
+    for (raw, expected) in [("s:.+2", 3), ("s:.-2", 2), ("s:.{next}", 2),
+        ("s:.{previous}", 3), ("s:.!", 3), ("s:.{last}", 3),
+        ("s:.{top-left}", 1), ("s:.{bottom-left}", 3), ("s:.TOP", 1),
+        ("s:.{down-of}", 2), ("s:.{up-of}", 3), ("~", 4), ("{marked}", 4),
+        ("s:@11.%4", 4), ("s:.%4", 4), (".%4", 4), ("s:%2", 2)] {
+        assert_eq!(crate::server::pane_target::resolve_pane(&a, raw).unwrap(), expected, "{raw}");
+        assert_eq!(active(&a), (0, 1), "lookup moved focus");
+    }
+    for raw in ["s:@11.%2", "other:%1", "%bad", "s:@10.%bad", "s:missing.0", "=", "{mouse}"] {
+        assert!(crate::server::pane_target::resolve_pane(&a, raw).is_err(), "{raw}");
+    }
+    a.pane_base_index = 5;
+    assert_eq!(crate::server::pane_target::resolve_pane(&a, "s:.5").unwrap(), 1);
+    assert_eq!(crate::server::pane_target::resolve_pane(&a, "s:.+").unwrap(), 2);
+}
+
+#[test]
+fn binding_commands_forward_resolved_identity_without_changing_focus() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    let mut a = app();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    a.control_port = Some(listener.local_addr().unwrap().port());
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut auth = String::new();
+        reader.read_line(&mut auth).unwrap();
+        assert!(auth.starts_with("AUTH "));
+        socket.write_all(b"OK\n").unwrap();
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        command
+    });
+    crate::commands::execute_command_string(&mut a, "select-pane -t :.+").unwrap();
+    assert_eq!(peer.join().unwrap().trim(), "select-pane -t %2");
+    assert_eq!(active(&a), (0, 1), "only the queued stable-id command changes focus");
+
+    // Mouse bindings acquire event identity before the ordinary command path.
+    for raw in ["select-pane -t =", "select-pane -t {mouse}"] {
+        let command = crate::mouse_keys::resolve_mouse_targets(raw, 3);
+        let tokens = crate::commands::parse_command_line(&command);
+        let args: Vec<_> = tokens[1..].iter().map(String::as_str).collect();
+        let normalized = crate::cli::normalize_pane_target_args(&tokens[0], &args, None,
+            |specs| crate::server::pane_target::resolve_all(&a, &specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())).unwrap();
+        assert_eq!(normalized, ["-t", "%3"]);
+    }
+}
+
+#[test]
+fn config_and_local_option_flags_preserve_scope_identity_and_value_text() {
+    let mut a = app();
+    crate::config::parse_config_line(&mut a, "set-option -wt s:@11 @scope '  value  # literal  '");
+    assert_eq!(a.windows[1].window_options.get("@scope").map(String::as_str), Some("  value  # literal  "));
+    assert!(!a.windows[0].window_options.contains_key("@scope"));
+    crate::config::parse_config_line(&mut a, "set-option -pt s:.+ @scope 'right pane'");
+    let pane = crate::tree::active_pane_mut(&mut a.windows[0].root, &vec![1]).unwrap();
+    assert_eq!(pane.pane_options.get("@scope").map(String::as_str), Some("right pane"));
+    for line in ["set-option -wt s:%bad @scope WRONG", "set-option -pt s:@10.%bad @scope WRONG"] {
+        crate::config::parse_config_line(&mut a, line);
+        assert_eq!(a.windows[1].window_options.get("@scope").map(String::as_str), Some("  value  # literal  "));
+        assert!(!a.windows[0].window_options.contains_key("@scope"));
+        assert!(!a.user_options.contains_key("@scope"));
+    }
+    assert_eq!(active(&a), (0, 1));
+}
+
+#[test]
+fn raw_window_targets_resolve_to_owning_stable_ids_without_focus_changes() {
+    let a = named("work", Some("window_unit"), 7);
+    let win = &a.windows[1];
+    let pane = crate::tree::get_active_pane_id(&win.root, &win.active_path).unwrap();
+    let before = active(&a);
+    let resolved = resolve_window_command_target(&a, &format!("work:%{pane}")).unwrap();
+    assert_eq!(resolved.win, Some(win.id));
+    assert!(resolved.win_is_id);
+    assert_eq!(resolved.pane, None);
+    for raw in ["work:%bad", "work:@bad", "work:.%bad", "work:%999999", "other:%1"] {
+        assert!(resolve_window_command_target(&a, raw).is_err(), "{raw}");
+    }
+    assert_eq!(active(&a), before);
+}
+
+// Issue #793: a target's session part is a claim about which server the
+// connection reached. Over the raw TCP protocol the reporter's script read the
+// first `<ns>*.port` file, which is the namespace's warm standby
+// (`<ns>____warm__` sorts before `<ns>__t`), and the standby ran
+// `send-keys -t t:@1.%1 C-c` and `respawn-pane -k -t t:@1.%1` on ITS OWN %1 and
+// answered OK. tmux answers "can't find session: t" (cmd-find.c).
+
+fn named(name: &str, ns: Option<&str>, id: usize) -> AppState {
+    let mut a = app();
+    a.session_name = name.to_string();
+    a.socket_name = ns.map(|s| s.to_string());
+    a.session_id = id;
+    a
+}
+
+fn session_only(s: &str) -> TempTarget {
+    TempTarget { session: Some(s.to_string()), ..Default::default() }
+}
+
+#[test]
+fn issue793_foreign_session_is_cant_find_session() {
+    let warm = named("__warm__", Some("ns793unit"), 4);
+    let t = TempTarget {
+        win: Some(10), win_is_id: true, pane: Some(1), pane_is_id: true,
+        session: Some("t".into()), ..Default::default()
+    };
+    assert_eq!(resolve_temp_target(&warm, &t).unwrap_err(), "can't find session: t");
+    assert_eq!(resolve_temp_target(&warm, &session_only("t")).unwrap_err(), "can't find session: t");
+    // Checked before the window and pane, so the message names the session.
+    let t = TempTarget { pane: Some(99), pane_is_id: true, session: Some("bogus".into()), ..Default::default() };
+    assert_eq!(resolve_temp_target(&warm, &t).unwrap_err(), "can't find session: bogus");
+    // Nothing moved.
+    assert_eq!(active(&warm), (0, 1));
+}
+
+#[test]
+fn issue793_own_session_in_every_spelling_resolves() {
+    let a = named("work", Some("ns793unit"), 7);
+    for s in ["work", "=work", "ns793unit__work", "$7", "wo"] {
+        assert!(session_names_this_server(&a, s), "{s} names this server");
+        let t = TempTarget { pane: Some(2), pane_is_id: true, session: Some(s.into()), ..Default::default() };
+        let r = resolve_temp_target(&a, &t).unwrap();
+        assert_eq!((r.pane, r.session.as_deref()), (Some(2), None), "{s}");
+    }
+    // A session-only target resolves to no window and no pane.
+    let r = resolve_temp_target(&a, &session_only("work")).unwrap();
+    assert_eq!((r.win, r.pane), (None, None));
+    for s in ["Work", "worker", "$8", "other", "ns793unit__other", "__warm__"] {
+        assert!(!session_names_this_server(&a, s), "{s} is another session");
+    }
+}
+
+#[test]
+fn issue793_which_targets_carry_a_session_to_check() {
+    use crate::server::connection::explicit_target_session;
+    let t = Some("t:@1.%1");
+    assert_eq!(explicit_target_session("send-keys", t).as_deref(), Some("t"));
+    assert_eq!(explicit_target_session("respawn-pane", t).as_deref(), Some("t"));
+    assert_eq!(explicit_target_session("respawn-window", Some("t:@1")).as_deref(), Some("t"));
+    assert_eq!(explicit_target_session("kill-window", Some("=t:@1")).as_deref(), Some("t"));
+    assert_eq!(explicit_target_session("select-pane", Some("t:0.1")).as_deref(), Some("t"));
+    // No explicit session: pane ids, window forms and bare words are unchanged.
+    for raw in ["%1", "@1.%1", ":1", ":.+", "0", "t", "main"] {
+        assert_eq!(explicit_target_session("send-keys", Some(raw)), None, "{raw}");
+    }
+    assert_eq!(explicit_target_session("send-keys", None), None);
+    // Targets that name another session or a client on purpose.
+    for cmd in ["switch-client", "detach-client", "kill-session", "has-session", "new-session",
+                "move-window", "link-window", "join-pane", "move-pane", "swap-window", "swap-pane",
+                "set-option", "refresh-client", "display-panes"] {
+        assert_eq!(explicit_target_session(cmd, t), None, "{cmd}");
+    }
+}
+
+// Issue #793 follow up: commands that resolve the pane of their -t themselves
+// (display-message, capture-pane and kill-pane by %id, select-pane) skipped
+// validation, so a pane that does not exist gave the ACTIVE pane's values
+// (`display-message -p -t %99` printed `%1`), an empty capture, or nothing,
+// all at exit 0 over TCP and control mode. tmux: "can't find pane: %99".
+
+fn check_only(pane: usize, is_id: bool) -> TempTarget {
+    TempTarget { pane: Some(pane), pane_is_id: is_id, pane_check_only: true, ..Default::default() }
+}
+
+fn add_float(app: &mut AppState, win: usize, id: usize) {
+    app.windows[win].floating.push(crate::types::FloatingPane {
+        pane: make_pane(id),
+        x: 0, y: 0, w: 10, h: 5,
+        border: String::new(),
+        id,
+        title: String::new(),
+        position: None,
+        styles: Default::default(),
+    });
+}
+
+#[test]
+fn issue793_check_only_pane_must_exist() {
+    let mut app = app();
+    add_float(&mut app, 1, 9);
+    assert_eq!(resolve_temp_target(&app, &check_only(99, true)).unwrap_err(), "can't find pane: %99");
+    assert_eq!(resolve_temp_target(&app, &check_only(7, false)).unwrap_err(), "can't find pane: 7");
+    // A tiled pane in another window and a floating pane both exist; the
+    // pane is not part of the resolved target (the command resolves it).
+    for t in [check_only(4, true), check_only(9, true), check_only(2, false)] {
+        let r = resolve_temp_target(&app, &t).unwrap();
+        assert_eq!((r.win, r.pane, r.pane_check_only), (None, None, false), "{t:?}");
+    }
+    // A floating pane's index follows the tiled ones, as #{pane_index} does:
+    // window 1 has %4 at 0 and the float %9 at 1.
+    let t = TempTarget { win: Some(1), pane: Some(1), pane_check_only: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap().win, Some(11));
+    let t = TempTarget { win: Some(1), pane: Some(2), pane_check_only: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap_err(), "can't find pane: 2");
+    // The window part is still resolved and still fails first.
+    let t = TempTarget { win: Some(9), pane: Some(0), pane_check_only: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap_err(), "can't find window: 9");
+    assert_eq!(active(&app), (0, 1));
+}
+
+#[test]
+fn issue793_which_commands_check_or_can_fail() {
+    use crate::server::connection::{pane_checked_not_focused, target_can_fail};
+    assert!(pane_checked_not_focused("display-message", false));
+    assert!(pane_checked_not_focused("display", true));
+    assert!(pane_checked_not_focused("capture-pane", true));
+    assert!(pane_checked_not_focused("kill-pane", true));
+    assert!(pane_checked_not_focused("killp", true));
+    // By index those two take the ordinary focused route.
+    assert!(!pane_checked_not_focused("capture-pane", false));
+    assert!(!pane_checked_not_focused("kill-pane", false));
+    // swap-pane resolves and reports its own target.
+    assert!(!pane_checked_not_focused("swap-pane", true));
+    // tmux CMD_FIND_CANFAIL commands that run without a target.
+    for c in ["run-shell", "run", "if-shell", "if", "source-file", "source"] {
+        assert!(target_can_fail(c), "{c}");
+    }
+    for c in ["display-message", "send-keys", "set-option", "kill-pane"] {
+        assert!(!target_can_fail(c), "{c}");
+    }
+}
+
+// Issue #793 follow up: a floating pane is a pane of its window for every
+// by-id request. It resolves, a -t naming it runs the request with it focused
+// (`floating_focus`, which input follows first), and a -t naming a TILED pane
+// takes that focus away for the request so a focused float cannot swallow it.
+
+#[test]
+fn issue793_floating_target_resolves_and_focuses_for_one_request() {
+    let mut app = app();
+    add_float(&mut app, 1, 9);
+    let t = TempTarget { pane: Some(9), pane_is_id: true, ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap().pane, Some(9));
+    // By index: window 1 has %4 at 0, the float at 1.
+    let t = TempTarget { win: Some(1), pane: Some(1), ..Default::default() };
+    assert_eq!(resolve_temp_target(&app, &t).unwrap().pane, Some(9));
+    let mut saved = None;
+    let t = TempTarget { pane: Some(9), pane_is_id: true, ..Default::default() };
+    apply_temp_target(&mut app, &mut saved, &t).unwrap();
+    assert_eq!((app.active_idx, app.windows[1].floating_focus), (1, Some(0)));
+    restore_temp_focus(&mut app, &mut saved);
+    assert_eq!((app.active_idx, app.windows[1].floating_focus), (0, None));
+    assert_eq!(active(&app), (0, 1));
+}
+
+#[test]
+fn issue793_tiled_target_is_not_swallowed_by_a_focused_float() {
+    let mut app = app();
+    add_float(&mut app, 0, 8);
+    app.windows[0].floating_focus = Some(0);
+    let mut saved = None;
+    let t = TempTarget { pane: Some(2), pane_is_id: true, ..Default::default() };
+    apply_temp_target(&mut app, &mut saved, &t).unwrap();
+    assert_eq!(app.windows[0].floating_focus, None, "the request runs on %2, not on the float");
+    assert_eq!(active(&app), (0, 2));
+    restore_temp_focus(&mut app, &mut saved);
+    assert_eq!(app.windows[0].floating_focus, Some(0), "the float gets its focus back");
+    assert_eq!(active(&app), (0, 1));
+}
+
+#[test]
+fn issue793_focus_pane_by_id_moves_floating_focus() {
+    let mut app = app();
+    add_float(&mut app, 1, 9);
+    crate::tree::focus_pane_by_id(&mut app, 9);
+    assert_eq!((app.active_idx, app.windows[1].floating_focus), (1, Some(0)));
+    crate::tree::focus_pane_by_id(&mut app, 4);
+    assert_eq!((app.active_idx, app.windows[1].floating_focus), (1, None));
+}
+
+#[test]
+fn issue793_swap_pane_trades_a_float_with_a_tiled_pane() {
+    let mut app = app();
+    add_float(&mut app, 0, 8);
+    assert_eq!(crate::window_ops::swap_pane_by_spec(&mut app, Some("%8"), "%2", true), Ok(true));
+    assert_eq!(app.windows[0].floating[0].id, 2);
+    assert_eq!(app.windows[0].floating[0].pane.id, 2);
+    assert!(crate::tree::find_pane_by_id_global(&app, 8).is_some(), "%8 is tiled now");
+    assert!(crate::tree::find_pane_by_id_global(&app, 2).is_none());
+    // And two floats in different windows trade places too.
+    add_float(&mut app, 1, 9);
+    assert_eq!(crate::window_ops::swap_pane_by_spec(&mut app, Some("%2"), "%9", true), Ok(true));
+    assert_eq!((app.windows[0].floating[0].id, app.windows[1].floating[0].id), (9, 2));
+}

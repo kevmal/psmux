@@ -53,14 +53,80 @@ fn path_with_spaces_spawns_directly() {
 }
 
 #[test]
-fn bare_program_names_keep_shell_wrapper() {
-    // Bare names (no path separator) intentionally stay on the shell
-    // wrapper: console utilities like timeout.exe exit immediately when
-    // spawned without the shell re-establishing console stdin, and bare
-    // invocations relied on shell semantics historically.
-    assert!(try_direct_spawn("cmd.exe /c exit").is_none());
-    assert!(try_direct_spawn("timeout /T 120 /nobreak").is_none());
-    assert!(try_direct_spawn("ping -t 127.0.0.1").is_none());
+fn bare_program_name_with_args_spawns_directly() {
+    // tmux execvp's a multi-argument shell-command and only routes a single
+    // one through the shell (spawn.c), so a bare name WITH arguments belongs
+    // on the direct path. psmux used to wrap those in `<shell> -Command`,
+    // which on Windows is a whole second pwsh start: `new-session pwsh
+    // -NoLogo -NoProfile -NoExit -File x.ps1` measured 278ms slower to its
+    // first prompt than the same command exec'd directly, and the wrapper
+    // (which has no -NoProfile of its own) also sourced the user's profile
+    // that the inner -NoProfile had asked to skip.
+    //
+    // The carve-out this test used to pin, namely console utilities supposedly
+    // needing the shell to re-establish console stdin, was re-measured and
+    // does not reproduce: `timeout /t 3`, `ping -n 2 127.0.0.1` and
+    // `nvim <file>` all run correctly spawned straight into a pane's ConPTY.
+    let (prog, args) =
+        try_direct_spawn("cmd.exe /c exit").expect("bare exe + args must direct-spawn");
+    assert!(prog.to_lowercase().ends_with("cmd.exe"), "resolved to {prog}");
+    assert!(prog.contains('\\'), "must resolve to a full path, got {prog}");
+    assert_eq!(args, vec!["/c", "exit"]);
+
+    let (prog, args) =
+        try_direct_spawn("timeout /T 120 /nobreak").expect("timeout + args must direct-spawn");
+    assert!(prog.to_lowercase().ends_with("timeout.exe"), "resolved to {prog}");
+    assert_eq!(args, vec!["/T", "120", "/nobreak"]);
+
+    let (prog, args) =
+        try_direct_spawn("ping -t 127.0.0.1").expect("ping + args must direct-spawn");
+    assert!(prog.to_lowercase().ends_with("ping.exe"), "resolved to {prog}");
+    assert_eq!(args, vec!["-t", "127.0.0.1"]);
+}
+
+#[test]
+fn lone_bare_program_name_keeps_the_shell() {
+    // A single-word command is tmux's shell case, and on Windows it is also
+    // the only thing that keeps `ls`, `cat`, `sort` and `where` resolving as
+    // the PowerShell aliases users mean by them.
+    assert!(try_direct_spawn("cmd.exe").is_none());
+    assert!(try_direct_spawn("timeout").is_none());
+}
+
+#[test]
+fn bare_name_resolving_to_a_script_keeps_the_shell() {
+    // `npm` is an extensionless Node script and `<x>.cmd`/`.bat`/`.ps1` need
+    // their interpreter; CreateProcessW refuses all of them with "%1 is not a
+    // valid Win32 application" (measured: `new-session -- npm --version` dies
+    // with os error 193), which would fail the whole pane spawn. Only
+    // .exe/.com may take the direct path.
+    let _lock = crate::util::lock_test_env();
+    let dir = std::env::temp_dir().join("psmux 492 script fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixture = "psmux492fixturelauncher";
+    std::fs::write(dir.join(format!("{fixture}.cmd")), b"@rem fixture").unwrap();
+    let old = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{};{}", dir.display(), old));
+    let got = try_direct_spawn(&format!("{fixture} --version"));
+    std::env::set_var("PATH", &old);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        got.is_none(),
+        "a .cmd launcher must keep the shell route, got {got:?}"
+    );
+}
+
+#[test]
+fn bare_shell_with_flags_is_not_wrapped_in_another_shell() {
+    // End-to-end guard on the launch-to-prompt path: the pane command must be
+    // the program itself, never `<shell> -Command "<the whole command>"`.
+    let builder = build_command(Some("cmd.exe /c exit"), false, false);
+    let argv = format!("{:?}", builder.get_argv()).to_lowercase();
+    assert!(
+        !argv.contains("-command"),
+        "no shell wrapper expected for a bare exe + args, got: {argv}"
+    );
+    assert!(argv.contains("cmd.exe"), "got: {argv}");
 }
 
 #[test]
@@ -100,10 +166,19 @@ fn build_command_direct_spawn_has_no_shell_wrapper() {
     // target the exe itself, not pwsh/powershell/cmd wrapping it.
     let cmd = format!("{}\\System32\\cmd.exe", windir());
     let builder = build_command(Some(&cmd), false, false);
-    let line = format!("{:?}", builder);
+    // The arguments the pane will be spawned with. The builder's Debug text
+    // also carries its environment and working directory, so a branch or a
+    // checkout path with "command" in its name (GITHUB_HEAD_REF in CI) read
+    // as a `-Command` wrapper there.
+    let argv: Vec<String> = builder
+        .get_argv()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     assert!(
-        !line.to_lowercase().contains("-command"),
-        "no `-Command` wrapper expected for a plain exe, got: {}",
-        line
+        !argv.iter().any(|a| a.eq_ignore_ascii_case("-command")),
+        "no `-Command` wrapper expected for a plain exe, got: {:?}",
+        argv
     );
+    assert_eq!(argv.first().map(String::as_str), Some(cmd.as_str()), "the exe itself is spawned: {:?}", argv);
 }

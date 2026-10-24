@@ -18,9 +18,15 @@
 use crate::types::AppState;
 use crate::config::{parse_config_content, parse_config_line};
 use crate::commands::execute_command_string;
-use std::sync::Mutex;
-
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+/// The process environment has exactly one owner across the whole test binary,
+/// and it is `crate::util::lock_test_env`. A second, file-local mutex only
+/// serialises this file against itself, so the three cursor tests below could
+/// still set `PSMUX_CURSOR_STYLE` while a test in another file was reading it,
+/// which is how `every_catalog_default_matches_a_fresh_appstate` could see a
+/// cursor style nobody configured.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::util::lock_test_env()
+}
 
 fn mock_app() -> AppState {
     AppState::new("config-test".to_string())
@@ -32,7 +38,9 @@ fn mock_app() -> AppState {
 
 #[test]
 fn default_escape_time() {
+    // Fork retains its pre-upgrade 500 ms default; upstream uses 10 ms.
     let app = mock_app();
+    assert_eq!(app.escape_time_ms, crate::types::DEFAULT_ESCAPE_TIME_MS);
     assert_eq!(app.escape_time_ms, 500);
 }
 
@@ -147,7 +155,8 @@ fn default_mode_keys() {
 #[test]
 fn default_word_separators() {
     let app = mock_app();
-    assert_eq!(app.word_separators, " -_@");
+    // tmux's default (options-table.c): ASCII punctuation minus the underscore.
+    assert_eq!(app.word_separators, "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~");
 }
 
 #[test]
@@ -369,13 +378,13 @@ fn default_status_right_style() {
 #[test]
 fn default_main_pane_width() {
     let app = mock_app();
-    assert_eq!(app.main_pane_width, 0);
+    assert_eq!(app.main_pane_width, "80", "tmux options-table.c default");
 }
 
 #[test]
 fn default_main_pane_height() {
     let app = mock_app();
-    assert_eq!(app.main_pane_height, 0);
+    assert_eq!(app.main_pane_height, "24", "tmux options-table.c default");
 }
 
 #[test]
@@ -399,6 +408,7 @@ fn default_copy_command() {
 #[test]
 fn default_set_clipboard() {
     let app = mock_app();
+    // The fork retains its pre-upgrade application OSC 52 buffer behavior.
     assert_eq!(app.set_clipboard, "on");
 }
 
@@ -929,14 +939,14 @@ fn config_file_mode_style() {
 fn config_file_main_pane_width() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g main-pane-width 80\n");
-    assert_eq!(app.main_pane_width, 80);
+    assert_eq!(app.main_pane_width, "80");
 }
 
 #[test]
 fn config_file_main_pane_height() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g main-pane-height 40\n");
-    assert_eq!(app.main_pane_height, 40);
+    assert_eq!(app.main_pane_height, "40");
 }
 
 #[test]
@@ -1169,6 +1179,30 @@ fn config_only_if_unset_sets_window_style_after_unset() {
 }
 
 #[test]
+fn negative_integer_is_rejected_before_only_if_unset_short_circuit() {
+    let mut app = mock_app();
+    parse_config_content(
+        &mut app,
+        "set -g history-limit 42\n\
+         set -go history-limit -1\n",
+    );
+    assert_eq!(app.history_limit, 42);
+    // An integer that is simply out of range is reported with tmux's strtonum
+    // wording (options.c:1295), which names the value and not the option; the
+    // config warning already carries the file and line that names it. A value
+    // that is not an integer at all still gets the psmux message that does name
+    // the option, see malformed_numeric_keeps_prior_value in
+    // test_issue370_config_warnings.rs.
+    assert!(
+        app.config_warnings
+            .iter()
+            .any(|warning| warning.contains("value is too small: -1")),
+        "expected an out of range refusal, got: {:?}",
+        app.config_warnings,
+    );
+}
+
+#[test]
 fn config_file_wrap_search() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g wrap-search on\n");
@@ -1268,13 +1302,26 @@ fn config_flag_u_unset_numeric_option() {
     // -u RESTORES THE TABLE DEFAULT (#619). This used to assert 100, pinning
     // the defect: the config parser applied an EMPTY value on -u, `"".parse()`
     // failed, and the number the user had set simply stayed. The same
-    // `set -gu escape-time` on the CLI route restored 500, so the two routes
+    // `set -gu escape-time` on the CLI route restored the default, so the two routes
     // disagreed about what an unset even means. tmux runs every unset through
     // options_remove_or_default (options.c), which writes the options-table
     // default at a global scope.
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g escape-time 100\nset -gu escape-time\n");
-    assert_eq!(app.escape_time_ms, 500);
+    assert_eq!(app.escape_time_ms, crate::types::DEFAULT_ESCAPE_TIME_MS);
+}
+
+#[test]
+fn config_explicit_empty_numeric_value_is_rejected() {
+    let mut app = mock_app();
+    parse_config_content(
+        &mut app,
+        "set -g escape-time 100\nset -g escape-time \"\"\n",
+    );
+    assert_eq!(app.escape_time_ms, 100);
+    assert!(app.config_warnings.iter().any(|warning| {
+        warning.contains("escape-time") && warning.contains("expected a number")
+    }));
 }
 
 #[test]
@@ -1302,11 +1349,12 @@ fn config_flag_a_append_user_option() {
 
 #[test]
 fn config_flag_q_quiet() {
-    // -q should silently accept unknown options
+    // -q silences an unknown option the way tmux's -q does: no warning, and,
+    // as in tmux, nothing is stored (#846).
     let mut app = mock_app();
     parse_config_content(&mut app, "set -gq nonexistent-unknown value\n");
-    // No crash, option stored in user_options because it has hyphens
-    assert!(app.user_options.contains_key("nonexistent-unknown"));
+    assert!(!app.user_options.contains_key("nonexistent-unknown"));
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
 }
 
 #[test]
@@ -1500,14 +1548,14 @@ fn cli_set_status_justify() {
 fn cli_set_main_pane_width() {
     let mut app = mock_app();
     execute_command_string(&mut app, "set-option -g main-pane-width 60").unwrap();
-    assert_eq!(app.main_pane_width, 60);
+    assert_eq!(app.main_pane_width, "60");
 }
 
 #[test]
 fn cli_set_main_pane_height() {
     let mut app = mock_app();
     execute_command_string(&mut app, "set-option -g main-pane-height 30").unwrap();
-    assert_eq!(app.main_pane_height, 30);
+    assert_eq!(app.main_pane_height, "30");
 }
 
 #[test]
@@ -1764,7 +1812,7 @@ fn config_nested_if_outer_false() {
     let mut app = mock_app();
     parse_config_content(&mut app, "%if \"0\"\n%if \"1\"\nset -g escape-time 999\n%endif\n%endif\n");
     // Should remain default because outer %if is false
-    assert_eq!(app.escape_time_ms, 500);
+    assert_eq!(app.escape_time_ms, crate::types::DEFAULT_ESCAPE_TIME_MS);
 }
 
 #[test]
@@ -1804,7 +1852,11 @@ fn config_hidden_basic() {
 fn config_hidden_in_environment() {
     let mut app = mock_app();
     parse_config_content(&mut app, "%hidden THEME=dark\n");
-    assert_eq!(app.environment.get("THEME").unwrap(), "dark");
+    // tmux keeps %hidden in the global environment as a hidden entry: not
+    // in the session map, never passed to a child (#775).
+    assert_eq!(app.env_scopes.global_hidden.get("THEME").unwrap(), "dark");
+    assert!(!app.environment.contains_key("THEME"));
+    assert_eq!(app.env_scopes.child_removals(&app.environment), vec!["THEME".to_string()]);
 }
 
 #[test]
@@ -1835,20 +1887,21 @@ fn config_hidden_inside_if_false() {
     let mut app = mock_app();
     parse_config_content(&mut app, "%if \"0\"\n%hidden NOPE=yes\n%endif\n");
     assert!(!app.environment.contains_key("NOPE"));
+    assert!(app.env_scopes.hidden_value("NOPE").is_none());
 }
 
 #[test]
 fn config_hidden_inside_if_true() {
     let mut app = mock_app();
     parse_config_content(&mut app, "%if \"1\"\n%hidden YES=yep\n%endif\n");
-    assert_eq!(app.environment.get("YES").unwrap(), "yep");
+    assert_eq!(app.env_scopes.hidden_value("YES").as_deref(), Some("yep"));
 }
 
 #[test]
 fn config_hidden_quoted_value() {
     let mut app = mock_app();
     parse_config_content(&mut app, "%hidden GREETING=\"hello world\"\n");
-    assert_eq!(app.environment.get("GREETING").unwrap(), "hello world");
+    assert_eq!(app.env_scopes.hidden_value("GREETING").as_deref(), Some("hello world"));
 }
 
 // --- UTF-8 BOM handling ---
@@ -2023,9 +2076,25 @@ fn config_setenv_alias() {
 
 #[test]
 fn config_set_environment_with_flags() {
+    let _g = env_lock();
     let mut app = mock_app();
-    parse_config_content(&mut app, "set-environment -g GLOBAL_VAR gval\n");
-    assert_eq!(app.environment.get("GLOBAL_VAR").unwrap(), "gval");
+    parse_config_content(&mut app, "set-environment -g PSMUX_T775_CFG_GLOBAL gval\n");
+    // -g is the global environment (this server's process environment, what
+    // every child inherits), not the session map (#775).
+    assert!(!app.environment.contains_key("PSMUX_T775_CFG_GLOBAL"));
+    assert_eq!(std::env::var("PSMUX_T775_CFG_GLOBAL").as_deref(), Ok("gval"));
+    let shown = crate::environ::show(&app.environment, &app.env_scopes,
+        &crate::environ::parse_show_environment(&["-g", "PSMUX_T775_CFG_GLOBAL"]).unwrap()).unwrap();
+    assert_eq!(shown, "PSMUX_T775_CFG_GLOBAL=gval\n");
+    // -r in a config is a removal marker, -u drops it.
+    parse_config_content(&mut app, "set-environment -g -r PSMUX_T775_CFG_GLOBAL\n");
+    assert!(std::env::var("PSMUX_T775_CFG_GLOBAL").is_err());
+    assert!(app.config_warnings.is_empty(), "{:?}", app.config_warnings);
+    parse_config_content(&mut app, "set-environment -gu PSMUX_T775_CFG_GLOBAL\n");
+    // Unquoted multi word values keep working from a config.
+    parse_config_content(&mut app, "set-environment PSMUX_T775_CFG_WORDS hello big world\n");
+    assert_eq!(app.environment.get("PSMUX_T775_CFG_WORDS").unwrap(), "hello big world");
+    parse_config_content(&mut app, "set-environment -u PSMUX_T775_CFG_WORDS\n");
 }
 
 // --- source-file via config file ---
@@ -2114,8 +2183,8 @@ bind-key -r Down select-pane -D
 "#;
     parse_config_content(&mut app, config);
     assert!(app.mouse_enabled);
-    assert_eq!(app.prefix_key.0, crossterm::event::KeyCode::Char('a'));
-    assert!(app.prefix_key.1.contains(crossterm::event::KeyModifiers::CONTROL));
+    assert_eq!(app.prefix_key.unwrap().0, crossterm::event::KeyCode::Char('a'));
+    assert!(app.prefix_key.unwrap().1.contains(crossterm::event::KeyModifiers::CONTROL));
     let prefix = app.key_tables.get("prefix").unwrap();
     assert!(prefix.iter().any(|b| b.key.0 == crossterm::event::KeyCode::Char('|')));
     assert!(prefix.iter().any(|b| b.key.0 == crossterm::event::KeyCode::Char('-')));
@@ -2227,7 +2296,7 @@ fn config_invalid_numeric_ignored() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g escape-time notanumber\n");
     // Should remain default
-    assert_eq!(app.escape_time_ms, 500);
+    assert_eq!(app.escape_time_ms, crate::types::DEFAULT_ESCAPE_TIME_MS);
 }
 
 #[test]
@@ -2286,8 +2355,8 @@ fn config_unquoted_value() {
 fn config_prefix_c_a() {
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g prefix C-a\n");
-    assert_eq!(app.prefix_key.0, crossterm::event::KeyCode::Char('a'));
-    assert!(app.prefix_key.1.contains(crossterm::event::KeyModifiers::CONTROL));
+    assert_eq!(app.prefix_key.unwrap().0, crossterm::event::KeyCode::Char('a'));
+    assert!(app.prefix_key.unwrap().1.contains(crossterm::event::KeyModifiers::CONTROL));
 }
 
 #[test]
@@ -2329,7 +2398,7 @@ fn config_multiple_command_aliases() {
 
 #[test]
 fn config_cursor_style_sets_env() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = env_lock();
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g cursor-style block\n");
     assert_eq!(std::env::var("PSMUX_CURSOR_STYLE").unwrap(), "block");
@@ -2339,7 +2408,7 @@ fn config_cursor_style_sets_env() {
 
 #[test]
 fn config_cursor_blink_on() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = env_lock();
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g cursor-blink on\n");
     assert_eq!(std::env::var("PSMUX_CURSOR_BLINK").unwrap(), "1");
@@ -2348,7 +2417,7 @@ fn config_cursor_blink_on() {
 
 #[test]
 fn config_cursor_blink_off() {
-    let _lock = ENV_MUTEX.lock().unwrap();
+    let _lock = env_lock();
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g cursor-blink off\n");
     assert_eq!(std::env::var("PSMUX_CURSOR_BLINK").unwrap(), "0");

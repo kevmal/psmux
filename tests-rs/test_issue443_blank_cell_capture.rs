@@ -39,39 +39,25 @@ const COLS: u16 = 40;
 const CUF_PAYLOAD: &[u8] = b"CUFA\x1b[4CCUFB\x1b[4CCUFC";
 const CUF_EXPECTED: &str = "CUFA    CUFB    CUFC";
 
-/// ConPTY creation and the dummy spawn can fail transiently when the full
-/// suite churns many short-lived PTYs in parallel; this file added 14 more
-/// tests to that pool and one full-suite run saw two of them fail while the
-/// same tests pass in isolation every time. Retry with backoff, and when it
-/// still fails surface WHICH stage broke instead of a bare `.expect`.
+/// The master, child and writer a pane fixture needs, with no pseudo console
+/// and no process behind any of them. See `util::stub_pane_pty`.
+///
+/// This used to open a real ConPTY and spawn `cmd /c exit` into it, behind five
+/// attempts with backoff: under the full parallel suite both steps failed often
+/// enough that two tests in this file once failed a run while passing in
+/// isolation. Nothing here ever used the console or the process, so there is
+/// nothing left to retry.
 fn open_pane_pty(
     rows: u16,
     cols: u16,
-) -> (Box<dyn portable_pty::MasterPty + Send>, Box<dyn portable_pty::Child + Send + Sync>, Box<dyn std::io::Write + Send>) {
-    let mut last_err = String::new();
-    for attempt in 0u64..5 {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(100 * attempt));
-        }
-        let pty = portable_pty::native_pty_system();
-        let pair = match pty.openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
-            Ok(p) => p,
-            Err(e) => { last_err = format!("openpty: {e:?}"); continue; }
-        };
-        let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
-        cmd.arg("/c");
-        cmd.arg("exit");
-        let child = match pair.slave.spawn_command(cmd) {
-            Ok(c) => c,
-            Err(e) => { last_err = format!("spawn dummy: {e:?}"); continue; }
-        };
-        let writer = match pair.master.take_writer() {
-            Ok(w) => w,
-            Err(e) => { last_err = format!("take_writer: {e:?}"); continue; }
-        };
-        return (pair.master, child, writer);
-    }
-    panic!("PTY-backed pane creation failed after 5 attempts under parallel load: {last_err}");
+) -> (Box<dyn portable_pty::MasterPty>, Box<dyn portable_pty::Child + Send + Sync>, Box<dyn crate::pane::PaneInputSink>) {
+    let (master, writer) = crate::util::stub_pane_pty(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    (master, crate::util::StubChild::exited(), writer)
 }
 
 fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
@@ -97,17 +83,19 @@ fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
         scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: Arc::new(AtomicU8::new(0)),
         bell_pending: Arc::new(AtomicBool::new(false)),
         cpr_pending: Arc::new(AtomicBool::new(false)),
         color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        copy_state: None,
+        copy_state: None, live_term: None,
         pane_style: None, pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         spawned_at: None,
+        start_command: String::new(),
+        cwd_hint: None,
     }
 }
 
@@ -119,6 +107,7 @@ fn make_window(id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -158,7 +147,7 @@ fn first_line(text: &str) -> String {
 }
 
 fn newest_buffer(app: &AppState) -> String {
-    app.paste_buffers.first().cloned().unwrap_or_default()
+    app.paste_top().unwrap_or_default().to_string()
 }
 
 /// The Win32 clipboard is a single process-global resource, and reading it
@@ -310,7 +299,9 @@ fn yank_line_selection_keeps_cuf_gaps() {
 fn yank_char_selection_keeps_cuf_gaps() {
     let _clip = ClipboardGuard::new();
     let mut app = app_showing(CUF_PAYLOAD);
-    // Single-line char selection covering exactly "CUFA    CUFB".
+    // vi keys copy the cell under the end too (emacs keys leave it out, as
+    // tmux does), so this char selection covers exactly "CUFA    CUFB".
+    app.mode_keys = "vi".to_string();
     select_all_of_row0(&mut app, SelectionMode::Char, 11);
     yank_selection(&mut app).expect("yank");
     assert_eq!(

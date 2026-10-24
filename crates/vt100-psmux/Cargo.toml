@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "vt100-psmux"
-version = "0.16.12"
+version = "0.16.13"
 authors = ["Jesse Luehrs <doy@tozt.net>"]
 build = false
 include = [
@@ -73,6 +73,26 @@ path = "tests/osc7_windows_path.rs"
 name = "issue589_undercurl"
 path = "tests/issue589_undercurl.rs"
 
+[[test]]
+name = "issue641_scrollback_compaction"
+path = "tests/issue641_scrollback_compaction.rs"
+
+[[test]]
+name = "issue685_osc4_palette"
+path = "tests/issue685_osc4_palette.rs"
+
+[[test]]
+name = "issue749_emoji_clusters"
+path = "tests/issue749_emoji_clusters.rs"
+
+[[test]]
+name = "program_status"
+path = "tests/program_status.rs"
+
+[[test]]
+name = "query_detector"
+path = "tests/query_detector.rs"
+
 [dependencies.itoa]
 version = "1.0.18"
 
@@ -90,7 +110,7 @@ features = ["term"]
 version = "1.1.0"
 
 [dev-dependencies.rand]
-version = "0.10.2"
+version = "0.10.3"
 
 [dev-dependencies.serde]
 version = "1.0.229"

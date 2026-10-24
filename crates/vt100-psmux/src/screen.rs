@@ -1,5 +1,4 @@
 use crate::term::BufWrite as _;
-use unicode_width::UnicodeWidthChar as _;
 
 /// Parse an OSC 7 URI into a filesystem path.
 /// Accepts `file://hostname/path`, `file:///path`, or a bare `/path`.
@@ -116,10 +115,23 @@ pub struct Screen {
     /// DECSET 1049 restored the app's colors instead of the shell's, and every
     /// line printed afterwards inherited them.
     alternate_saved_attrs: crate::attrs::Attrs,
+    /// Where the cursor was on the main screen when the alternate screen was
+    /// entered, `None` while it is not in use (tmux's `saved_cx`/`saved_cy`,
+    /// set by screen_alternate_on and reset by screen_alternate_off).
+    alternate_saved_cursor: Option<(u16, u16)>,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
     mouse_protocol_encoding: MouseProtocolEncoding,
+
+    /// Which of DECSET 1005 and 1006 the application currently has ON, kept
+    /// apart from `mouse_protocol_encoding` because they are two independent
+    /// switches and the encoding is only one answer.  tmux stores them as two
+    /// bits of the pane's screen mode (`MODE_MOUSE_UTF8` 0x100 and
+    /// `MODE_MOUSE_SGR` 0x200, tmux.h:683) and reports each on its own through
+    /// `#{mouse_utf8_flag}` / `#{mouse_sgr_flag}` (format.c:2015, 1991), so an
+    /// application that turned both on has both flags set.  Issue #662.
+    mouse_encoding_flags: u8,
 
     /// Window title set by the application via OSC 0 or OSC 2.
     osc_title: String,
@@ -133,6 +145,10 @@ pub struct Screen {
     /// 3=indeterminate,4=warning} and value ∈ 0..=100. `None` until first set;
     /// stays `Some` after that so a clear (state=0) is also forwarded.
     osc94_progress: Option<(u8, u8)>,
+    program_status: crate::ProgramStatuses,
+    program_status_enabled: bool,
+    capture_queries: bool,
+    pending_queries: Vec<crate::TerminalQuery>,
 
     /// Pending OSC 52 clipboard payload emitted by the child process inside
     /// this pane.  Format: `Some((selector_bytes, base64_payload))`.  The
@@ -163,6 +179,18 @@ pub struct Screen {
     /// alone so a prior SetUserVar/633;E can "latch" via the subsequent C marker.
     osc_shell_command: Option<String>,
 
+    /// Per pane colour palette set by OSC 4 and emptied by OSC 104 / RIS
+    /// (issue #685).  `None` until the first entry is set, so a pane that
+    /// never touches its palette costs one pointer and renders byte for byte
+    /// as it did before.  tmux keeps the same thing on the pane
+    /// (`tmux.h:1379`) and allocates it lazily too (`colour.c:1280`).
+    palette: Option<Box<crate::palette::ColourPalette>>,
+
+    /// Bumped on every change to `palette`.  The pane reader thread compares
+    /// it to the value it last published so it can mirror the low sixteen
+    /// entries for the OSC 4 query responder without locking on every batch.
+    palette_generation: u64,
+
     /// Set to `true` when the screen is cleared (CSI 2J) while
     /// `squelch_clear_pending` is active.  The layout serialiser
     /// checks this flag to know that `cls` has finished.
@@ -192,6 +220,85 @@ pub struct Screen {
     /// tmux approach) does not preserve content on this platform.
     /// Copy-on-exit is the equivalent end-user behaviour.
     pub(crate) allow_alternate_screen: bool,
+
+    /// True once the output stream asked its terminal for win32 input mode
+    /// (`CSI ?9001h`).  On a psmux pane that request comes from the pane's
+    /// console host itself, as the very first bytes it writes (`ESC[?9001h
+    /// ESC[?1004h` on build 26200), and it is the host's way of saying it can
+    /// parse `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` key records written into its
+    /// input.  A host that predates win32 input mode (the Windows 10 19041
+    /// inbox conhost, OpenConsole 1.0) never sends it.  Issue #845.
+    ///
+    /// Sticky: `CSI ?9001l` does not clear it, because a program in the pane
+    /// that turns the mode off again on exit says nothing about the host, and
+    /// RIS keeps it because a reset of the screen is not a new host.
+    win32_input_requested: bool,
+
+    /// tmux's `MODE_KEYS_EXTENDED` / `MODE_KEYS_EXTENDED_2` (tmux.h), the
+    /// extended key reporting mode this pane's application asked for:
+    /// 0 is the standard (VT10x) mode, 1 is xterm modifyOtherKeys=1 and 2
+    /// is modifyOtherKeys=2.  Set by `CSI > 4 ; n m` and cleared by
+    /// `CSI > 4 n`, both filtered through the `extended-keys` server option
+    /// exactly as tmux's input.c does (INPUT_CSI_MODSET / INPUT_CSI_MODOFF),
+    /// and reset by RIS.  Issue #860.
+    extended_keys_mode: u8,
+}
+
+/// The `extended-keys` server option as a number, tmux's
+/// `options_table_extended_keys_list` order: 0 off, 1 on, 2 always.  One per
+/// process because tmux reads it from `global_options` while it parses pane
+/// output; psmux stores it here so the parser can do the same.
+static EXTENDED_KEYS_OPTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Record the `extended-keys` server option (0 off, 1 on, 2 always) for every
+/// pane parser in this process.  See [`Screen::extended_keys_mode`].
+pub fn set_extended_keys_option(value: u8) {
+    EXTENDED_KEYS_OPTION.store(value.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `extended-keys` server option last given to
+/// [`set_extended_keys_option`].
+#[must_use]
+pub fn extended_keys_option() -> u8 {
+    EXTENDED_KEYS_OPTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The mode a fresh or reset screen starts in: tmux's `screen_reinit` and
+/// `screen_write_reset` put a screen into mode 1 when `extended-keys` is
+/// `always`, and into the standard mode otherwise.
+fn initial_extended_keys_mode() -> u8 {
+    if extended_keys_option() == 2 { 1 } else { 0 }
+}
+
+/// The extended key mode after `CSI > resource ; level m` arrives in a pane
+/// whose mode is `current`, with the `extended-keys` option at `ek` (0 off,
+/// 1 on, 2 always).  tmux input.c INPUT_CSI_MODSET: only resource 4 counts,
+/// nothing changes while the option is off, level 2 is mode 2, and level 1
+/// (or any level under `always`) is mode 1.  Pure, so the state machine is
+/// pinned by unit tests whatever the process option holds.
+#[must_use]
+pub fn xtmodkeys_set_mode(current: u8, ek: u8, resource: u16, level: u16) -> u8 {
+    if resource != 4 || ek == 0 {
+        return current;
+    }
+    if level == 2 {
+        2
+    } else if level == 1 || ek == 2 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The extended key mode after `CSI > resource n`.  tmux input.c
+/// INPUT_CSI_MODOFF: resource 4 clears the mode, then `always` puts mode 1
+/// back.
+#[must_use]
+pub fn xtmodkeys_off_mode(current: u8, ek: u8, resource: u16) -> u8 {
+    if resource != 4 {
+        return current;
+    }
+    if ek == 2 { 1 } else { 0 }
 }
 
 impl Screen {
@@ -208,20 +315,30 @@ impl Screen {
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
             alternate_saved_attrs: crate::attrs::Attrs::default(),
+            alternate_saved_cursor: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
             mouse_protocol_encoding: MouseProtocolEncoding::default(),
+            mouse_encoding_flags: 0,
             osc_title: String::new(),
             osc7_path: None,
             osc94_progress: None,
+            program_status: crate::ProgramStatuses::default(),
+            program_status_enabled: false,
+            capture_queries: false,
+            pending_queries: Vec::new(),
             osc52_clipboard: None,
             hyperlinks: Vec::new(),
             osc_shell_command: None,
+            palette: None,
+            palette_generation: 0,
             squelch_cleared: false,
             squelch_clear_pending: false,
             audible_bell_count: 0,
             allow_alternate_screen: true,
+            win32_input_requested: false,
+            extended_keys_mode: initial_extended_keys_mode(),
         }
     }
 
@@ -264,6 +381,64 @@ impl Screen {
     #[must_use]
     pub fn scrollback_filled(&self) -> usize {
         self.grid.scrollback_filled()
+    }
+
+    /// Returns the number of rows held in the scrollback of the grid that
+    /// is in use, the one `cell` and `set_scrollback` work on: none while
+    /// the alternate grid is up, since it keeps no scrollback.  A reader
+    /// that walks lines by moving the scrollback offset needs this count,
+    /// not `scrollback_filled`, or it reads rows the offset cannot reach.
+    #[must_use]
+    pub fn active_scrollback_filled(&self) -> usize {
+        self.grid().scrollback_filled()
+    }
+
+    /// Returns roughly how many bytes the main grid's scrollback holds: the
+    /// cells the history rows actually store, plus per-row bookkeeping.  Since
+    /// a row is compacted to its used width when it becomes history (issue
+    /// #641), this tracks the text retained rather than the pane's width.
+    /// Reported as tmux's `#{history_bytes}`.
+    #[must_use]
+    pub fn history_bytes(&self) -> usize {
+        self.grid.history_bytes()
+    }
+
+    /// Reset the screen for a new process while KEEPING the main grid's
+    /// history, the way tmux's `screen_reinit` (screen.c) does when
+    /// `respawn-pane` / `respawn-window` reuse a pane (spawn.c, psmux issue
+    /// #708).
+    ///
+    /// Exactly what tmux resets goes: the visible rows are cleared WITHOUT
+    /// being pushed into history (`grid_clear_lines(hsize, sy)`), the cursor
+    /// goes home, the scroll region, saved cursor, modes (cursor keys, keypad,
+    /// mouse, bracketed paste, ...), attributes, title and progress are reset,
+    /// and the alternate screen is left.  The history above the visible rows
+    /// survives, still under the grid's own limit, and so does the hyperlink
+    /// table those history cells point into, plus the `alternate-screen`
+    /// option, which belongs to the pane rather than to the process.
+    ///
+    /// The OSC 4 palette survives as well: tmux keeps it on the
+    /// `window_pane` and clears it only on RIS, OSC 104 and `send-keys -R`
+    /// (input.c, cmd-send-keys.c), never on a respawn.
+    pub fn reinit_keep_history(&mut self) {
+        let size = self.grid.size();
+        let scrollback_len = self.grid.scrollback_len();
+        let history = self.grid.take_scrollback();
+        let hyperlinks = std::mem::take(&mut self.hyperlinks);
+        let palette = self.palette.take();
+        let palette_generation = self.palette_generation;
+        let allow_alternate_screen = self.allow_alternate_screen;
+        let mut program_status = std::mem::take(&mut self.program_status);
+        program_status.clear();
+        let program_status_enabled = self.program_status_enabled;
+        *self = Self::new(size, scrollback_len);
+        self.program_status = program_status;
+        self.program_status_enabled = program_status_enabled;
+        self.grid.put_scrollback(history);
+        self.hyperlinks = hyperlinks;
+        self.palette = palette;
+        self.palette_generation = palette_generation;
+        self.allow_alternate_screen = allow_alternate_screen;
     }
 
     /// Updates the maximum scrollback buffer size for the main grid.  Rows
@@ -786,6 +961,51 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Whether the output stream has asked for win32 input mode
+    /// (`CSI ?9001h`) at any point.  See the field for why it is sticky.
+    #[must_use]
+    pub fn win32_input_requested(&self) -> bool {
+        self.win32_input_requested
+    }
+
+    /// The extended key reporting mode of this pane: 0 standard (VT10x), 1
+    /// for xterm modifyOtherKeys=1, 2 for modifyOtherKeys=2.  tmux's
+    /// `#{pane_key_mode}` shows it as `VT10x`, `Ext 1` and `Ext 2`.
+    #[must_use]
+    pub fn extended_keys_mode(&self) -> u8 {
+        self.extended_keys_mode
+    }
+
+    /// Carry [`Self::extended_keys_mode`] into a fresh screen that replaces
+    /// this one for the same application (clear-history swaps the parser).
+    pub fn set_extended_keys_mode(&mut self, mode: u8) {
+        self.extended_keys_mode = mode.min(2);
+    }
+
+    /// `CSI > n ; m m` (xterm XTMODKEYS), tmux input.c INPUT_CSI_MODSET:
+    /// only resource 4 (modifyOtherKeys) counts, the request is ignored
+    /// while `extended-keys` is off, level 2 selects mode 2, and level 1 (or
+    /// any level under `always`) selects mode 1.
+    pub(crate) fn xtmodkeys_set(&mut self, resource: u16, level: u16) {
+        self.extended_keys_mode =
+            xtmodkeys_set_mode(self.extended_keys_mode, extended_keys_option(), resource, level);
+    }
+
+    /// `CSI > n n` (xterm disable modifiers), tmux input.c INPUT_CSI_MODOFF:
+    /// resource 4 drops back to the standard mode, or to mode 1 under
+    /// `extended-keys always`.
+    pub(crate) fn xtmodkeys_off(&mut self, resource: u16) {
+        self.extended_keys_mode =
+            xtmodkeys_off_mode(self.extended_keys_mode, extended_keys_option(), resource);
+    }
+
+    /// Carry [`Self::win32_input_requested`] into a fresh screen that replaces
+    /// this one for the same output stream (clear-history swaps the parser
+    /// while the console host behind it stays the same).
+    pub fn set_win32_input_requested(&mut self, requested: bool) {
+        self.win32_input_requested = requested;
+    }
+
     /// Returns the currently active [`MouseProtocolMode`].
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -796,6 +1016,57 @@ impl Screen {
     #[must_use]
     pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
         self.mouse_protocol_encoding
+    }
+
+    /// Is the application asking for mouse tracking at all?  tmux's
+    /// `#{mouse_any_flag}`, `wp->base.mode & ALL_MOUSE_MODES` where
+    /// `ALL_MOUSE_MODES` is `MODE_MOUSE_STANDARD|MODE_MOUSE_BUTTON|
+    /// MODE_MOUSE_ALL` (format.c:1952, tmux.h:698).  The reporting ENCODING
+    /// (1005/1006) is deliberately not part of it: an encoding on its own
+    /// reports nothing.
+    #[must_use]
+    pub fn mouse_any_flag(&self) -> bool {
+        self.mouse_protocol_mode != MouseProtocolMode::None
+    }
+
+    /// DECSET 1000, tmux's `#{mouse_standard_flag}` / `MODE_MOUSE_STANDARD`
+    /// (format.c:2003).  X10 tracking (DECSET 9) counts here too: tmux does
+    /// not implement 9 at all, this parser does, and it is the same
+    /// press-only report `1000` extends.
+    #[must_use]
+    pub fn mouse_standard_flag(&self) -> bool {
+        matches!(
+            self.mouse_protocol_mode,
+            MouseProtocolMode::Press | MouseProtocolMode::PressRelease
+        )
+    }
+
+    /// DECSET 1002, tmux's `#{mouse_button_flag}` / `MODE_MOUSE_BUTTON`
+    /// (format.c:1964): motion reported while a button is held.
+    #[must_use]
+    pub fn mouse_button_flag(&self) -> bool {
+        self.mouse_protocol_mode == MouseProtocolMode::ButtonMotion
+    }
+
+    /// DECSET 1003, tmux's `#{mouse_all_flag}` / `MODE_MOUSE_ALL`
+    /// (format.c:1940): motion reported with no button held.
+    #[must_use]
+    pub fn mouse_all_flag(&self) -> bool {
+        self.mouse_protocol_mode == MouseProtocolMode::AnyMotion
+    }
+
+    /// DECSET 1005, tmux's `#{mouse_utf8_flag}` / `MODE_MOUSE_UTF8`
+    /// (format.c:2015).
+    #[must_use]
+    pub fn mouse_utf8_flag(&self) -> bool {
+        self.mouse_encoding_flags & Self::ENCODING_UTF8 != 0
+    }
+
+    /// DECSET 1006, tmux's `#{mouse_sgr_flag}` / `MODE_MOUSE_SGR`
+    /// (format.c:1991).
+    #[must_use]
+    pub fn mouse_sgr_flag(&self) -> bool {
+        self.mouse_encoding_flags & Self::ENCODING_SGR != 0
     }
 
     /// Returns the window title set via OSC 0 or OSC 2.
@@ -845,6 +1116,46 @@ impl Screen {
         }
     }
 
+    /// Live OSC 7501 records, independent of the active terminal grid.
+    pub fn program_status(&self) -> &crate::ProgramStatuses {
+        &self.program_status
+    }
+
+    /// Mutable records for acknowledgement and attached-process exit cleanup.
+    pub fn program_status_mut(&mut self) -> &mut crate::ProgramStatuses {
+        &mut self.program_status
+    }
+
+    /// Whether OSC 7501 is accepted. Off, the default, reports are not stored
+    /// and the capability query draws no reply: the sequence is handled as an
+    /// unknown OSC, exactly as before OSC 7501 support. Turning it off
+    /// withdraws every stored record.
+    pub fn set_program_status_enabled(&mut self, enabled: bool) {
+        if self.program_status_enabled == enabled { return; }
+        self.program_status_enabled = enabled;
+        if !enabled { self.program_status.clear(); }
+    }
+
+    /// See [`Screen::set_program_status_enabled`].
+    pub fn program_status_enabled(&self) -> bool {
+        self.program_status_enabled
+    }
+
+    /// Enable ordered query capture. The host must drain queries after processing.
+    pub fn capture_queries(&mut self, enabled: bool) {
+        self.capture_queries = enabled;
+        if !enabled { self.pending_queries.clear(); }
+    }
+
+    /// Drain queries in parser dispatch order. Snapshots do not capture queries.
+    pub fn take_queries(&mut self) -> Vec<crate::TerminalQuery> {
+        std::mem::take(&mut self.pending_queries)
+    }
+
+    pub(crate) fn query(&mut self, query: crate::TerminalQuery) {
+        if self.capture_queries { self.pending_queries.push(query); }
+    }
+
     /// Returns the most recent OSC 9;4 progress indicator state, if any.
     /// `Some((state, value))` once an OSC 9;4 has been received, even when
     /// state==0 (hide); `None` when none has ever been received. Consumers
@@ -879,6 +1190,80 @@ impl Screen {
     /// Terminal, etc.) can perform the actual copy.
     pub fn take_clipboard(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         self.osc52_clipboard.take()
+    }
+
+    // ---- OSC 4 / OSC 104 per pane colour palette (issue #685) ----
+
+    /// This pane's palette, or `None` when no OSC 4 has ever been accepted.
+    ///
+    /// Serialisers take this once per pane per frame and hand it to
+    /// [`resolve_colour`](Self::resolve_colour), so a pane without a palette
+    /// pays a single null check for the whole frame.
+    #[must_use]
+    pub fn colour_palette(&self) -> Option<&crate::palette::ColourPalette> {
+        self.palette.as_deref()
+    }
+
+    /// The RGB override for one index, if set.  tmux's `colour_palette_get`
+    /// (`colour.c:1251`).
+    #[must_use]
+    pub fn palette_entry(&self, idx: u8) -> Option<(u8, u8, u8)> {
+        self.palette.as_ref().and_then(|p| p.get(idx))
+    }
+
+    /// Set or unset one palette entry.  Returns `true` when the stored value
+    /// changed, mirroring `colour_palette_set` (`colour.c:1272`), whose return
+    /// is what makes tmux schedule a full redraw.
+    pub fn set_palette_entry(
+        &mut self,
+        idx: u8,
+        rgb: Option<(u8, u8, u8)>,
+    ) -> bool {
+        if rgb.is_none() && self.palette.is_none() {
+            // Nothing allocated, nothing to unset: tmux returns 0 here too
+            // rather than allocating 256 slots for a reset.
+            return false;
+        }
+        let palette = self
+            .palette
+            .get_or_insert_with(|| Box::new(crate::palette::ColourPalette::default()));
+        if palette.set(idx, rgb) {
+            self.palette_generation = self.palette_generation.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop the whole palette (`colour_palette_clear`, `colour.c:1227`).
+    /// Returns `true` when something was dropped.
+    pub fn clear_palette(&mut self) -> bool {
+        let dropped = self.palette.take().is_some_and(|p| !p.is_empty());
+        if dropped {
+            self.palette_generation = self.palette_generation.wrapping_add(1);
+        }
+        dropped
+    }
+
+    /// A counter bumped on every accepted palette change.  The pane reader
+    /// thread uses it to notice that the mirror it keeps for the OSC 4 query
+    /// responder is stale, without walking 256 entries per output batch.
+    #[must_use]
+    pub fn palette_generation(&self) -> u64 {
+        self.palette_generation
+    }
+
+    /// Replace an indexed colour with this pane's palette RGB.  This is the
+    /// substitution tmux performs in `tty_check_fg` / `tty_check_bg` /
+    /// `tty_check_us` (`tty.c:2822`, `2892`, `2945`) just before the cell
+    /// reaches the terminal.  A pane with no palette returns `c` untouched.
+    #[inline]
+    #[must_use]
+    pub fn resolve_colour(&self, c: crate::attrs::Color) -> crate::attrs::Color {
+        match &self.palette {
+            Some(p) => p.resolve(c),
+            None => c,
+        }
     }
 
     /// Begin an OSC 8 hyperlink: intern `uri` and set it as the current pen's
@@ -1059,6 +1444,10 @@ impl Screen {
     }
 
     fn enter_alternate_grid(&mut self) {
+        if !self.mode(MODE_ALTERNATE_SCREEN) {
+            let pos = self.grid.pos();
+            self.alternate_saved_cursor = Some((pos.col, pos.row));
+        }
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
@@ -1079,6 +1468,27 @@ impl Screen {
             self.copy_alt_visible_to_main_scrollback();
         }
         self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.alternate_saved_cursor = None;
+    }
+
+    /// The main screen cursor `(col, row)` saved when the alternate screen
+    /// was entered, `None` when the alternate screen is not in use.
+    #[must_use]
+    pub fn alternate_saved_cursor(&self) -> Option<(u16, u16)> {
+        if self.alternate_screen() {
+            self.alternate_saved_cursor
+        } else {
+            None
+        }
+    }
+
+    /// While the alternate screen is in use, show the main screen it covers
+    /// (tmux's saved grid) instead. Meant for a snapshot, never the live
+    /// screen: the alternate screen stays allocated and comes back on the
+    /// next write.
+    pub(crate) fn show_saved_normal_grid(&mut self) {
+        self.clear_mode(MODE_ALTERNATE_SCREEN);
+        self.alternate_saved_cursor = None;
     }
 
     /// Append every non-blank visible row of the alt grid to the
@@ -1145,50 +1555,123 @@ impl Screen {
         self.mouse_protocol_mode = mode;
     }
 
-    fn clear_mouse_mode(&mut self, mode: MouseProtocolMode) {
-        if self.mouse_protocol_mode == mode {
-            self.mouse_protocol_mode = MouseProtocolMode::default();
-        }
+    /// DECRST for a mouse tracking mode.  tmux turns the whole family off for
+    /// any of `1000`, `1001`, `1002` and `1003`
+    /// (`screen_write_mode_clear(sctx, ALL_MOUSE_MODES)`, input.c:1959), and
+    /// so does xterm: the three modes are one setting with three spellings,
+    /// so an application that enabled `1003` and disables with a bare
+    /// `ESC[?1000l` really is asking for the mouse to go quiet.  Matching only
+    /// the exact mode left such a pane reporting tracking that nobody wanted,
+    /// and `#{mouse_all_flag}` would have said so (#662).
+    fn clear_mouse_mode(&mut self, _mode: MouseProtocolMode) {
+        self.mouse_protocol_mode = MouseProtocolMode::default();
     }
 
     fn set_mouse_encoding(&mut self, encoding: MouseProtocolEncoding) {
+        self.mouse_encoding_flags |= Self::encoding_bit(encoding);
         self.mouse_protocol_encoding = encoding;
     }
 
     fn clear_mouse_encoding(&mut self, encoding: MouseProtocolEncoding) {
+        self.mouse_encoding_flags &= !Self::encoding_bit(encoding);
         if self.mouse_protocol_encoding == encoding {
-            self.mouse_protocol_encoding = MouseProtocolEncoding::default();
+            // Fall back to whichever of the two is still on rather than
+            // straight to the default: `1005h 1006h 1006l` leaves UTF-8
+            // reporting enabled, because `1005` was never withdrawn.
+            self.mouse_protocol_encoding =
+                if self.mouse_encoding_flags & Self::ENCODING_SGR != 0 {
+                    MouseProtocolEncoding::Sgr
+                } else if self.mouse_encoding_flags & Self::ENCODING_UTF8 != 0 {
+                    MouseProtocolEncoding::Utf8
+                } else {
+                    MouseProtocolEncoding::default()
+                };
+        }
+    }
+
+    const ENCODING_UTF8: u8 = 0b01;
+    const ENCODING_SGR: u8 = 0b10;
+
+    fn encoding_bit(encoding: MouseProtocolEncoding) -> u8 {
+        match encoding {
+            MouseProtocolEncoding::Utf8 => Self::ENCODING_UTF8,
+            MouseProtocolEncoding::Sgr => Self::ENCODING_SGR,
+            MouseProtocolEncoding::Default => 0,
         }
     }
 }
 
-/// U+FE0F VARIATION SELECTOR-16, which requests emoji presentation.
-const VS16: char = '\u{FE0F}';
-
 impl Screen {
-    /// Does appending the zero-width char `c` turn this cell into a
-    /// double-width sequence? (#533)
+    /// Fold `c` into the cell before the cursor when tmux would, and say
+    /// whether `c` has been dealt with (#749). The decision is
+    /// `crate::width::join`, tmux's `screen_write_combine`, which
+    /// `screen_write_cell` calls before anything else; so it runs ahead of the
+    /// wrap decision here too, and a character combining onto the last column
+    /// never wraps.
     ///
-    /// Emoji presentation is a property of the *sequence*, not of any single
-    /// character: `U+2733` is one column on its own, but `U+2733 U+FE0F` is
-    /// two, in real terminals and in tmux alike. Because `text()` measures
-    /// width one char at a time, the base settles the cell at one column and
-    /// the selector is folded in afterwards as a zero-width mark, so the cell
-    /// stays narrow and every column after it drifts left by one.
-    ///
-    /// The trigger mirrors tmux's `screen_write_combine`, which forces the
-    /// stored width to 2 when a VS16 lands on a cell whose width is still 1
-    /// (`variation-selector-always-wide`, on by default). The width measured
-    /// over the whole cell is checked too, so any other sequence that
-    /// `unicode-width` considers double width is promoted as well.
-    fn wants_wide_promotion(cell: &crate::Cell, c: char) -> bool {
-        use unicode_width::UnicodeWidthStr as _;
-        // A cell that is already wide must not be promoted again: tmux only
-        // promotes when the stored width is 1, so `📛 + VS16` stays 2 columns
-        // rather than growing to 4.
-        cell.has_contents()
-            && !cell.is_wide()
-            && (c == VS16 || cell.contents().width() > 1)
+    /// Measured one character at a time, each wide member of an emoji cluster
+    /// took its own two columns, so a family of four spent eight where the
+    /// child process had counted two, and everything after it drifted right.
+    fn combine(&mut self, c: char, width: u16) -> bool {
+        // The cell to combine with is the one the cursor follows: one column
+        // back, or two when that column is the continuation of a wide cell.
+        // It must really start there, so a cursor parked in the middle of a
+        // wide glyph combines with nothing.
+        let pos = self.grid().pos();
+        let mut base = None;
+        if pos.col > 0 {
+            let mut base_col = pos.col - 1;
+            let mut last = self.grid().drawing_cell(crate::grid::Pos {
+                row: pos.row,
+                col: base_col,
+            });
+            if pos.col != 1 && last.is_some_and(crate::Cell::is_wide_continuation) {
+                base_col = pos.col - 2;
+                last = self.grid().drawing_cell(crate::grid::Pos {
+                    row: pos.row,
+                    col: base_col,
+                });
+            }
+            if let Some(last) = last {
+                let last_width = if last.is_wide() { 2 } else { 1 };
+                if pos.col - base_col == last_width && !last.is_wide_continuation() {
+                    base = Some((base_col, last, usize::from(last_width)));
+                }
+            }
+        }
+
+        let decision = crate::width::join(
+            base.map(|(_, cell, w)| (cell.contents(), w)),
+            c,
+            usize::from(width),
+        );
+        let base_col = base.map(|(col, _, _)| col);
+        match (decision, base_col) {
+            (crate::width::Join::Discard, _) => true,
+            (crate::width::Join::NewCell, _) | (_, None) => false,
+            (crate::width::Join::Combine { widen }, Some(base_col)) => {
+                let appended = self
+                    .grid_mut()
+                    .drawing_cell_mut(crate::grid::Pos {
+                        row: pos.row,
+                        col: base_col,
+                    })
+                    .is_some_and(|cell| cell.append(c));
+                if !appended {
+                    // Only the cluster table refusing a new entry gets here;
+                    // tmux then writes the character on its own, which for a
+                    // zero width one shows nothing.
+                    return width == 0;
+                }
+                // Force the width to 2 for modifiers and the variation
+                // selector, but only from 1: a cell already two wide is left
+                // alone, so `📛 VS16` stays two columns rather than four.
+                if widen {
+                    self.promote_cell_to_wide(pos.row, base_col, self.attrs);
+                }
+                true
+            }
+        }
     }
 
     /// Widen the narrow cell at (`row`, `col`) into a two column cell, taking
@@ -1247,7 +1730,7 @@ impl Screen {
         let size = self.grid().size();
         let attrs = self.attrs;
 
-        let width = c.width();
+        let width = crate::width::char_width(c);
         if width.is_none() && (u32::from(c)) < 256 {
             // don't even try to draw control characters
             return;
@@ -1257,6 +1740,10 @@ impl Screen {
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+
+        if self.combine(c, width) {
+            return;
+        }
 
         // A glyph wider than the whole row can never be represented: there is
         // nowhere to put its continuation, and `size.cols - width` underflows
@@ -1294,159 +1781,81 @@ impl Screen {
         self.grid_mut().col_wrap(width, wrap);
         let pos = self.grid().pos();
 
-        if width == 0 {
-            if pos.col > 0 {
-                let mut base_col = pos.col - 1;
-                let mut prev_cell = self
+        // After a resize, cells may be in inconsistent states (e.g.
+        // a wide char at the last column without its continuation).
+        // Use safe accessors to avoid panics on out-of-bounds.
+        if let Some(cell_ref) = self.grid().drawing_cell(pos) {
+            if cell_ref.is_wide_continuation() {
+                if let Some(prev_cell) = self
                     .grid_mut()
                     .drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
-                        col: base_col,
+                        col: pos.col - 1,
                     })
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.col - 1 is valid because we just
-                    // checked for pos.col > 0.
-                    .unwrap();
-                if prev_cell.is_wide_continuation() {
-                    base_col = pos.col - 2;
-                    prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: base_col,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. we know pos.col - 2 is valid
-                        // because the cell at pos.col - 1 is a wide
-                        // continuation character, which means there must be
-                        // the first half of the wide character before it.
-                        .unwrap();
-                }
-                prev_cell.append(c);
-                if Self::wants_wide_promotion(prev_cell, c) {
-                    self.promote_cell_to_wide(pos.row, base_col, attrs);
-                }
-            } else if pos.row > 0 {
-                let prev_row = self
-                    .grid()
-                    .drawing_row(pos.row - 1)
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.row - 1 is valid because we just
-                    // checked for pos.row > 0.
-                    .unwrap();
-                if prev_row.wrapped() {
-                    let mut prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row - 1,
-                            col: size.cols - 1,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. pos.row - 1 is valid because we
-                        // just checked for pos.row > 0. col of size.cols - 1
-                        // is always valid.
-                        .unwrap();
-                    if prev_cell.is_wide_continuation() {
-                        prev_cell = self
-                            .grid_mut()
-                            .drawing_cell_mut(crate::grid::Pos {
-                                row: pos.row - 1,
-                                col: size.cols - 2,
-                            })
-                            // pos.row is valid, since it comes directly from
-                            // self.grid().pos() which we assume to always
-                            // have a valid row value. pos.row - 1 is valid
-                            // because we just checked for pos.row > 0. col of
-                            // size.cols - 2 is valid because the cell at
-                            // size.cols - 1 is a wide continuation character,
-                            // so it must have the first half of the wide
-                            // character before it.
-                            .unwrap();
-                    }
-                    prev_cell.append(c);
+                {
+                    prev_cell.clear(attrs);
                 }
             }
-        } else {
-            // After a resize, cells may be in inconsistent states (e.g.
-            // a wide char at the last column without its continuation).
-            // Use safe accessors to avoid panics on out-of-bounds.
-            if let Some(cell_ref) = self.grid().drawing_cell(pos) {
-                if cell_ref.is_wide_continuation() {
-                    if let Some(prev_cell) = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: pos.col - 1,
-                        })
-                    {
-                        prev_cell.clear(attrs);
-                    }
-                }
-            }
+        }
 
-            let is_wide_at_pos = self
+        let is_wide_at_pos = self
+            .grid()
+            .drawing_cell(pos)
+            .map_or(false, |c| c.is_wide());
+        if is_wide_at_pos {
+            if let Some(next_cell) = self
+                .grid_mut()
+                .drawing_cell_mut(crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col + 1,
+                })
+            {
+                next_cell.set(' ', attrs);
+            }
+        }
+
+        if let Some(cell) = self
+            .grid_mut()
+            .drawing_cell_mut(pos)
+        {
+            cell.set(c, attrs);
+        } else {
+            return;
+        }
+        self.grid_mut().col_inc(1);
+        if width > 1 {
+            let pos = self.grid().pos();
+            let is_wide_here = self
                 .grid()
                 .drawing_cell(pos)
                 .map_or(false, |c| c.is_wide());
-            if is_wide_at_pos {
-                if let Some(next_cell) = self
+            if is_wide_here {
+                let next_next_pos = crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col + 1,
+                };
+                if let Some(next_next_cell) = self
                     .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    })
+                    .drawing_cell_mut(next_next_pos)
                 {
-                    next_cell.set(' ', attrs);
-                }
-            }
-
-            if let Some(cell) = self
-                .grid_mut()
-                .drawing_cell_mut(pos)
-            {
-                cell.set(c, attrs);
-            } else {
-                return;
-            }
-            self.grid_mut().col_inc(1);
-            if width > 1 {
-                let pos = self.grid().pos();
-                let is_wide_here = self
-                    .grid()
-                    .drawing_cell(pos)
-                    .map_or(false, |c| c.is_wide());
-                if is_wide_here {
-                    let next_next_pos = crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    };
-                    if let Some(next_next_cell) = self
-                        .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                    {
-                        next_next_cell.clear(attrs);
-                        if next_next_pos.col == size.cols - 1 {
-                            if let Some(row) = self.grid_mut()
-                                .drawing_row_mut(pos.row)
-                            {
-                                row.wrap(false);
-                            }
+                    next_next_cell.clear(attrs);
+                    if next_next_pos.col == size.cols - 1 {
+                        if let Some(row) = self.grid_mut()
+                            .drawing_row_mut(pos.row)
+                        {
+                            row.wrap(false);
                         }
                     }
                 }
-                if let Some(next_cell) = self
-                    .grid_mut()
-                    .drawing_cell_mut(pos)
-                {
-                    next_cell.clear(crate::attrs::Attrs::default());
-                    next_cell.set_wide_continuation(true);
-                }
-                self.grid_mut().col_inc(1);
             }
+            if let Some(next_cell) = self
+                .grid_mut()
+                .drawing_cell_mut(pos)
+            {
+                next_cell.clear(crate::attrs::Attrs::default());
+                next_cell.set_wide_continuation(true);
+            }
+            self.grid_mut().col_inc(1);
         }
     }
 
@@ -1505,7 +1914,18 @@ impl Screen {
 
     // ESC c
     pub(crate) fn ris(&mut self) {
+        let mut statuses = std::mem::take(&mut self.program_status);
+        statuses.clear();
+        let queries = std::mem::take(&mut self.pending_queries);
+        let capture = self.capture_queries;
+        let program_status_enabled = self.program_status_enabled;
+        let win32_input_requested = self.win32_input_requested;
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
+        self.program_status = statuses;
+        self.pending_queries = queries;
+        self.capture_queries = capture;
+        self.program_status_enabled = program_status_enabled;
+        self.win32_input_requested = win32_input_requested;
     }
 
     // csi codes
@@ -1683,6 +2103,7 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 [2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                [9001] => self.win32_input_requested = true,
                 _ => unhandled(self),
             }
         }

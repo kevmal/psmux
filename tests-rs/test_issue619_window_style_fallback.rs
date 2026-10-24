@@ -226,7 +226,7 @@ fn dim_reaches_the_rendered_pane_background() {
         copy_cursor_row: None, copy_cursor_col: None,
         content: Vec::new(),
         rows_v2: vec![RowRunsJson { runs: vec![run("AB", "", "", 0, 2)] }],
-        title: None,
+        title: None, copy_hl: Vec::new(),
     };
     let styles = WindowContentStyles {
         inactive: None,
@@ -240,9 +240,13 @@ fn dim_reaches_the_rendered_pane_background() {
         let area = ratatui::layout::Rect::new(0, 0, 2, 1);
         let active_rect = crate::client::compute_active_rect_json(&layout, area);
         crate::client::render_layout_json(
-            frame, &layout, area, false, Color::DarkGray, Color::Green, false,
+            frame, &layout, area, false,
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Green),
+            false,
             Color::Reset, active_rect, "", false, "off", "", 1,
             crate::border_lines::border_chars("single"), None, styles,
+            crate::pane_border::PaneBorderIndicators::Colour,
         );
     }).unwrap();
     let buffer = terminal.backend().buffer().clone();

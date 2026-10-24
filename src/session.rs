@@ -28,6 +28,119 @@ pub fn is_warm_session(base: &str) -> bool {
     base == "__warm__" || base.ends_with("____warm__")
 }
 
+/// Registry base of namespace `ns`'s warm standby: `__warm__` for the default
+/// namespace, `<ns>____warm__` for a named one.
+pub fn warm_base_for(ns: Option<&str>) -> String {
+    match ns {
+        Some(n) => format!("{}____warm__", n),
+        None => "__warm__".to_string(),
+    }
+}
+
+/// The warm standby of namespace `ns` when it is HELD (issue #734): unclaimed,
+/// `exit-empty` off, still registered. That is psmux's form of the empty
+/// server `tmux start-server \; set -g exit-empty off` leaves running, so
+/// untargeted commands must reach it while the namespace has no session.
+///
+/// Both files are required: the `.held` marker says the standby is holding,
+/// the `.port` file says it is still registered (a claim or a shutdown removes
+/// it first). A marker left behind by a crash is therefore inert.
+pub fn held_warm_base_in(dir: &std::path::Path, ns: Option<&str>) -> Option<String> {
+    let base = warm_base_for(ns);
+    let held = dir.join(format!("{}.held", base)).is_file();
+    let registered = dir.join(format!("{}.port", base)).is_file();
+    (held && registered).then_some(base)
+}
+
+/// Write or remove a standby's `.held` marker (issue #734). `held` is true
+/// while the server is an unclaimed standby with `exit-empty` off.
+pub fn set_held_marker(base: &str, held: bool) {
+    let path = crate::paths::held_file(base);
+    if held {
+        let _ = std::fs::write(&path, std::process::id().to_string());
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Environment variable through which `start-server` hands the standby it just
+/// started to the commands queued after it (issue #734). Set only on those
+/// child invocations, never in a server's environment.
+pub const ROUTE_WARM_ENV: &str = "PSMUX_ROUTE_WARM";
+
+/// Whether `new-session` must claim the namespace's standby whatever its flags
+/// (issue #734). True when the namespace has no session and its standby is the
+/// empty server a client may already have identified: held, or named by the
+/// `start-server` this command is queued behind (`route_warm`).
+pub fn cli_must_claim_standby(dir: &std::path::Path, ns: Option<&str>, route_warm: Option<&str>) -> bool {
+    if resolve_last_session_name_ns_in(dir, ns).is_some() {
+        return false;
+    }
+    let warm = warm_base_for(ns);
+    let named = route_warm == Some(warm.as_str()) && dir.join(format!("{}.port", warm)).is_file();
+    named || held_warm_base_in(dir, ns).is_some()
+}
+
+/// Commands that finish a held claim (issue #734): the claim renames the
+/// standby and re-homes it to `-c`, but cannot replace the shell it is
+/// already running or change its size. A command (`initial_cmd`, the shell
+/// form, or `raw_cmd`, the argv after `--`) replaces the pane in place, which
+/// keeps the server, the only identity a held claim promises, unchanged.
+pub fn held_claim_followups(
+    initial_cmd: Option<&str>,
+    raw_cmd: Option<&[String]>,
+    start_dir: Option<&str>,
+    width: Option<u16>,
+    height: Option<u16>,
+) -> Vec<String> {
+    use crate::util::quote_arg;
+    let mut lines = Vec::new();
+    let command: Option<String> = match (raw_cmd, initial_cmd) {
+        (Some(argv), _) if !argv.is_empty() => {
+            Some(argv.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" "))
+        }
+        (_, Some(cmd)) if !cmd.trim().is_empty() => Some(quote_arg(cmd)),
+        _ => None,
+    };
+    if let Some(command) = command {
+        let mut line = String::from("respawn-pane -k");
+        if let Some(dir) = start_dir {
+            line.push_str(" -c ");
+            line.push_str(&quote_arg(dir));
+        }
+        line.push_str(" -- ");
+        line.push_str(&command);
+        line.push('\n');
+        lines.push(line);
+    }
+    if width.is_some() || height.is_some() {
+        let mut line = String::from("resize-window");
+        if let Some(w) = width {
+            line.push_str(&format!(" -x {}", w));
+        }
+        if let Some(h) = height {
+            line.push_str(&format!(" -y {}", h));
+        }
+        line.push('\n');
+        lines.push(line);
+    }
+    lines
+}
+
+/// Whether a CLI may address the standby `target` directly: it is held, or the
+/// `start-server` that owns this command queue named it.
+pub fn warm_target_addressable(target: &str) -> bool {
+    if !is_warm_session(target) {
+        return false;
+    }
+    if env::var(ROUTE_WARM_ENV).ok().as_deref() == Some(target) {
+        return true;
+    }
+    let dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+    let ns = target.strip_suffix("____warm__");
+    held_warm_base_in(&dir, ns).as_deref() == Some(target)
+}
+
 /// The `-L` socket namespace a registry base name belongs to.
 ///
 /// A namespaced session is stored as `<ns>__<name>`, so the namespace is the
@@ -42,6 +155,174 @@ pub fn session_namespace(full: &str) -> Option<&str> {
     match full.split_once("__") {
         Some((ns, _)) if !ns.is_empty() => Some(ns),
         _ => None,
+    }
+}
+
+/// The registry base (port file stem) a session name addresses under `ns`.
+///
+/// A user types the short name (`sess`) inside `-L ns`, while routing state
+/// such as `PSMUX_TARGET_SESSION` and a resolved `$N` id already carry the
+/// on disk name (`ns__sess`). Adding the prefix only when it is missing maps
+/// both spellings onto the same identity, so the prefix is never doubled.
+///
+/// A session may itself be named `ns__x` (discussion #844): its base is
+/// `ns__ns__x`, so when that registry entry exists the name is read as a
+/// session name and prefixed like any other. Otherwise `ns__x` is taken to be
+/// a base already, as before.
+pub fn namespaced_session_base(ns: Option<&str>, name: &str) -> String {
+    namespaced_session_base_with(ns, name, |base| {
+        std::path::Path::new(&crate::paths::port_file(base)).exists()
+    })
+}
+
+/// [`namespaced_session_base`] with the registry lookup passed in, so the rule
+/// can be tested without a data dir. `registered(base)` says whether a session
+/// with that base exists.
+pub fn namespaced_session_base_with(
+    ns: Option<&str>,
+    name: &str,
+    registered: impl Fn(&str) -> bool,
+) -> String {
+    match ns {
+        Some(n) if !n.is_empty() => {
+            let prefixed = session_name_base(ns, name);
+            if !name.starts_with(&format!("{}__", n)) || registered(&prefixed) {
+                prefixed
+            } else {
+                name.to_string()
+            }
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// The registry base a session NAMED `name` gets under namespace `ns`: the
+/// name with the `<ns>__` prefix under `-L`, the name alone otherwise. This is
+/// what `AppState::port_file_base` writes, so a new or renamed session must be
+/// checked against this and never against [`namespaced_session_base`], which
+/// reads a `-t` that may already be a base.
+pub fn session_name_base(ns: Option<&str>, name: &str) -> String {
+    match ns {
+        Some(n) => format!("{}__{}", n, name),
+        None => name.to_string(),
+    }
+}
+
+/// Why `name` cannot be the name of a new or renamed session in namespace
+/// `ns`, as the error line to print, or None when it can.
+///
+/// The registry stores session `B` of `-L A` as `A__B` and a default namespace
+/// session under its name alone, so a default namespace session named `A__B`
+/// would share every registry file with `-L A`'s `B` and be read back as
+/// belonging to namespace `A` (discussion #844): listed and killed there,
+/// missing from its own `ls`. The file names cannot change without breaking
+/// the tools that read them, so the default namespace refuses `__` in a
+/// session name, as tmux refuses a name it cannot store (`invalid session:`).
+/// Under `-L` a name may contain `__`: the base splits at the first `__`.
+pub fn reserved_session_name_error(ns: Option<&str>, name: &str) -> Option<String> {
+    let in_default = ns.is_none_or(|n| n.is_empty());
+    if in_default && name.contains("__") {
+        Some(format!(
+            "invalid session: {} (psmux stores the sessions of -L NAME as NAME__session, \
+             so a session outside -L cannot have __ in its name)",
+            name
+        ))
+    } else {
+        None
+    }
+}
+
+/// The session `switch-client -t/-n/-p/-l` goes to, as a registry base.
+///
+/// `all_sessions` is the sorted list of bases in this server's namespace `ns`
+/// and `current` is this server's own base. `-t` takes the name a user types
+/// (`sess`) or the base (`ns__sess`), exactly or as a prefix. `-n`/`-p` step
+/// through the list and wrap, as tmux's session_next_session and
+/// session_previous_session do (cmd-switch-client.c). `-l` is the client's
+/// own previous session, while it is still alive and is not this one (tmux:
+/// `tc->last_session != NULL && session_alive(tc->last_session)`).
+pub fn resolve_switch_client(
+    flag: char,
+    target: &str,
+    current: &str,
+    all_sessions: &[String],
+    last: Option<&str>,
+    ns: Option<&str>,
+) -> Option<String> {
+    match flag {
+        't' => {
+            if target.is_empty() {
+                return None;
+            }
+            let want = namespaced_session_base(ns, target);
+            if all_sessions.iter().any(|s| s == &want) {
+                Some(want)
+            } else {
+                all_sessions.iter().find(|s| s.starts_with(&want)).cloned()
+            }
+        }
+        'n' => match all_sessions.iter().position(|s| s == current) {
+            Some(i) if i + 1 < all_sessions.len() => Some(all_sessions[i + 1].clone()),
+            _ => all_sessions.first().cloned(),
+        },
+        'p' => match all_sessions.iter().position(|s| s == current) {
+            Some(i) if i > 0 => Some(all_sessions[i - 1].clone()),
+            _ => all_sessions.last().cloned(),
+        },
+        'l' => last
+            .filter(|s| !s.is_empty() && *s != current && all_sessions.iter().any(|a| a == s))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Whether two session names denote the same session under namespace `ns`.
+///
+/// Either side may be the short name or the namespaced registry base. This is
+/// what a CLI must use to decide whether a `sess:win` target leaves the
+/// routed session: comparing the raw strings read `ns__sess` and `sess` as two
+/// different sessions.
+pub fn same_session_identity(ns: Option<&str>, a: &str, b: &str) -> bool {
+    namespaced_session_base(ns, a) == namespaced_session_base(ns, b)
+}
+
+/// Whether the registry base `base` belongs to namespace `ns`.
+///
+/// This is the file-name convention in one place: a `-L` namespace writes
+/// `<ns>__<session>`, the default namespace writes a bare `<session>`, and the
+/// default namespace's own warm helper `__warm__` is the single bare name that
+/// contains `__`. Membership, unlike [`session_visible_from`], counts the warm
+/// helpers: they are real servers, so a namespace-wide sweep must reach them.
+pub fn registry_base_in_namespace(base: &str, ns: Option<&str>) -> bool {
+    match ns {
+        Some(n) => base.starts_with(&format!("{}__", n)),
+        None => !base.contains("__") || base == "__warm__",
+    }
+}
+
+/// What a `kill-server` is allowed to touch.
+///
+/// tmux's `kill-server` kills the server on the selected socket and nothing
+/// else; sessions on other sockets are untouched. psmux keeps every `-L`
+/// namespace in one registry directory, so the socket boundary has to be
+/// applied by name — that is [`KillScope::Namespace`]. [`KillScope::All`] is
+/// the psmux-only `kill-server -a`, the deliberate machine-wide sweep that used
+/// to be what a bare `kill-server` did (#649).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillScope<'a> {
+    /// Every registry entry in the data dir, every namespace (`-a`/`--all`).
+    All,
+    /// One socket: `Some(ns)` for `-L ns`, `None` for the default namespace.
+    Namespace(Option<&'a str>),
+}
+
+impl KillScope<'_> {
+    /// Whether a registry base name (a `.port`/`.pid` file stem) is in scope.
+    pub fn covers(&self, base: &str) -> bool {
+        match self {
+            KillScope::All => true,
+            KillScope::Namespace(ns) => registry_base_in_namespace(base, *ns),
+        }
     }
 }
 
@@ -124,13 +405,16 @@ impl CounterLock {
     const STALE_AFTER: Duration = Duration::from_secs(5);
 
     fn acquire(path: String) -> Self {
+        let mut made_dir = false;
         for _ in 0..2000 {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
                     let _ = write!(f, "{}", std::process::id());
                     return CounterLock { path };
                 }
-                Err(_) => {
+                // Another process holds it. This is the one failure waiting can
+                // resolve, so it is the only one that sleeps.
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     // Take over a stale lock left behind by a crashed holder.
                     let stale = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
@@ -142,10 +426,39 @@ impl CounterLock {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // Windows reports a lock file that another process is in the
+                // middle of deleting as PermissionDenied (delete pending), not
+                // AlreadyExists: measured at about 1 in 18 contended attempts with
+                // 8 processes. It is contention, so it waits like AlreadyExists.
+                // Proceeding here let two processes read the same counter, and
+                // this caller's Drop then removed the real holder's lock file:
+                // 8 processes x 150 allocations handed out as few as 677 unique
+                // ids of 1200. A directory that is genuinely denied spends the
+                // budget and proceeds, which is what every failure did before.
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // The data directory is not there yet, which is what a first run
+                // on a machine looks like. Create it once and try again: no
+                // amount of waiting makes a missing directory appear, and the
+                // counter file this lock guards cannot be written without it
+                // either.
+                Err(e) if e.kind() == ErrorKind::NotFound && !made_dir => {
+                    made_dir = true;
+                    match std::path::Path::new(&path).parent() {
+                        Some(parent) if std::fs::create_dir_all(parent).is_ok() => {}
+                        _ => return CounterLock { path },
+                    }
+                }
+                // Anything else, a denied directory for instance, is a state
+                // this loop cannot change. Proceed rather than spend the whole
+                // budget discovering that.
+                Err(_) => return CounterLock { path },
             }
         }
-        // Never observed in practice (the critical section is microseconds);
-        // proceed rather than hang session creation indefinitely.
+        // Only reachable under real contention now, and never observed there:
+        // the critical section is microseconds. Proceed rather than hang
+        // session creation indefinitely.
         CounterLock { path }
     }
 }
@@ -334,7 +647,7 @@ fn cleanup_stale_port_files_in(psmux_dir: &Path) {
 /// Registry file extensions that only ever exist as satellites of a `.port`
 /// entry. Anything else in the data dir (`next_session_id`, its `.lock`, debug
 /// logs, the `instances/` and `servers/` subdirectories) is never touched.
-const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "act"];
+const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "act", "held"];
 
 /// How long a `.port`-less registry file must sit untouched before it is
 /// considered abandoned (issue #530).
@@ -519,7 +832,7 @@ where
 /// teardown that already removed the `.pid` have no anchor at all, which is
 /// precisely the abandoned case.
 fn orphan_anchor_pid(path: &Path, ext: &str) -> Option<u32> {
-    let body = if ext == "spawnlock" {
+    let body = if ext == "spawnlock" || ext == "held" {
         std::fs::read_to_string(path).ok()?
     } else {
         std::fs::read_to_string(path.with_extension("pid")).ok()?
@@ -539,10 +852,27 @@ fn pid_owns_live_server(pid: u32) -> bool {
     if !cfg!(windows) {
         return true;
     }
-    match crate::platform::process_info::get_process_name(pid) {
+    // Snapshot-backed lookup (#650): an unopenable PID is not a dead one. A
+    // server started from an SSH logon carries the elevated token sshd mints,
+    // so a desktop CLI running under the UAC-filtered token is refused the
+    // handle and would otherwise prune a live server's satellites.
+    match crate::platform::process_info::get_process_name_or_snapshot(pid) {
         None => false,
-        Some(name) => PSMUX_SERVER_IMAGE_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            // A renamed binary's servers carry its own image name. Answering
+            // "live" only keeps files, the safe direction for this sweep.
+            PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str())
+                || own_image_stem().as_deref() == Some(name.as_str())
+        }
     }
+}
+
+/// Lower-case file stem of the running executable, e.g. `psmux-dev` for a
+/// renamed copy, so registry readers recognise servers it started itself.
+fn own_image_stem() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.file_stem()?.to_string_lossy().to_ascii_lowercase())
 }
 
 /// Instance-token file names (`instances/<prefix>-<hash>`) that a namespace with
@@ -812,21 +1142,21 @@ pub fn format_pid_file_contents(pid: u32, creation_time: u64) -> String {
 }
 
 /// Force-kill candidates for `kill-server`'s fallback, scoped by construction to
-/// a single data dir: the `pid:creation_filetime` `.pid` files in `dir`. When
-/// `ns_prefix` is `Some`, only files whose base starts with it are considered —
-/// mirroring the graceful pass's `-L` filter, so a namespaced kill-server never
-/// reaches another namespace. Bare-pid and malformed files are skipped (no
-/// recorded creation time means no identity gate, so they are not force-kill
-/// candidates). This selects targets; it does not kill.
-pub fn force_kill_targets(dir: &std::path::Path, ns_prefix: Option<&str>) -> Vec<PidTarget> {
+/// a single data dir: the `pid:creation_filetime` `.pid` files in `dir`, further
+/// narrowed by `scope` so the fallback reaches exactly the servers the graceful
+/// pass aimed at — one namespace for a bare or `-L` kill-server, everything for
+/// `-a`. Bare-pid and malformed files are skipped (no recorded creation time
+/// means no identity gate, so they are not force-kill candidates). This selects
+/// targets; it does not kill.
+pub fn force_kill_targets(dir: &std::path::Path, scope: KillScope) -> Vec<PidTarget> {
     let mut targets = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return targets; };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().map(|e| e == "pid").unwrap_or(false) {
-            if let Some(pfx) = ns_prefix {
+            {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if !stem.starts_with(pfx) { continue; }
+                if !scope.covers(stem) { continue; }
             }
             if let Ok(contents) = std::fs::read_to_string(&path) {
                 // A recorded creation time is required: it is the identity gate.
@@ -850,6 +1180,351 @@ pub fn confirms_identity(queried: Option<u64>, expected: u64) -> bool {
     queried == Some(expected)
 }
 
+/// A server `kill-server` is about to end: its `.port` file, the port it names
+/// and the auth key that goes with it.
+pub struct KillTarget {
+    pub base: String,
+    pub port_path: std::path::PathBuf,
+    pub port: u16,
+}
+
+/// Registry entries a `kill-server` in `scope` should end, plus the stale
+/// `.port` files (unreadable, so nothing to talk to) that should simply be
+/// swept. `exclude_base` drops one entry — the caller's own server, when the
+/// command came from inside it and must kill itself last.
+///
+/// Selection only: nothing is contacted or deleted here, which is what makes
+/// the scope rule testable without starting a server.
+pub fn kill_server_targets(
+    dir: &std::path::Path,
+    scope: KillScope,
+    exclude_base: Option<&str>,
+) -> (Vec<KillTarget>, Vec<std::path::PathBuf>) {
+    let mut targets: Vec<KillTarget> = Vec::new();
+    let mut stale: Vec<std::path::PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return (targets, stale) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e != "port").unwrap_or(true) {
+            continue;
+        }
+        let Some(base) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        // tmux parity (#649): a bare kill-server ends the server on the socket
+        // it was invoked on and nothing else. Without this, every `-L`
+        // namespace sharing the data dir died with it.
+        if !scope.covers(base) {
+            continue;
+        }
+        if exclude_base == Some(base) {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(port_str) => match port_str.trim().parse::<u16>() {
+                Ok(port) => targets.push(KillTarget {
+                    base: base.to_string(),
+                    port_path: path.clone(),
+                    port,
+                }),
+                // A `.port` with no parseable port names no live server.
+                Err(_) => stale.push(path.clone()),
+            },
+            Err(_) => stale.push(path.clone()),
+        }
+    }
+    (targets, stale)
+}
+
+/// How many of the targets are real user sessions, i.e. not warm standbys.
+/// tmux answers `no server running` when there is nothing to kill, and a warm
+/// standby is an implementation detail, not a session (the same rule `ls`
+/// applies), so it must not make an empty namespace look occupied.
+pub fn user_session_count(targets: &[KillTarget]) -> usize {
+    targets.iter().filter(|t| !is_warm_session(&t.base)).count()
+}
+
+/// Send `kill-server` to every server in `scope`, sweep their registry sets and
+/// force-kill whatever ignored the graceful request. Returns the number of user
+/// sessions (warm standbys excluded) that were in scope.
+///
+/// One implementation for every dispatch route — the CLI, the command prompt of
+/// an attached client and a config file — so the blast radius cannot drift
+/// between them again.
+pub fn kill_servers_in_scope(
+    dir: &std::path::Path,
+    scope: KillScope,
+    exclude_base: Option<&str>,
+) -> usize {
+    // Snapshot the force-kill candidates BEFORE the graceful pass removes the
+    // `.pid` files, scoped the same way, so the fallback can never reach a
+    // server the graceful pass was not allowed to touch.
+    //
+    // Stamp the kill BEFORE enumerating (see `warm_standby_verdict`): a
+    // standby that registers after the enumeration below must find it.
+    write_kill_marker(dir, scope, crate::platform::process_kill::now_process_filetime());
+    let fk_targets: Vec<PidTarget> = force_kill_targets(dir, scope);
+    let excluded_pid = exclude_base.and_then(|b| {
+        std::fs::read_to_string(crate::paths::pid_file(b))
+            .ok()
+            .and_then(|s| parse_pid_file_contents(&s))
+            .map(|(pid, _)| pid)
+    });
+    let (targets, stale) = kill_server_targets(dir, scope, exclude_base);
+    // ...and again AFTER it, before anything is ended: every server found
+    // above was created before this stamp, so a standby whose spawner dies in
+    // this kill reads a stamp newer than that spawner.
+    write_kill_marker(dir, scope, crate::platform::process_kill::now_process_filetime());
+    let killed = user_session_count(&targets);
+    let handles: Vec<std::thread::JoinHandle<()>> = targets
+        .into_iter()
+        .map(|t| {
+            std::thread::spawn(move || {
+                let key = read_session_key(&t.base).unwrap_or_default();
+                let addr = format!("127.0.0.1:{}", t.port);
+                if let Ok(sock) = addr.parse() {
+                    if let Ok(mut stream) =
+                        std::net::TcpStream::connect_timeout(&sock, Duration::from_millis(500))
+                    {
+                        let _ = stream.set_nodelay(true);
+                        let _ = write!(stream, "AUTH {}\n", key);
+                        let _ = stream.flush();
+                        let _ = stream.write_all(b"kill-server\n");
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        // Wait for the server to exit (EOF = done).
+                        // Longer than the server's own hold (KILL_SERVER_HOLD),
+                        // so the EOF that ends this wait is the server exiting
+                        // after its reaper, not this timeout (#686).
+                        let _ = stream.set_read_timeout(Some(crate::warm_pane_sync::KILL_SERVER_HOLD + Duration::from_millis(1000)));
+                        let mut buf = [0u8; 64];
+                        loop {
+                            match std::io::Read::read(&mut stream, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => continue,
+                            }
+                        }
+                    }
+                }
+                // Remove the whole registry set regardless. Deleting only
+                // port/key/pid used to strand the `.sid`, which no sweep can
+                // reach once its `.port` is gone (#530).
+                remove_session_registry_files(&t.port_path);
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+    // Clean up stale registry sets (whole set, including `.sid` — #530)
+    for path in &stale {
+        remove_session_registry_files(path);
+    }
+    // Force-kill any wedged server that ignored the graceful kill. The
+    // identity gate (exact process-creation-time match) skips any pid that has
+    // already exited or been recycled — no machine-wide, name-based scan.
+    std::thread::sleep(Duration::from_millis(50));
+    let mut ended: Vec<PidTarget> = Vec::new();
+    for t in fk_targets {
+        if Some(t.pid) == excluded_pid {
+            continue;
+        }
+        if confirms_identity(
+            crate::platform::process_kill::process_creation_time(t.pid),
+            t.creation_time,
+        ) {
+            crate::platform::process_kill::terminate_server_pid(t.pid, None);
+        }
+        ended.push(t);
+    }
+    // A server that had written its `.pid` but not yet its `.port` when the
+    // registry was read (a standby mid registration) is ended above by pid,
+    // with nobody to remove its files: it went on to write `.port` and `.key`
+    // before it died, and the dead entry was left listed. Sweep every set
+    // whose `.pid` still names one of the servers this kill ended.
+    sweep_registry_sets_of(dir, scope, &ended);
+    killed
+}
+
+/// Remove the registry set of every `.pid` in `scope` that names exactly one
+/// of `ended` (same pid and creation time) and whose process is no longer
+/// running under that identity. A pid that was recycled, or a set that a new
+/// server has since rewritten, is left alone.
+fn sweep_registry_sets_of(dir: &Path, scope: KillScope, ended: &[PidTarget]) {
+    if ended.is_empty() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e != "pid").unwrap_or(true) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if !scope.covers(stem) {
+            continue;
+        }
+        let Some((pid, Some(creation))) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| parse_pid_file_contents(&s))
+        else {
+            continue;
+        };
+        if !ended.iter().any(|t| t.pid == pid && t.creation_time == creation) {
+            continue;
+        }
+        // Creation time alone is not liveness: an exited process whose object
+        // is still held open somewhere answers GetProcessTimes as before.
+        // TerminateProcess returns before the process is gone, so give one
+        // that was just ended a moment to finish dying.
+        let still_running = || {
+            crate::platform::process_is_alive(pid)
+                && confirms_identity(crate::platform::process_kill::process_creation_time(pid), creation)
+        };
+        let mut running = still_running();
+        for _ in 0..10 {
+            if !running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            running = still_running();
+        }
+        if running {
+            continue;
+        }
+        remove_session_registry_files(&path.with_extension("port"));
+    }
+}
+
+// --- kill-server and the warm standby -----------------------------------------
+// A server spawns its namespace's `__warm__` standby a moment AFTER it has
+// registered, and the standby needs a few hundred milliseconds more before its
+// own `.port`/`.pid` appear. A kill-server that lands in that window enumerates
+// the registry, finds the session server but not the standby, ends the session
+// server and returns; the standby registers afterwards and nothing ever ends
+// it. Measured on the unfixed build: `-L ns new-session -d` then `-L ns
+// kill-server` at once left the standby alive 10 times out of 10, and one of
+// them rebuilt the data directory after it had been deleted.
+//
+// No amount of waiting in kill-server closes that, because the standby can
+// register at any later moment. So the kill leaves a marker instead, and the
+// standby checks it: kill-server stamps the time into a per scope marker file
+// before it enumerates and again after it has enumerated, and an unclaimed
+// standby that finds a marker covering it ends itself. The two stamps are what
+// make the ordering airtight, see `warm_standby_verdict`.
+
+/// The kill marker for `scope`, inside `dir/killed/`. The per namespace file
+/// reuses the identity file's name (readable prefix plus a hash of the full
+/// namespace name, see `paths::namespace_instance_file`), so any `-L` value maps
+/// to a legal and distinct file name. `all` cannot collide with those, since
+/// every namespace name ends in `-<16 hex digits>`.
+pub fn kill_marker_path(dir: &Path, scope: KillScope) -> std::path::PathBuf {
+    let killed = dir.join("killed");
+    match scope {
+        KillScope::All => killed.join("all"),
+        KillScope::Namespace(ns) => {
+            let inst = crate::paths::namespace_instance_file(dir, ns);
+            killed.join(inst.file_name().unwrap_or_default())
+        }
+    }
+}
+
+/// Stamp `when` (a FILETIME) into the kill marker for `scope`. Written to a
+/// temporary file and renamed over the marker, so a standby reading it at the
+/// same moment sees the old stamp or the new one, never an empty file.
+pub fn write_kill_marker(dir: &Path, scope: KillScope, when: u64) {
+    let path = kill_marker_path(dir, scope);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, when.to_string()).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::write(&path, when.to_string());
+}
+
+/// The newest kill that covers namespace `ns`: its own marker or an
+/// everything (`-a`) marker, whichever is later. `None` when neither exists.
+pub fn read_kill_marker(dir: &Path, ns: Option<&str>) -> Option<u64> {
+    let read = |scope: KillScope| -> Option<u64> {
+        std::fs::read_to_string(kill_marker_path(dir, scope))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    match (read(KillScope::Namespace(ns)), read(KillScope::All)) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What an unclaimed standby knows about itself when it asks whether it should
+/// still be running. Times are FILETIMEs; `None` means unknown, and an unknown
+/// value never makes a standby exit.
+#[derive(Debug, Clone, Copy)]
+pub struct WarmStandbyFacts {
+    /// When this standby process was created.
+    pub own_creation: Option<u64>,
+    /// When the server that spawned this standby was created, if it said.
+    pub spawner_creation: Option<u64>,
+    /// Whether that spawner is still running under the same identity.
+    pub spawner_alive: bool,
+    /// The newest kill marker covering this namespace.
+    pub kill_marker: Option<u64>,
+    /// Whether the data directory still exists.
+    pub data_dir_present: bool,
+}
+
+/// Why an unclaimed standby must end, or `Keep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmStandbyVerdict {
+    Keep,
+    /// The data directory was deleted. A standby serves the sessions of one
+    /// data directory; recreating it (the registry self heal would) resurrects
+    /// a namespace somebody removed on purpose.
+    DataDirGone,
+    /// A kill-server of this namespace ran after this standby was created.
+    NamespaceKilled,
+    /// The spawner is dead and a kill-server ran after the spawner was
+    /// created: the kill that ended the spawner is the one this standby missed.
+    SpawnerKilled,
+}
+
+/// The decision, kept free of I/O so it can be tested exhaustively.
+///
+/// Why this closes the race rather than narrowing it. kill-server writes stamp
+/// M1, enumerates the registry, writes stamp M2, then ends what it found.
+///
+/// * A standby that already existed at M1 either registered before the
+///   enumeration, and was ended by it, or registered after it. In the second
+///   case its first check comes after its own registration, so after the
+///   enumeration, so after M1 was written: it reads a stamp at or after M1,
+///   which is at or after its own creation, and exits (`NamespaceKilled`).
+/// * A standby created after M1 was spawned by some server X. If X was ended by
+///   this kill, X was in the enumeration, so X was created before M2 was
+///   written, and X died after M2 was written. The standby polls X, sees it
+///   gone, reads a stamp at or after M2, which is after X's creation, and
+///   exits (`SpawnerKilled`). If X survived (it registered too late to be
+///   enumerated) the standby survives with it, which is the right answer for a
+///   server that is still running.
+pub fn warm_standby_verdict(f: &WarmStandbyFacts) -> WarmStandbyVerdict {
+    if !f.data_dir_present {
+        return WarmStandbyVerdict::DataDirGone;
+    }
+    let Some(marker) = f.kill_marker else { return WarmStandbyVerdict::Keep };
+    if let Some(own) = f.own_creation {
+        if marker >= own {
+            return WarmStandbyVerdict::NamespaceKilled;
+        }
+    }
+    if let Some(spawner) = f.spawner_creation {
+        if !f.spawner_alive && marker >= spawner {
+            return WarmStandbyVerdict::SpawnerKilled;
+        }
+    }
+    WarmStandbyVerdict::Keep
+}
+
 /// `.pid` registry entries belonging to namespace `ns`, excluding `self_pid`
 /// (issue #509).
 ///
@@ -866,13 +1541,10 @@ pub fn namespace_peer_pids(dir: &Path, ns: Option<&str>, self_pid: u32) -> Vec<P
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let mine = match ns {
-            Some(n) => stem.starts_with(&format!("{}__", n)),
-            // A bare session name has no `__` separator; the default namespace's
-            // own warm helper is the one exception.
-            None => !stem.contains("__") || stem == "__warm__",
-        };
-        if !mine {
+        // A bare session name has no `__` separator; the default namespace's
+        // own warm helper is the one exception. One rule, shared with
+        // kill-server's scope (`registry_base_in_namespace`).
+        if !registry_base_in_namespace(stem, ns) {
             continue;
         }
         if let Ok(contents) = std::fs::read_to_string(&path) {
@@ -1089,6 +1761,12 @@ fn reap_orphaned_servers_in(psmux_dir: &Path) {
     }
     let mut candidates: Vec<ServerCandidate> = Vec::new();
     for (pid, ports) in by_pid {
+        // Handle-only on purpose, unlike the liveness lookups (#650). A PID
+        // that lands here becomes a candidate for TERMINATION, so "I cannot
+        // open it, therefore I cannot claim it is mine" is the fail-safe
+        // answer. Naming a process psmux cannot open would widen what the
+        // reaper is willing to kill, and the reap this issue is about is the
+        // registry sweep, not this one.
         let is_psmux = crate::platform::process_info::get_process_name(pid)
             .map(|n| {
                 let n = n.to_ascii_lowercase();
@@ -1180,6 +1858,20 @@ const PID_REUSE_MARGIN_TICKS: u64 = 60 * 10_000_000; // 60s in 100ns ticks
 ///   None        - no usable `.pid` anchor (pre-#448 registry) -> caller must
 ///                 fall back to the network probe.
 fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
+    pid_anchor_verdict_with(
+        port_path,
+        crate::platform::process_info::get_process_name_or_snapshot,
+    )
+}
+
+/// [`pid_anchor_verdict`] with the process-name lookup injected, so a test can
+/// drive the "the handle path is refused but the process is right there in the
+/// snapshot" case that issue #650 is about without needing a second Terminal
+/// Services session and a differently-elevated token.
+fn pid_anchor_verdict_with<F>(port_path: &Path, name_of: F) -> Option<bool>
+where
+    F: Fn(u32) -> Option<String>,
+{
     // The process-table queries below are Windows-only; other platforms fall
     // back to the network probe rather than misreading stub returns as "dead".
     if !cfg!(windows) {
@@ -1188,22 +1880,63 @@ fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
     let pid_path = port_path.with_extension("pid");
     // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
     // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
-    let name = match crate::platform::process_info::get_process_name(pid) {
-        // No such process (a same-user psmux server is always openable with
-        // QUERY_LIMITED_INFORMATION, so an unopenable PID is not our server).
+    let (pid, creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    pid_anchor_verdict_for(&pid_path, pid, creation, name_of, crate::platform::process_kill::process_creation_time)
+}
+
+/// The verdict half of [`pid_anchor_verdict_with`] once the `.pid` body is
+/// parsed, with the creation time lookup injected as well so a test can drive
+/// a renamed server image without spawning one.
+fn pid_anchor_verdict_for<F, C>(
+    pid_path: &Path,
+    pid: u32,
+    recorded_creation: Option<u64>,
+    name_of: F,
+    creation_of: C,
+) -> Option<bool>
+where
+    F: Fn(u32) -> Option<String>,
+    C: Fn(u32) -> Option<u64>,
+{
+    let name = match name_of(pid) {
+        // No such process anywhere on the machine — not openable AND not in the
+        // process table. That is a genuinely dead PID, so the #448 fast reap
+        // still fires here.
+        //
+        // It used to be enough for the PID to be merely unopenable, on the
+        // assumption that a same-user psmux server is always openable with
+        // QUERY_LIMITED_INFORMATION. It is not: a server started from an
+        // OpenSSH logon lives in Terminal Services session 0 under the elevated
+        // token sshd mints, and an unelevated desktop shell in session 1 is
+        // refused the handle with ERROR_ACCESS_DENIED, so every desktop
+        // invocation, `psmux -V` included, deleted the live server's registry
+        // files (#650). See `get_process_name_or_snapshot` for the measured
+        // access matrix.
         None => return Some(false),
         Some(n) => n.to_ascii_lowercase(),
     };
     if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
+        // An image psmux does not know by name is still our server when it is
+        // the very process that wrote the `.pid`: the recorded creation time
+        // pins identity exactly, so a recycled PID can never match it. This is
+        // what keeps a copied or renamed binary (`psmux-dev.exe`, a pinned
+        // `pr123.exe`) usable; judging by name alone made its own CLI call its
+        // freshly started server dead, so `new-session -d` exited 0 and every
+        // later command said "no server running", and a psmux.exe CLI sharing
+        // the data dir deleted the live server's registry files.
+        if let (Some(recorded), Some(created)) = (recorded_creation, creation_of(pid)) {
+            if recorded == created {
+                return Some(true);
+            }
+        }
         // PID recycled by an unrelated application; our server is gone.
         return Some(false);
     }
     // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
     // created well AFTER the .pid file was last written cannot be the server
     // that wrote it. When either timestamp is unavailable, err towards alive.
-    if let Some(created_ft) = crate::platform::process_kill::process_creation_time(pid) {
-        if let Some(mtime_ft) = std::fs::metadata(&pid_path)
+    if let Some(created_ft) = creation_of(pid) {
+        if let Some(mtime_ft) = std::fs::metadata(pid_path)
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(system_time_to_filetime_ticks)
@@ -1375,6 +2108,9 @@ pub(crate) fn remove_session_registry_files(port_path: &Path) {
     // keep ranking in bare CLI routing.
     let act_path = port_path.with_extension("act");
     let _ = std::fs::remove_file(&act_path);
+    // And a standby's `.held` marker (issue #734).
+    let held_path = port_path.with_extension("held");
+    let _ = std::fs::remove_file(&held_path);
 }
 
 /// Outcome of a single AUTH handshake against the listener on a port.
@@ -1581,6 +2317,10 @@ pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<S
     let _ = write!(s, "AUTH {}\n", key);
     let _ = std::io::Write::write_all(&mut s, cmd);
     let _ = s.flush();
+    // Fork policy: let the server close first, just as send_control and
+    // exchange_on_port do. A client half-close trades the server's short
+    // batch-read tail for client-side TIME_WAIT and ephemeral-port pressure.
+    // Keep the passive close even on the warm-claim helper; read to EOF below.
     let mut br = std::io::BufReader::new(std::io::Read::take(&mut s, MAX_AUTHED_RESPONSE_BYTES));
     let mut auth_line = String::new();
     let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
@@ -1691,6 +2431,36 @@ pub fn fetch_authed_response(
 ) -> Option<String> {
     let mut br = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
     read_authed_line(&mut br)
+}
+
+/// Like `fetch_authed_response`, but the first line of the reply comes back
+/// as it was sent, with only its line ending taken off: no trimming, and an
+/// empty line or one that reads `OK` is a payload like any other. The server
+/// always acknowledges AUTH with `OK` before it answers, so exactly one such
+/// line is skipped. For text whose spaces matter, such as a paste buffer.
+pub fn fetch_authed_first_line_raw(
+    addr: &str,
+    key: &str,
+    cmd: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Option<String> {
+    let mut br = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
+    let mut ack = String::new();
+    if std::io::BufRead::read_line(&mut br, &mut ack).ok()? == 0 || ack.trim_end() != "OK" {
+        return None;
+    }
+    let mut line = String::new();
+    if std::io::BufRead::read_line(&mut br, &mut line).ok()? == 0 {
+        return None;
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Some(line)
 }
 
 /// Like `fetch_authed_response` but returns the entire response body
@@ -1898,6 +2668,71 @@ pub fn classify_sessions_parallel(
     })
 }
 
+/// What one server answered to a registry wide listing (`list-sessions`,
+/// `list-windows -a`, `list-panes -a`), which talk to every server in the
+/// namespace over their own raw socket instead of `send_control_with_response`.
+#[derive(Debug, PartialEq)]
+pub enum RegistryReply {
+    /// The first reply line after the AUTH ack (possibly empty: a `-F` format
+    /// may legitimately expand to nothing).
+    Line(String),
+    /// The server refused the connection; holds its reason without `ERROR:`.
+    Refused(String),
+    /// Nothing came back in time, or the connection closed without a reply.
+    NoReply,
+}
+
+/// Read the AUTH ack and the first reply line of a registry listing.
+///
+/// A refusal is recognised by the MISSING `OK` ack, not by matching its text:
+/// the server writes `ERROR: Authentication required` or `ERROR: Invalid
+/// session key` INSTEAD of the ack, while a `-F` reply that starts with the
+/// word ERROR still comes after it. The old exact string check let the
+/// invalid key refusal through as a session row, and the discarded read result
+/// made a timed out read look like an empty `-F` expansion (issue #809).
+pub fn read_registry_reply<R: io::BufRead>(br: &mut R) -> RegistryReply {
+    let mut ack = String::new();
+    match br.read_line(&mut ack) {
+        Ok(0) | Err(_) => return RegistryReply::NoReply,
+        Ok(_) => {}
+    }
+    let ack = ack.trim();
+    if ack != "OK" {
+        return RegistryReply::Refused(
+            ack.strip_prefix("ERROR:").map(str::trim).unwrap_or(ack).to_string(),
+        );
+    }
+    let mut line = String::new();
+    match br.read_line(&mut line) {
+        // The server ends every reply with a newline, so even an empty
+        // expansion is Ok(1); EOF here means the reply never came.
+        Ok(0) | Err(_) => RegistryReply::NoReply,
+        Ok(_) => RegistryReply::Line(line),
+    }
+}
+
+/// Report a server that a registry listing could not read, unless it turned
+/// out to be shutting down meanwhile (its pid anchor is dead or its `.port`
+/// is gone), which is a normal race with `kill-server` and not a failure.
+/// Returns true when it reported one, so the caller exits non-zero.
+pub fn report_unreadable_registry_server(cmd: &str, base: &str, display_name: &str, reply: &RegistryReply) -> bool {
+    if registry_pid_anchor_alive(base) == Some(false) {
+        return false;
+    }
+    if let Some(p) = crate::paths::port_file_opt(base) {
+        if !Path::new(&p).exists() {
+            return false;
+        }
+    }
+    let reason = match reply {
+        RegistryReply::Refused(r) if !r.is_empty() => r.to_lowercase(),
+        RegistryReply::Refused(_) => "refused".to_string(),
+        _ => "no response from server (timed out)".to_string(),
+    };
+    eprintln!("psmux: {}: session {}: {}", cmd, display_name, reason);
+    true
+}
+
 /// PID-anchor liveness for the session registered under `base`, for
 /// enumeration paths (e.g. CLI `list-sessions`) that would otherwise pay a
 /// TCP connect timeout per dead entry. Some(false) = definitively dead
@@ -1911,6 +2746,150 @@ pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
 ///
 /// Used when a probe proves the session is dead. Safe against a live server:
 /// it re-creates these files on its next 5s registry tick.
+/// The file name a registry path is actually stored under, or `None` when
+/// nothing is there.
+///
+/// The data directory is case-insensitive on Windows, so opening
+/// `REPRO-CASE.port` succeeds on a file created as `repro-case.port`. The
+/// directory entry still remembers the spelling it was created with, and that
+/// spelling is the stored session name (issue #774). `FindFirstFileW` on a path
+/// without wildcards is a single lookup that returns that entry's real name.
+#[cfg(windows)]
+pub fn stored_file_name(path: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    if path.contains(['*', '?']) {
+        return None;
+    }
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let h = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe { FindClose(h) };
+    let len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+    Some(String::from_utf16_lossy(&data.cFileName[..len]))
+}
+
+#[cfg(not(windows))]
+pub fn stored_file_name(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.exists() {
+        p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Is `stored` a different spelling of the requested registry base `base`?
+///
+/// tmux compares session names with `strcmp` (`session_find`, and the prefix
+/// and `fnmatch` fallbacks in `cmd_find_get_session` are case-sensitive too),
+/// so a session name that differs only in case is a different session. The
+/// `-L` namespace part of a base (`<ns>__`) is not part of the session name and
+/// is left out of the comparison: only the session name is held to tmux's rule.
+pub fn session_spelling_differs(base: &str, stored: &str) -> bool {
+    if base == stored {
+        return false;
+    }
+    match (base.split_once("__"), stored.split_once("__")) {
+        (Some((_, b)), Some((_, s))) => b != s,
+        _ => true,
+    }
+}
+
+/// The stored name of the live registry entry that a lookup of `base` lands on
+/// when it is spelled differently, or `None` when there is no entry or the
+/// spelling is exact (issue #774).
+///
+/// Every registry lookup opens `<base>.port`, which on a case-insensitive data
+/// directory finds a session whose name differs only in case. Callers resolving
+/// an explicit session target must treat `Some` as "no such session".
+pub fn registry_case_variant(base: &str) -> Option<String> {
+    let path = crate::paths::port_file_opt(base)?;
+    let stored = stored_file_name(&path)?;
+    let stem = stored.strip_suffix(".port").or_else(|| {
+        // The extension itself is stored as created; compare it loosely.
+        let n = stored.len().checked_sub(5)?;
+        stored.get(n..).filter(|e| e.eq_ignore_ascii_case(".port")).map(|_| &stored[..n])
+    })?;
+    if session_spelling_differs(base, stem) {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+/// The live session that would be overwritten if the session registered as
+/// `current_base` were renamed to `new_base`, by its stored registry base.
+///
+/// tmux refuses `rename-session` onto an existing name with `duplicate
+/// session: NAME` (`cmd-rename-session.c`). psmux had no such check: the rename
+/// wrote its files over the other session's, orphaning a live server. On the
+/// case-insensitive data directory the same happens for a name that differs
+/// only in case (issue #774), so the slot is checked by its stored spelling.
+/// Renaming a session to another spelling of its own name lands on its own
+/// files and is allowed, as in tmux.
+pub fn rename_blocker(current_base: &str, new_base: &str) -> Option<String> {
+    if new_base == current_base {
+        return None;
+    }
+    let path = crate::paths::port_file_opt(new_base)?;
+    let stored = stored_file_name(&path)?;
+    let n = stored.len().checked_sub(5)?;
+    let stem = stored.get(..n)?.to_string();
+    if stem == current_base {
+        return None;
+    }
+    let alive = match registry_pid_anchor_alive(new_base) {
+        Some(v) => v,
+        None => std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .map(|port| {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+            })
+            .unwrap_or(false),
+    };
+    if alive { Some(stem) } else { None }
+}
+
+/// The user-facing session name of a registry base: the `<ns>__` prefix of
+/// `-L ns` removed.
+pub fn display_session_name<'a>(ns: Option<&str>, base: &'a str) -> &'a str {
+    match ns {
+        Some(n) if !n.is_empty() => base.strip_prefix(&format!("{}__", n)).unwrap_or(base),
+        _ => base,
+    }
+}
+
+/// Make the registry files of `base` carry exactly that spelling (issue #774).
+///
+/// `std::fs::write` over an existing file keeps the old directory entry, so a
+/// file left behind by a session spelled differently would keep its spelling
+/// under a new server and the case-exact lookup would then miss the session
+/// that owns it. A case-only rename fixes the entry in place.
+pub fn heal_registry_spelling(base: &str) {
+    for path in [
+        crate::paths::port_file(base),
+        crate::paths::key_file(base),
+        crate::paths::sid_file(base),
+        crate::paths::pid_file(base),
+    ] {
+        let Some(stored) = stored_file_name(&path) else { continue };
+        let wanted = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        if wanted.as_deref() != Some(stored.as_str()) {
+            let from = Path::new(&path).with_file_name(&stored);
+            let _ = std::fs::rename(&from, &path);
+        }
+    }
+}
+
 pub fn remove_session_registry(base: &str) {
     let Some(port_path) = crate::paths::port_file_opt(base) else {
         return;
@@ -1925,8 +2904,9 @@ pub fn send_control(line: String) -> io::Result<()> {
             target, env::var("PSMUX_TARGET_FULL").ok(),
             env::args().collect::<Vec<_>>(), line.trim());
     }
-    // Never target a warm (standby) session — resolve to a real session instead
-    if is_warm_session(&target) {
+    // Never target a warm (standby) session, resolve to a real session instead,
+    // unless it is the namespace's held empty server (issue #734).
+    if is_warm_session(&target) && !warm_target_addressable(&target) {
         // Extract namespace from warm session name (e.g. "foo____warm__" -> Some("foo"))
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
@@ -2004,14 +2984,32 @@ pub fn send_control(line: String) -> io::Result<()> {
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
+    send_control_with_response_bounded(line, Some(Duration::from_millis(3000)))
+}
+
+/// [`send_control_with_response`] for a command whose reply comes only once
+/// the work it starts has finished: a forwarded `if-shell` (a shell condition,
+/// then the chosen branch, which may create a session), a forwarded
+/// `run-shell`, and `source-file`. A tmux client waits for its command list
+/// however long it runs (client.c leaves only on the server's MSG_EXIT). The
+/// 3 s read bound made a slow condition or session creation look like no
+/// answer, and the CLI then ran the command a SECOND time locally while the
+/// server was still running the first: a duplicate session, a run-shell body
+/// run twice (#734 follow up). The connect stays bounded.
+pub fn send_control_with_response_wait(line: String) -> io::Result<String> {
+    send_control_with_response_bounded(line, None)
+}
+
+fn send_control_with_response_bounded(line: String, read_timeout: Option<Duration>) -> io::Result<String> {
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
             target, env::var("PSMUX_TARGET_FULL").ok(),
             env::args().collect::<Vec<_>>(), line.trim());
     }
-    // Never target a warm (standby) session — resolve to a real session instead
-    if is_warm_session(&target) {
+    // Never target a warm (standby) session, resolve to a real session instead,
+    // unless it is the namespace's held empty server (issue #734).
+    if is_warm_session(&target) && !warm_target_addressable(&target) {
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
@@ -2019,6 +3017,25 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     let path = crate::paths::port_file(&target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
+    exchange_on_port(port, &session_key, full_target.as_deref(), &line, read_timeout)
+}
+
+/// One request to the server on `port` and its whole reply: AUTH, an optional
+/// TARGET line, `line`, and the reply read until the server
+/// closes, which a one-shot connection does only once the command has run.
+/// The AUTH `OK` is taken off, an authentication refusal is an error, and so
+/// is a reply cut off by `read_timeout` (None waits for the server).
+///
+/// The CLI reaches its server through this, and a source job reaches its own
+/// server through it one command at a time (issue #842): the end of the reply
+/// is what tells the job that the command before the next one is done.
+pub fn exchange_on_port(
+    port: u16,
+    session_key: &str,
+    full_target: Option<&str>,
+    line: &str,
+    read_timeout: Option<Duration>,
+) -> io::Result<String> {
     // Bounded connect: against a saturated listen backlog, a bare connect()
     // fails only after the ~21s Windows SYN-retransmit and surfaces as the
     // notorious `os error 10060`. A 1s timeout turns that into a fast, retryable
@@ -2027,9 +3044,9 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+    let _ = stream.set_read_timeout(read_timeout);
     let _ = write!(stream, "AUTH {}\n", session_key);
-    if let Some(ref ft) = full_target {
+    if let Some(ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
     // The server frames a command by the newline, and without a half-close it
@@ -2038,10 +3055,14 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     // which the server returns WITHOUT dispatching and this call yields Ok("")
     // at exit 0. Every in-tree caller already terminates the line; normalize
     // anyway, because this is a `pub fn` and the failure is silent.
-    let line = if line.ends_with('\n') { line } else { format!("{}\n", line) };
+    let line = if line.ends_with('\n') {
+        std::borrow::Cow::Borrowed(line)
+    } else {
+        std::borrow::Cow::Owned(format!("{line}\n"))
+    };
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
-    // NO half-close here — deliberately, and unlike `send_control` above.
+    // NO half-close here — deliberately, as in `send_control` above.
     //
     // This used to `shutdown(Shutdown::Write)` so the server saw EOF straight
     // after the request. That made the CLIENT the active closer of every
@@ -2065,14 +3086,11 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     // blocks before doing either turns a fast command into a read-timeout
     // error here.
     //
-    // Crucially this is NOT the case #464 fixed. That bug was in
-    // `send_control` — fire-and-forget, which closed with data still unread by
-    // the server, so a Windows loopback RST could discard the command before it
-    // was dispatched (`kill-session` no-opping at exit 0). Its half-close
-    // stays, and those paths still spend an ephemeral port per call. Here we
-    // read the reply to EOF before closing at all, so this side never closes
-    // with data pending. (The server closing on a refusal still can; that is
-    // unchanged by this and is what the refusal classification below is for.)
+    // #464 affected send_control closing while the server's acknowledgement
+    // was unread, letting a Windows loopback RST discard a pending command.
+    // Both paths now drain to EOF before closing; send_control also appends
+    // its execution barrier. Neither needs a client half-close. A server
+    // refusal may still reset the connection; classify that separately below.
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut timed_out = false;
@@ -2354,6 +3372,22 @@ pub fn resolve_routing_target(
     tmux_env: Option<&str>,
     psmux_dir: &std::path::Path,
 ) -> Option<String> {
+    resolve_routing_target_with(l_socket_name, tmux_env, psmux_dir, None)
+}
+
+/// [`resolve_routing_target`] for a command that may also land on a standby.
+///
+/// With no real session in the namespace, a namespace whose standby is HELD
+/// (`start-server` + `exit-empty off`, issue #734) routes to that standby,
+/// which is the empty server tmux would answer from. `route_warm` is the
+/// standby a `start-server` invocation named for the commands queued after it
+/// (`ROUTE_WARM_ENV`); it is honoured only when it is this namespace's.
+pub fn resolve_routing_target_with(
+    l_socket_name: Option<&str>,
+    tmux_env: Option<&str>,
+    psmux_dir: &std::path::Path,
+    route_warm: Option<&str>,
+) -> Option<String> {
     // Adopt the current server (named by `$TMUX`) only when it is in-namespace.
     if let Some(tmux_val) = tmux_env {
         if let Some(base) = session_base_owning_tmux_port(tmux_val, psmux_dir) {
@@ -2369,6 +3403,14 @@ pub fn resolve_routing_target(
     // Otherwise the most recent real session in the namespace,
     if let Some(name) = resolve_last_session_name_ns_in(psmux_dir, l_socket_name) {
         return Some(name);
+    }
+    // else the namespace's empty server, when there is one (issue #734),
+    let warm = warm_base_for(l_socket_name);
+    if route_warm == Some(warm.as_str()) {
+        return Some(warm);
+    }
+    if let Some(held) = held_warm_base_in(psmux_dir, l_socket_name) {
+        return Some(held);
     }
     // else a namespaced `X__default` so `-L X` never leaks to the un-namespaced
     // `default` server. With no `-L`, stay unresolved (the caller keeps "default").
@@ -2577,6 +3619,14 @@ pub fn list_all_sessions_tree(current_session: &str, current_windows: &[(String,
 mod tests;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue649_kill_server_namespace_scope.rs"]
+mod tests_issue649_kill_server_namespace_scope;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_kill_server_reaps_warm.rs"]
+mod tests_kill_server_reaps_warm;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue250_root_cause.rs"]
 mod tests_issue250_root_cause;
 
@@ -2617,5 +3667,41 @@ mod tests_issue530_registry_pruning;
 mod tests_issue603_bare_routing;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_issue734_held_standby.rs"]
+mod tests_issue734_held_standby;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_picker_namespace_filter.rs"]
 mod tests_picker_namespace_filter;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue650_cross_session_process_name.rs"]
+mod tests_issue650_cross_session_process_name;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_renamed_server_image_anchor.rs"]
+mod tests_renamed_server_image_anchor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue698_counter_lock_missing_dir.rs"]
+mod tests_issue698_counter_lock_missing_dir;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_namespaced_session_identity.rs"]
+mod tests_namespaced_session_identity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue774_session_name_case.rs"]
+mod tests_issue774_session_name_case;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue809_registry_reply.rs"]
+mod tests_issue809_registry_reply;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_switch_client_last_namespace.rs"]
+mod tests_switch_client_last_namespace;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_discussion844_namespace_names.rs"]
+mod tests_discussion844_namespace_names;

@@ -399,7 +399,9 @@ row per object. The full catalogue, including the human facing status bar variab
 | `#{window_flags}` | `*` | Rendered window flag string |
 | `#{pane_pid}` | `32944` | PID of the pane's shell, for process tree work |
 | `#{pane_tty}` | `/dev/pty1` | Pseudo terminal name |
-| `#{pane_current_command}` | `pwsh` | Foreground process name |
+| `#{pane_current_command}` | `pwsh` | Executable name of the pane's immediate child. Never a program modified process title on Windows, see "Identifying the Program Running in a Pane" below |
+| `#{pane_title}` | `openclaw-gateway` | Console title of the pane, which is where a Windows program's logical name surfaces. Requires `allow-set-title on` |
+| `#{pane_start_command}` | `node server.mjs` | The command psmux was asked to run in the pane, empty when the pane got the default shell |
 | `#{pane_current_path}` | `C:\Projects\app` | Working directory, in native Windows form. Read from the foreground process. Inside `wsl` or `ssh` there is no Windows process that knows the answer, so it uses the directory the shell announced over `OSC 7` or `OSC 9;9` and keeps the last observed one when the shell announces nothing. See the WSL entry in [the FAQ](faq.md) |
 | `#{pane_path}` | `/mnt/c/Users` | Exactly what the shell announced over `OSC 7` or `OSC 9;9`, untranslated, or empty when it announced nothing |
 | `#{pane_dead}` | `0` | `1` when the process exited and `remain-on-exit` kept the pane |
@@ -416,7 +418,7 @@ row per object. The full catalogue, including the human facing status bar variab
 | `#{version}` | `3.3.7` | psmux version, for capability gating |
 | `#{pid}` / `#{server_pid}` | `19004` | PID of the server process that answered. **Session-scoped**, see below |
 | `#{server_instance}` | `b644f0a347fa5e14` | Stable identity of the `-L` namespace. Poll this to detect a real restart |
-| `#{socket_path}` | `C:\Users\me/.psmux/default` | Server discovery path |
+| `#{socket_path}` | `C:\Users\me/.psmux/default` | The server that answered: `<psmux dir>/default`, `<psmux dir>/<label>` under `-L`, or the exact path given to `-S`. Passing it back to `-S` reaches the same server |
 | `#{host}` / `#{host_short}` / `#{user}` | `BOX` / `me` | Host and user identity |
 
 > **Supervising a namespace.** Unlike tmux, psmux runs one server process per
@@ -440,6 +442,67 @@ psmux display-message -p "#{history-limit}"    # 2000
 psmux display-message -p "#{@my-tool-state}"   # a bare @name is a user option
 ```
 
+### Identifying the Program Running in a Pane
+
+Three variables answer three different questions, and a supervisor that treats any one of them as
+a service identity will eventually be wrong. This came out of a gateway automation report
+([#647](https://github.com/psmux/psmux/issues/647)).
+
+**`#{pane_current_command}` is an executable name.** It reports the image of the pane's immediate
+child, so a pane running `node server.mjs` reports `node` and returns to `pwsh` the moment that
+process exits. It is stable and cheap to poll. It can never reflect a program modified process
+title on Windows: `process.title` in Node, or the equivalent in any runtime, changes nothing that
+the process tree exposes. `Win32_Process.Name` stays the image name, a console process has no
+main window title, and ConPTY has no `tcgetpgrp` equivalent that would identify a foreground
+process group. On Linux, tmux reads the controlling terminal's foreground process group and
+therefore does show the modified title there; that difference is a platform limit, not a psmux
+choice.
+
+**`#{pane_title}` is the console title, and this is where the logical name actually appears.** A
+Windows program that names itself calls `SetConsoleTitleW`, which is exactly what Node's
+`process.title` setter does. ConPTY turns that call into an OSC title on the pane's output
+stream, and psmux parses it into the pane title. The pane title is only updated when
+`allow-set-title` is on, which is not the default:
+
+```powershell
+psmux set-option -g allow-set-title on
+psmux list-panes -t gateway -F '#{pane_id}|#{pane_current_command}|#{pane_title}'
+# %1|node|openclaw-gateway
+```
+
+The value is valid only while the program that set it owns the console. An interactive shell
+rewrites the title constantly: PowerShell sets it to the working directory on every prompt, so
+the title of an idle shell pane tells you nothing about any service. It is trustworthy for a
+long running foreground process and not for a prompt. See [pane-titles.md](pane-titles.md) for
+the wider consequences of turning `allow-set-title` on, including its effect on the status bar.
+
+**`#{pane_start_command}` is the command psmux was asked to run.** It records what was passed at
+pane creation, so it survives the process exiting and is not affected by anything the program
+does to itself. It is **empty** for a pane that was given the default shell, which includes the
+first pane of a plain `new-session`, so a supervisor that relies on it must start its service
+pane with an explicit command:
+
+```powershell
+psmux new-window -d -t gateway: -n api -- node server.mjs --port 18789
+psmux display-message -p -t gateway:api '#{pane_start_command}'
+# node server.mjs --port 18789
+```
+
+**Recommended recipe for identifying a service.** No single variable is sufficient. Combine four
+signals, in roughly this order of reliability:
+
+1. A dedicated window or pane name that your controller chose, addressed by the stable
+   `#{window_id}` or `#{pane_id}` so a rename cannot break the link.
+2. `#{pane_start_command}`, which is what you asked for and cannot drift.
+3. Pane liveness, `#{pane_dead}` plus `#{pane_pid}`, to tell a running service from a pane that
+   `remain-on-exit` is holding open.
+4. A real health check that does not involve psmux at all, such as connecting to the port the
+   service is supposed to be listening on.
+
+`#{pane_title}` is a useful fifth signal once `allow-set-title` is on, and `#{pane_current_command}`
+is a reasonable coarse filter, for example to tell a `node` pane from a `pwsh` one. Neither
+should be the thing your controller keys on.
+
 ### Accepted but not yet meaningful
 
 About twenty five names exist for tmux format compatibility but always return a fixed
@@ -449,15 +512,14 @@ in a tool that keys on them. Do not build on these:
 `session_stack`, `window_bigger`, `window_offset_x`, `window_offset_y`, `window_stack_index`,
 `window_cell_width`, `window_cell_height`, `window_linked_sessions_list`, `pane_dead_signal`,
 `pane_dead_status`, `pane_dead_time`, `pane_start_path`, `pane_tabs`, `cursor_flag`,
-`scroll_region_upper`, `client_name`, `client_tty`, `client_control_mode`, `client_flags`,
-`client_termfeatures`, `client_utf8`, `client_cell_width`, `client_cell_height`,
+`scroll_region_upper`, `client_termfeatures`, `client_utf8`, `client_cell_width`, `client_cell_height`,
 `client_written`, `client_discarded`, `alternate_saved_x`, `alternate_saved_y`, `origin_flag`,
 `insert_flag`, `keypad_cursor_flag`, `keypad_flag`, `wrap_flag`, `line`, `command`,
 `command_list_name`, `command_list_alias`, `command_list_usage`, `config_files`.
 
-Note in particular that `#{client_control_mode}` is always `0`, even for a `-CC` client, and
-`#{client_name}` is always `client0`, so neither can be used to tell clients apart. The
-per-variable values are tabulated in
+To tell attached clients apart, use `list-clients -F '#{client_name} #{client_pid}
+#{client_readonly} #{client_flags}'` or `display-message -c <client> -p '...'`: those are live
+per client values. The per-variable placeholder values are tabulated in
 [scripting.md, "Accepted but not yet meaningful"](scripting.md#accepted-but-not-yet-meaningful).
 
 ## Named Paste Buffers
@@ -566,7 +628,7 @@ psmux sets these environment variables in child processes, matching tmux:
 
 | Variable | Example | Description |
 |----------|---------|-------------|
-| `TMUX` | `/tmp/psmux-58828/default,51961,0` | Indicates a tmux/psmux session is active. The shape is `/tmp/psmux-<server pid>/<socket name>,<port>,0`, so the middle field is the server's TCP port rather than a Unix pid |
+| `TMUX` | `/tmp/psmux-58828/default,51961,0` | Indicates a tmux/psmux session is active. The shape is `/tmp/psmux-<server pid>/<socket name>,<port>,0` (for a server started with `-S`, the first field is that exact path), so the middle field is the server's TCP port rather than a Unix pid. The first field passed to `-S` reaches the same server |
 | `TMUX_PANE` | `%1` | The pane ID of the current pane |
 | `PSMUX_SESSION` | `work` | The session the pane belongs to (psmux extension) |
 | `TERM` | `xterm-256color` | Terminal type |
@@ -799,6 +861,13 @@ psmux -CC
 When porting Unix tmux integrations to Windows:
 
 - **Alternate screen buffer**: `#{alternate_on}` reports `1` while a full screen program (nvim, htop, less) holds the alternate screen and `0` at a shell prompt, the same as tmux. It is read from the pane's own parser, so a program that switches buffers through the Win32 console API rather than by writing `ESC [ ? 1049 h` (a plain `Write-Host` of the sequence from PowerShell, for example) does not flip it. Real TUIs write the sequence and are detected.
+- **Mouse tracking flags**: `#{mouse_any_flag}`, `#{mouse_standard_flag}`, `#{mouse_button_flag}`, `#{mouse_all_flag}`, `#{mouse_utf8_flag}` and `#{mouse_sgr_flag}` report the pane's own DECSET state, the same six variables tmux publishes and the same reading, so tmux's default wheel binding works unchanged:
+
+  ```
+  bind -n WheelUpPane { if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }
+  ```
+
+  Two Windows caveats. First, the flags describe the pane's terminal, and under ConPTY the terminal is a console: conhost publishes the console input mode word upstream, so a program that merely switches its stdin to raw mode can leave a pane reporting `mouse_all_flag=1` and `mouse_sgr_flag=1` without ever writing a DECSET, and the mode granularity an application asked for is only preserved when its own sequence comes after that. Second, psmux's own wheel handling does not simply follow `mouse_any_flag`: it also asks who turned the mode on, so that PowerShell's PSReadLine enabling tracking at a prompt does not take the scrollback away from the user ([#548](https://github.com/psmux/psmux/issues/548), [#598](https://github.com/psmux/psmux/issues/598)). The flags stay honest about what the pane reports; they are not a prediction of psmux's gate in that one case.
 - **Output normalization**: ConPTY may normalize line endings. `%output` data may differ slightly from Unix tmux output.
 - **Ctrl+C**: tmux writes a raw `0x03` and lets the pane's tty discipline decide. On Windows psmux routes `C-c` by what is in the foreground of the pane: a shell prompt or a native console program gets a console `CTRL_C_EVENT`, a raw mode TUI (vim, Copilot CLI) gets the byte, and a bridge such as `wsl.exe` or `ssh.exe` gets the byte with console processing turned off so conhost cannot convert it into a console wide event ([#579](https://github.com/psmux/psmux/issues/579)). Prefer app-specific quit keys over `C-c` in automation where you can.
 - **Closing the terminal window**: closing the Windows Terminal tab or console window that hosts an attached client detaches that client, exactly as closing an xterm running `tmux attach` does. The server and every process inside every pane keep running until you `kill-session` or `kill-server` ([#585](https://github.com/psmux/psmux/issues/585)). A tool that wants "close the window, stop the work" must issue the kill itself.

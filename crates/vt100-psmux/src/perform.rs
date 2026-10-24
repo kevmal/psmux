@@ -94,6 +94,9 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         _ignore: bool,
         c: char,
     ) {
+        if let Some(query) = crate::queries::csi_query(params, intermediates, _ignore, c) {
+            self.screen.query(query);
+        }
         let unhandled = |screen: &mut crate::screen::Screen| {
             self.callbacks.unhandled_csi(
                 screen,
@@ -194,6 +197,28 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     );
                 }
             },
+            // XTMODKEYS (`CSI > 4 ; n m`) and its reset (`CSI > 4 n`): the
+            // extended key mode tmux keeps per pane (issue #860).  The
+            // callback still runs, as it did before for every `>` sequence.
+            Some(b'>') if c == 'm' || c == 'n' => {
+                let mut it = params.iter();
+                // tmux input_get(ictx, 0, 0, 0) / (ictx, 1, 0, 0): a missing
+                // parameter reads as 0.
+                let resource = it.next().and_then(|x| x.first().copied()).unwrap_or(0);
+                if c == 'm' {
+                    let level = it.next().and_then(|x| x.first().copied()).unwrap_or(0);
+                    self.screen.xtmodkeys_set(resource, level);
+                } else {
+                    self.screen.xtmodkeys_off(resource);
+                }
+                self.callbacks.unhandled_csi(
+                    &mut self.screen,
+                    Some(b'>'),
+                    intermediates.get(1).copied(),
+                    &params.iter().collect::<Vec<_>>(),
+                    c,
+                );
+            }
             Some(i) => {
                 self.callbacks.unhandled_csi(
                     &mut self.screen,
@@ -207,6 +232,10 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bel_terminated: bool) {
+        if let Some(query) = crate::queries::osc_query(params, self.screen.program_status_enabled()) {
+            self.screen.query(query);
+            return;
+        }
         match params {
             [b"0", s] => {
                 self.callbacks.set_window_icon_name(&mut self.screen, s);
@@ -219,6 +248,50 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
                 self.screen.set_title(s);
+            }
+            // ---- OSC 4 : set one or more palette entries (issue #685) ----
+            // `\e]4;<i>;<colour>[;<i>;<colour>]*\e\\`.  vte splits on ';', so
+            // the pairs arrive as flat params.  tmux parses exactly the same
+            // shape in `input_osc_4` (input.c:2927).  A `?` spec is a QUERY,
+            // which psmux answers on the raw output scan in the pane reader
+            // thread (pane.rs `scan_color_queries`, issue #473), preferring
+            // this pane's own entry when it has one; nothing to do here.
+            [b"4", rest @ ..] if !rest.is_empty() => {
+                let mut i = 0usize;
+                while i + 1 < rest.len() {
+                    let Some(idx) = crate::palette::parse_palette_index(rest[i])
+                    else {
+                        // tmux stops the whole sequence on a bad index
+                        // (input.c:2941 `bad = 1; break;`).
+                        break;
+                    };
+                    let spec = rest[i + 1];
+                    i += 2;
+                    if spec == b"?" {
+                        continue;
+                    }
+                    if let Some(rgb) = crate::palette::parse_x11_colour(spec) {
+                        self.screen.set_palette_entry(idx, Some(rgb));
+                    }
+                    // An unparseable colour is skipped, not fatal
+                    // (input.c:2959 `s = next; continue;`).
+                }
+            }
+            // ---- OSC 104 : reset palette entries (issue #685) ----
+            // Bare `\e]104\e\\` (and `\e]104;\e\\`, which vte hands us as an
+            // empty trailing param) clears everything; `\e]104;<i>[;<i>]*`
+            // clears those indexes.  tmux: `input_osc_104` (input.c:3446).
+            [b"104"] | [b"104", b""] => {
+                self.screen.clear_palette();
+            }
+            [b"104", rest @ ..] => {
+                for raw in rest {
+                    let Some(idx) = crate::palette::parse_palette_index(raw)
+                    else {
+                        break;
+                    };
+                    self.screen.set_palette_entry(idx, None);
+                }
             }
             [b"7", uri] => {
                 self.screen.set_path(uri);
@@ -253,6 +326,14 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     cwd.extend_from_slice(part);
                 }
                 self.screen.set_path_literal(&cwd);
+            }
+            [b"7501", body @ ..] if self.screen.program_status_enabled() => {
+                // vte excludes OSC/ST and semicolon separators from params.
+                let sequence_len = 2 + params.iter().map(|p| p.len()).sum::<usize>()
+                    + params.len().saturating_sub(1) + if _bel_terminated { 1 } else { 2 };
+                if sequence_len <= 4096 {
+                    self.screen.program_status_mut().report(&body.join(&b';'));
+                }
             }
             [b"9999", ..] => {
                 self.screen.squelch_cleared = true;
@@ -311,6 +392,7 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             // Extras (k=i, cl=line, aid=...) are optional kitty/ghostty
             // parameters; we ignore them via `..`.
             [b"133", b"A", ..] => {
+                self.screen.program_status_mut().expire();
                 self.screen.set_shell_command(None);
             }
             // 133;C with cmdline_url= parameter (kitty's fish integration).

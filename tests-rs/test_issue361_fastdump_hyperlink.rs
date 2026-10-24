@@ -29,6 +29,8 @@ struct DummyWriter;
 
 struct DummyMaster;
 
+impl crate::pane::PaneInputSink for DummyWriter {}
+
 impl std::io::Write for DummyWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
@@ -94,17 +96,19 @@ fn make_pane(id: usize) -> crate::types::Pane {
         last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
-        mouse_input_cache: None,
+        mouse_input_cache: None, win32_input_latched: false, input_off: false,
         scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None,
         cursor_shape: Arc::new(AtomicU8::new(0)),
         bell_pending: Arc::new(AtomicBool::new(false)),
         cpr_pending: Arc::new(AtomicBool::new(false)),
         color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        copy_state: None,
+        copy_state: None, live_term: None,
         pane_style: None, pane_options: Default::default(),
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         spawned_at: None,
+        start_command: String::new(),
+        cwd_hint: None,
     }
 }
 
@@ -116,6 +120,7 @@ fn make_window() -> crate::types::Window {
         id: 0,
         area: ratatui::layout::Rect::new(0, 0, COLS, ROWS),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,

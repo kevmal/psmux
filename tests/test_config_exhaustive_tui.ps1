@@ -191,10 +191,9 @@ function Send-TcpCommand {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if ($ns.DataAvailable -eq $false) {
-                    Start-Sleep -Milliseconds 100
-                    if ($ns.DataAvailable -eq $false) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()
@@ -251,7 +250,10 @@ function Test-TuiOption {
     Focus-PsmuxWindow | Out-Null
     Send-PsmuxCommand $SetCmd
     Start-Sleep -Milliseconds 300
-    $r = Send-TcpCommand $SESSION "show-options -g $ShowOpt"
+    # Read the table the set wrote: a set without -g gives the session its own
+    # value and leaves the global alone (tmux, #803), so `show -g` would not see it.
+    $showScope = if ($SetCmd -match '\s-[a-zA-Z]*g') { '-g ' } else { '' }
+    $r = Send-TcpCommand $SESSION "show-options $showScope$ShowOpt"
     if ($r.ok -and $r.resp -match $ExpectedPattern) {
         Write-Pass "$Label"
     } else {
@@ -337,7 +339,7 @@ foreach ($opt in $bools) {
 Write-Host "`n=== 2. NUMERIC OPTIONS VIA TUI ===" -ForegroundColor Cyan
 
 $nums = @(
-    @{n='escape-time'; v='100'; d='500'},
+    @{n='escape-time'; v='100'; d='500'},  # fork keeps its pre-upgrade escape-time default
     @{n='history-limit'; v='50000'; d='2000'},
     @{n='display-time'; v='3000'; d='750'},
     @{n='display-panes-time'; v='5000'; d='1000'},
@@ -427,7 +429,7 @@ Write-Host "`n=== 4. FLAG MATRIX VIA TUI ===" -ForegroundColor Cyan
 
 # -g (global) already tested above, verify one more
 Test-TuiOption "set-option -g escape-time 42" "escape-time" '42' "TUI flag -g"
-Send-PsmuxCommand "set-option -g escape-time 500"
+Send-PsmuxCommand "set-option -g escape-time 500"  # fork keeps its pre-upgrade escape-time default
 
 # -a (append) via TUI
 Send-PsmuxCommand "set-option -g status-right AAA"
@@ -500,6 +502,9 @@ if ($r.ok -and $r.resp -match 'mouse') {
 }
 
 # Combined -a via TUI
+# Drop the session value the earlier -a test left, so the append starts from the global
+Send-PsmuxCommand "set-option -u status-right"
+Start-Sleep -Milliseconds 200
 Send-PsmuxCommand "set-option -g status-right P1"
 Start-Sleep -Milliseconds 200
 Test-TuiOption "set-option -a status-right P2" "status-right" 'P1P2' "TUI combined -a"
@@ -642,7 +647,8 @@ if ($r.ok -and $r.resp -match 'TUI_ENV_TEST2.*value2') {
 Write-Test "TUI set-environment -g global"
 Send-PsmuxCommand "set-environment -g TUI_ENV_GLOBAL gval"
 Start-Sleep -Milliseconds 300
-$r = Send-TcpCommand $SESSION "show-environment"
+# -g is the global environment, read back with -g like tmux (#775).
+$r = Send-TcpCommand $SESSION "show-environment -g TUI_ENV_GLOBAL"
 if ($r.ok -and $r.resp -match 'TUI_ENV_GLOBAL.*gval') {
     Write-Pass "TUI set-environment -g (verified via show-environment)"
 } else {
@@ -791,7 +797,7 @@ if ($r.ok -and $r.resp -match '5') {
 }
 
 # Restore
-Send-PsmuxCommand "set-option -g escape-time 500"
+Send-PsmuxCommand "set-option -g escape-time 500"  # fork keeps its pre-upgrade escape-time default
 Send-PsmuxCommand "set-option -g base-index 0"
 Remove-Item $tempSrc -Force -EA SilentlyContinue
 
@@ -894,7 +900,7 @@ if ($r.ok -and $r.resp -match 'tcpval') {
 }
 
 # Restore
-Send-PsmuxCommand "set-option -g escape-time 500"
+Send-PsmuxCommand "set-option -g escape-time 500"  # fork keeps its pre-upgrade escape-time default
 
 # =============================================================================
 # SECTION 17: Escape key cancels command prompt
@@ -1012,7 +1018,7 @@ if ($r.ok -and $r.resp -match 'mouse') {
 #
 # Left open it swallows the whole next command. That is what made section 20's
 # "rapid sequential sets" fail: prefix, colon, the text and Enter all landed on
-# this box, so escape-time stayed 500 while the checks reported a product bug.
+# this box, so escape-time stayed at its default while the checks reported a product bug.
 Send-PsmuxEscape
 Send-PsmuxEscape
 
@@ -1036,7 +1042,7 @@ foreach ($opt in $rapidOpts) {
 }
 
 # Restore
-Send-PsmuxCommand "set-option -g escape-time 500"
+Send-PsmuxCommand "set-option -g escape-time 500"  # fork keeps its pre-upgrade escape-time default
 Send-PsmuxCommand "set-option -g history-limit 2000"
 Send-PsmuxCommand "set-option -g mouse on"
 Send-PsmuxCommand "set-option -g status-position bottom"

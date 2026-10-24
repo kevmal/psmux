@@ -39,6 +39,63 @@ fn pane_inner_cell_0based(area: Rect, abs_x: u16, abs_y: u16) -> (i16, i16) {
     (col, row)
 }
 
+/// The row `pane-border-status` takes out of every pane's layout slot for its
+/// label, resolved once from the server's own options.
+///
+/// tmux never needs this: `layout_fix_panes` bakes the label row into
+/// `wp->yoff`/`wp->sy` once (layout.c), and then every mouse event — press,
+/// drag, release, motion, wheel — converts through the single `cmd_mouse_at`
+/// (cmd.c), so press and release cannot disagree.  psmux converts in two
+/// places instead: the client turns a screen cell into a pane cell with
+/// `client::pane_content_inner` before sending `pane-mouse`, while the verbs
+/// that carry RAW screen coordinates (`mouse-up`, `mouse-drag`, `mouse-down`,
+/// `mouse-move`, `scroll-up`/`scroll-down`) are converted here.  This side
+/// used to subtract the layout slot's top rather than the content's, so with
+/// `pane-border-status top` a press landed on the row under the pointer and
+/// the matching release and drag landed one row lower (#669).  Both sides now
+/// call the same helper.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PaneLabelRow {
+    /// "top", "bottom" or "off" — already collapsed to the three cases
+    /// `pane_content_inner` distinguishes, so no option string is borrowed.
+    status: &'static str,
+}
+
+impl PaneLabelRow {
+    /// Resolve from the live options, including the #414 default: only an
+    /// explicitly emptied `pane-border-format` turns the label row off.
+    pub(crate) fn from_options(app: &AppState) -> Self {
+        let status = match app.user_options.get("pane-border-status").map(String::as_str) {
+            Some("top") => "top",
+            Some("bottom") => "bottom",
+            _ => "off",
+        };
+        let format_empty = matches!(
+            app.user_options.get("pane-border-format").map(String::as_str),
+            Some("")
+        );
+        Self { status: if format_empty { "off" } else { status } }
+    }
+
+    /// The pane's content rect inside its layout slot.
+    pub(crate) fn content(self, area: Rect) -> Rect {
+        crate::client::pane_content_inner(
+            area,
+            self.status,
+            crate::client::DEFAULT_PANE_BORDER_FORMAT,
+        )
+    }
+
+    /// Screen cell → 0-based content cell, the conversion the client performs
+    /// for `pane-mouse`.  The row is floored at 0 exactly as the client floors
+    /// it, so a click on the label row itself still reports the pane's first
+    /// content row rather than a negative one.
+    pub(crate) fn cell_0based(self, area: Rect, abs_x: u16, abs_y: u16) -> (i16, i16) {
+        let (col, row) = pane_inner_cell_0based(self.content(area), abs_x, abs_y);
+        (col, row.max(0))
+    }
+}
+
 /// Convert screen coordinates to 1-based pane-local coordinates.
 fn pane_inner_cell(area: Rect, abs_x: u16, abs_y: u16) -> (u16, u16) {
     let col = abs_x.saturating_sub(area.x) + 1;
@@ -425,7 +482,7 @@ pub fn pane_mouse_is_inert_motion(app: &AppState, pane_id: usize, button: u8) ->
     if button != 35 {
         return false;
     }
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         return false;
     }
     let Some(win) = app.windows.get(app.active_idx) else { return true };
@@ -465,14 +522,22 @@ fn detect_vt_bridge(pane: &mut Pane) -> bool {
     result
 }
 
-/// Detect whether the child's console has ENABLE_MOUSE_INPUT (0x0010) set.
+/// `ENABLE_MOUSE_INPUT` — the console can hand the child MOUSE_EVENT records.
+pub(crate) const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+/// `ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT` — the cooked-input pair.  A console
+/// still carrying either of these is line buffered and echoing, which no
+/// application that reads `INPUT_RECORD`s ever leaves in place.
+pub(crate) const COOKED_INPUT_MODE: u32 = 0x0002 | 0x0004;
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` — conhost stops parsing the child's input
+/// and passes VT bytes through verbatim, so the child reassembles sequences
+/// itself.  The paste route gate (issue #684) keys on this bit.
+pub(crate) const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// The pane child's whole console input mode word, cached for 2 seconds.
 ///
-/// When true, the child reads MOUSE_EVENT records via ReadConsoleInputW
-/// (crossterm/ratatui apps like pstop, claude).  When false, the child
-/// reads input as text / VT sequences (nvim, vim, opencode).
-///
-/// Result is cached for 2 seconds per pane.
-fn detect_mouse_input(pane: &mut Pane) -> bool {
+/// One probe answers both mouse questions below, and the AttachConsole /
+/// CreateFileW dance behind it is expensive enough to be worth sharing.
+fn console_input_mode(pane: &mut Pane) -> Option<u32> {
     if let Some((ts, cached)) = pane.mouse_input_cache {
         if ts.elapsed().as_secs() < 2 {
             return cached;
@@ -481,13 +546,161 @@ fn detect_mouse_input(pane: &mut Pane) -> bool {
     if pane.child_pid.is_none() {
         pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
     }
-    let result = if let Some(pid) = pane.child_pid {
-        mouse_inject::query_mouse_input_enabled(pid).unwrap_or(false)
-    } else {
-        false
-    };
+    let result = pane.child_pid.and_then(mouse_inject::query_console_input_mode);
     pane.mouse_input_cache = Some((std::time::Instant::now(), result));
     result
+}
+
+/// Detect whether the child's console has ENABLE_MOUSE_INPUT (0x0010) set.
+///
+/// When true, the console CAN deliver MOUSE_EVENT records to the child
+/// (crossterm/ratatui apps like pstop, claude read them).  This is the
+/// permissive answer to "may the wheel be forwarded at all": the bit is set in
+/// the inherited Windows default, so a `true` here does NOT establish that the
+/// child asked for the mouse.  Use [`detect_record_reader`] for that.
+///
+/// Result is cached for 2 seconds per pane.
+fn detect_mouse_input(pane: &mut Pane) -> bool {
+    console_input_mode(pane).map_or(false, |m| m & ENABLE_MOUSE_INPUT != 0)
+}
+
+/// Did the child DELIBERATELY configure its console to read `INPUT_RECORD`s?
+///
+/// `ENABLE_MOUSE_INPUT` on its own cannot answer this.  The mode a freshly
+/// spawned console inherits is Windows' documented default, `0x01F7`, and that
+/// word already contains `ENABLE_MOUSE_INPUT`, so every pane child looks like a
+/// record reader from the moment it starts, before it has run a line of its own
+/// code.  Measured on this tree, pane children with no `SetConsoleMode` call of
+/// their own between them:
+///
+/// ```text
+///   pwsh reading via [Console]::ReadKey  0x01F7  mouse=1 line=1 echo=1
+///   Far Manager                          0x01B8  mouse=1 line=0 echo=0
+///   pstop (crossterm)                    0x0098  mouse=1 line=0 echo=0
+/// ```
+///
+/// What separates them is the rest of the word: a record reader always takes
+/// the console out of cooked mode first, because line buffering and echo would
+/// swallow the very keystrokes it wants as records.  So the discriminator is
+/// `ENABLE_MOUSE_INPUT` set AND [`COOKED_INPUT_MODE`] clear.
+///
+/// `ENABLE_QUICK_EDIT_MODE` looks like it would work too (both readers above
+/// clear it, the default sets it) but it must NOT be used: psmux clears that
+/// very bit itself.  `mouse_inject::send_mouse_event` sets
+/// `ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS` and clears
+/// `ENABLE_QUICK_EDIT_MODE` on the child console before every injected record
+/// and never restores it, so one forwarded wheel notch turns any pane into a
+/// quick-edit-free "record reader".  Measured: the pwsh reader above went
+/// `0x01F6 -> 0x01B6` across a single wheel event.  psmux never touches
+/// `ENABLE_LINE_INPUT` or `ENABLE_ECHO_INPUT`, which is why the cooked pair is
+/// the signal that survives its own mouse traffic.
+pub(crate) fn detect_record_reader(pane: &mut Pane) -> bool {
+    console_input_mode(pane).map_or(false, mode_is_deliberate_record_reader)
+}
+
+/// Does this pane's child take its KEYS as console records, so that a key
+/// whose VT form drops a modifier (Ctrl + digit, issue #623) must be delivered
+/// as a win32 input record instead?
+///
+/// Deliberately wider than [`detect_record_reader`], which also demands
+/// `ENABLE_MOUSE_INPUT` because it answers a MOUSE question (may psmux flip
+/// VTI for the wheel).  Far Manager with its mouse support switched off
+/// (Options, Interface settings, Mouse; `-set:Interface.Mouse=false`) runs in
+/// `0x01E8`: no mouse bit, so the narrower gate said "not a record reader",
+/// Ctrl+1 in the drives menu went out as tmux's bare `1`, and Far opened the
+/// Temporary panel whose hotkey that is.  Measured 3 of 3 in psmux against 3
+/// of 3 correct in a native console, where the same Ctrl+1 hid the disk type.
+///
+/// A child that is neither cooked nor reading VT is reading keys as records,
+/// mouse or not, and a real keyboard would have given it exactly this record.
+/// A cooked shell keeps tmux's `standard_map` byte, and a VT reader (nvim,
+/// node) keeps the VT form.
+#[cfg(windows)]
+pub(crate) fn detect_key_record_reader(pane: &mut Pane) -> bool {
+    console_input_mode(pane).map_or(false, mode_reads_key_records)
+}
+
+/// The pure classification behind [`detect_key_record_reader`].
+pub(crate) fn mode_reads_key_records(mode: u32) -> bool {
+    mode & COOKED_INPUT_MODE == 0 && mode & ENABLE_VIRTUAL_TERMINAL_INPUT == 0
+}
+
+/// Does this pane's child read its input as a VT byte stream (issue #684)?
+///
+/// The paste route gate asks this before it may deliver `ESC[200~` as
+/// `KEY_EVENT` records.  A byte stream reader (node, nvim, a crossterm app
+/// running with `ENABLE_VIRTUAL_TERMINAL_INPUT`) reassembles the markers out of
+/// the characters conhost hands it; an `INPUT_RECORD` reader cannot, and shows
+/// them as the literal characters `[200~` instead, which is issue #98.
+///
+/// The discriminator is the `ENABLE_VIRTUAL_TERMINAL_INPUT` bit ALONE, and
+/// deliberately NOT [`detect_record_reader`].  That heuristic answers a
+/// different question ("may psmux flip this child's mode?") where erring toward
+/// "record reader" is the safe side; here the safe side is the other one, and
+/// the heuristic gets this wrong for exactly the children the gate is for.
+/// Measured on this tree with the #684 recorder, whose two shapes differ only
+/// in the bit that matters:
+///
+/// ```text
+///   byte stream reader (VTI on, cooked off)   0x03F0  mouse=1 cooked=0 vti=1
+///   record reader      (VTI off, cooked off)  0x01F8  mouse=1 cooked=0 vti=0
+/// ```
+///
+/// `mode_is_deliberate_record_reader` is "mouse set and cooked clear", so it
+/// calls BOTH of those record readers: `ENABLE_MOUSE_INPUT` is part of the
+/// inherited `0x01F7` default and a byte stream reader has no reason to clear
+/// it.  Gating the paste on it kept every pane on the pipe, which is the one
+/// outcome issue #684 needs to change.  `ENABLE_VIRTUAL_TERMINAL_INPUT` is the
+/// direct signal instead: with it set conhost stops parsing and passes the
+/// bytes through, which is precisely the child that can reassemble `ESC[200~`.
+///
+/// A deliberate record reader never carries the bit.  crossterm's Windows
+/// backend reads `INPUT_RECORD`s and never sets it (issue #98's Helix), and
+/// psmux cannot set it behind its back either, because [`ensure_vti`] refuses
+/// to flip a `detect_record_reader` pane (issue #623).
+///
+/// Unlike [`ensure_vti`] this only ever QUERIES.  A paste has no business
+/// changing a child's console mode, so a child that has not set VTI itself
+/// simply keeps the pipe.  It reads the cached mode word `console_input_mode`
+/// already maintains for the mouse questions, so a paste costs no extra attach.
+#[cfg(windows)]
+pub(crate) fn pane_reads_vt_bytes(pane: &mut Pane) -> bool {
+    console_input_mode(pane).map_or(false, |m| m & ENABLE_VIRTUAL_TERMINAL_INPUT != 0)
+}
+
+/// May psmux inject a VT REPLY (an OSC colour answer, the XTVERSION DCS) into a
+/// console whose input mode word is `mode` (issue #623, the F10 report)?
+///
+/// A reply injected with `WriteConsoleInputW` is nothing but key records whose
+/// characters spell the sequence.  It is only a reply to a reader that parses
+/// its input as a VT byte stream, which is what `ENABLE_VIRTUAL_TERMINAL_INPUT`
+/// declares.  Any other reader dispatches each record as a keypress.
+///
+/// Measured on 26200.  Far Manager 3.0.6364 reads its palette with a DA1
+/// bracketed query (`CSI 0c`, `OSC 4;0;?;...;255;? ST`, `CSI 0c`, one write)
+/// and turns VT input on only for that read.  ConPTY answers both DA1s itself
+/// while processing the write, before psmux has seen the OSC, so Far's read is
+/// over and the console is back in `0x01B8` when psmux's reply lands.  Far then
+/// takes the reply as typing: every ESC clears its command line, and the last
+/// ST leaves a `\` there that opens the autocompletion list, which is what ate
+/// the reporter's first F10.  yazi (`0x0098`) did the same with the XTVERSION
+/// reply: its cursor moved and a `1` appeared, 3 runs out of 3.  node
+/// (`0x0208`) and the query probe (`0x02xx`) keep VT input on and are
+/// unaffected.  A terminal on the same inbox ConPTY never gets this far: the
+/// reply it writes to the input pipe is consumed by conhost's input parser.
+///
+/// The mode is a sample, so one gap is left: a reply that lands after an app's
+/// read has ended but before it switches VT input off again is still typed.
+/// Far's native code closes that gap in microseconds; psmux found Far's
+/// console already in `0x01B8` at every reply in 10 of 10 launches.
+pub(crate) fn mode_reads_vt_replies(mode: u32) -> bool {
+    mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+}
+
+/// The pure classification behind [`detect_record_reader`], split out so it can
+/// be pinned by unit tests against the modes measured from real applications.
+pub(crate) fn mode_is_deliberate_record_reader(mode: u32) -> bool {
+    mode & ENABLE_MOUSE_INPUT != 0 && mode & COOKED_INPUT_MODE == 0
 }
 
 /// Ensure the child's console has ENABLE_VIRTUAL_TERMINAL_INPUT set before
@@ -504,11 +717,52 @@ fn detect_mouse_input(pane: &mut Pane) -> bool {
 /// Cached for 2 seconds per pane (same TTL as the other mouse-inject
 /// detectors) to avoid the AttachConsole/CreateFileW/SetConsoleMode dance on
 /// every wheel tick once VTI is confirmed on.
+///
+/// # Never for a record reader (issue #623)
+///
+/// The flip is permanent, since nothing here restores the mode afterwards, and
+/// it is the console's mode rather than psmux's, so it changes how conhost
+/// treats EVERY later byte psmux writes to that ConPTY, keys included.  With
+/// VTI off conhost PARSES the input stream and hands the child real
+/// INPUT_RECORDs, so the three bytes psmux sends for F1 (`\x1bOP`) arrive as
+/// one `VK_F1` press.  With VTI on conhost stops parsing and passes the bytes
+/// through verbatim, so the same F1 arrives as the characters ESC, 'O', 'P'.
+///
+/// An application that reads `INPUT_RECORD`s cannot use those (Far Manager
+/// ignores them), and the first thing it does when it wakes to read them is
+/// re-apply its own console mode, which clears VTI again, so the key after the
+/// lost one works.  That is exactly the reported symptom: inside psmux, Far's
+/// F1 opened no help until it was pressed a second time.
+///
+/// Such a child does not need the flip in the first place.  It configured its
+/// console to receive `MOUSE_EVENT` records, which is conhost's cue to turn the
+/// very SGR report this function is preparing into one, and the record channel
+/// in `inject_mouse_combined` delivers the wheel to it directly.
+///
+/// The gate has to be [`detect_record_reader`], NOT `ENABLE_MOUSE_INPUT` on its
+/// own.  That bit is part of the console mode a child INHERITS (`0x01F7`), so
+/// gating on it alone excused every freshly spawned pane app from the flip,
+/// including the #277/#245 class this function exists for: an application that
+/// writes DECSET 1000/1002/1003/1006 and then reads the SGR bytes itself never
+/// calls `SetConsoleMode` at all, so it still carries the inherited word and was
+/// misread as a record reader.  conhost then dropped every SGR report psmux
+/// wrote, and the Win32 record injected alongside is no help to it because a
+/// byte reader discards `MOUSE_EVENT` records.  Measured: the wheel stopped
+/// reaching such a pane entirely.  A real record reader is recognised by the
+/// rest of its mode word instead (see `detect_record_reader`).
 fn ensure_vti(pane: &mut Pane) {
     if let Some((ts, cached)) = pane.vti_mode_cache {
         if cached || ts.elapsed().as_secs() < 2 {
             return;
         }
+    }
+    // Issue #623: leave a record reader's console mode alone.  Re-checked on
+    // the same 2 second cadence as the rest of the probe (and
+    // `console_input_mode` has its own cache), so a pane that later switches
+    // to a VT reading app still gets the flip it needs for #277.
+    if detect_record_reader(pane) {
+        pane.vti_mode_cache = Some((std::time::Instant::now(), false));
+        return;
     }
     if pane.child_pid.is_none() {
         pane.child_pid = mouse_inject::get_child_pid(&*pane.child);
@@ -651,6 +905,16 @@ pub(crate) fn record_bypass_applies(event_flags: u32) -> bool {
 ///   behavior (right-click=paste, scroll=copy-mode) before calling this.
 pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_button: u8, press: bool,
                           _button_state: u32, _event_flags: u32, win_name: &str) {
+    // select-pane -d (tmux PANE_INPUTOFF): a mouse event forwarded to the
+    // program is a key like any other in tmux (window_pane_key returns before
+    // input_key_pane), so it is dropped.  Every route that hands a mouse event
+    // to a pane's program comes through here; what psmux does with the mouse
+    // itself (focus, copy mode, resize) is not input and is unaffected.
+    if !pane.accepts_input() {
+        mouse_log(&format!("inject_mouse_combined: col={} row={} vt_btn={} press={} win={} -> DROPPED (pane input off)",
+            col, row, vt_button, press, win_name));
+        return;
+    }
     let vt_bridge = detect_vt_bridge(pane);
 
     if vt_bridge {
@@ -764,6 +1028,15 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // anchored to the process that earned it — and consults it last, after
         // both live signals have already said no.  A pane that never earned an
         // authorization is exactly as silent as #598 made it.
+        //
+        // This site keeps the PERMISSIVE `detect_mouse_input`, while the #623
+        // gate in `ensure_vti` uses the strict `detect_record_reader`, and the
+        // asymmetry is deliberate: here a `true` only lets the wheel THROUGH,
+        // so the inherited `ENABLE_MOUSE_INPUT` erring towards delivery costs
+        // nothing (the `mouse_protocol_mode` check above has already run, and
+        // the `wheel_auth` latch is the real backstop).  There a `true`
+        // WITHHOLDS the VTI flip, and the same inherited bit would then silence
+        // the #277 apps for good.
         if _event_flags & mouse_inject::MOUSE_WHEELED != 0 && !wheel_forced(pane) {
             if matches!(pane.mouse_proto_owner, Some((_, true))) || detect_mouse_input(pane) {
                 // A live signal answered yes: refresh the latch so the
@@ -896,6 +1169,9 @@ pub fn toggle_zoom(app: &mut AppState) {
 
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The line number gutter of each pane, for the pointer column to be
+    // brought back through (see `CopyGutter`).
+    let gutter = CopyGutter::snapshot(app);
     // Status bar tab clicks are handled client-side via select-window.
     // Only handle pane focus and border resize here.
     let status_row = app.last_window_area.y + app.last_window_area.height;
@@ -931,12 +1207,15 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         }
     }
 
+    let label = PaneLabelRow::from_options(app);
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
     let mut active_area: Option<Rect> = None;
+    let mut pressed_gutter = 0;
     for (path, area) in rects.iter() {
         if area.contains(ratatui::layout::Position { x, y }) {
+            pressed_gutter = gutter.over(path);
             win.active_path = path.clone();
             // Update MRU for clicked pane (tmux parity #70)
             if let Some(pid) = crate::tree::get_active_pane_id(&win.root, path) {
@@ -946,11 +1225,17 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         }
     }
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         app.copy_anchor = None;
+        app.copy_pos_published = None;
         if let Some(area) = active_area {
-            let (row, col) = copy_cell_for_area(area, x, y);
+            let (row, col) = copy_cell_for_area(label.content(area), x, y, pressed_gutter);
             app.copy_pos = Some((row, col));
+            // A press is not a drag: this cell is in the view on screen now, so
+            // leave the endpoint unpinned.  Pinning here survived the press as
+            // a stale offset, and every later keyboard selection in the same
+            // copy mode was resolved against the view the press happened in.
+            app.copy_pos_scroll_offset = None;
             app.copy_mouse_down_cell = Some((row, col));
         }
         return;
@@ -977,7 +1262,7 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     // Forward left-click only when active pane wants mouse input.
     if !on_border {
         if let Some(area) = active_area {
-            let (col, row) = pane_inner_cell_0based(area, x, y);
+            let (col, row) = label.cell_0based(area, x, y);
             let win_name = win.name.clone();
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                 if pane_wants_click(active) {
@@ -991,6 +1276,9 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The line number gutter of each pane, for the pointer column to be
+    // brought back through (see `CopyGutter`).
+    let gutter = CopyGutter::snapshot(app);
 
     // A floating-pane drag moves or resizes the grabbed float, following the
     // cursor. Runs before any tiled handling and short-circuits it.
@@ -1029,21 +1317,22 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
         return;
     }
 
+    let label = PaneLabelRow::from_options(app);
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         // Prefer the pane under the pointer; fall back to the active
         // (copy-mode) pane so a drag that leaves every pane rect still
         // extends the selection and can auto-scroll at the edges.
         let target = rects.iter()
             .find(|(_, area)| area.contains(ratatui::layout::Position { x, y }))
             .or_else(|| rects.iter().find(|(p, _)| *p == win.active_path))
-            .map(|(p, a)| (p.clone(), *a));
+            .map(|(p, a)| (p.clone(), label.content(*a)));
         if let Some((path, area)) = target {
+            let (row, col) = copy_cell_for_area(area, x, y, gutter.over(&path));
             win.active_path = path;
-            let (row, col) = copy_cell_for_area(area, x, y);
             if app.copy_anchor.is_none() {
                 // Only start selection when mouse moves to a different cell
                 // than the click position. Prevents micro-drag jitter (#199).
@@ -1055,6 +1344,11 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((row, col));
+            // The endpoint's own offset, recorded before the edge scroll below
+            // moves the view: it is what makes this screen row mean a content
+            // line.  Without it a drag that hit an edge copied a different
+            // range than the one that was painted.
+            app.copy_pos_scroll_offset = Some(app.copy_scroll_offset);
             // tmux parity (#62): dragging on/past the pane's first or last
             // row scrolls the view so the selection continues into scrollback.
             if y <= area.y {
@@ -1073,7 +1367,7 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     } else {
         // Forward drag only when active pane wants mouse input.
         if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-            let (col, row) = pane_inner_cell_0based(area, x, y);
+            let (col, row) = label.cell_0based(area, x, y);
             let win_name = win.name.clone();
             if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                 if pane_wants_click(active) {
@@ -1087,33 +1381,71 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The line number gutter of each pane, for the pointer column to be
+    // brought back through (see `CopyGutter`).
+    let gutter = CopyGutter::snapshot(app);
     // End any floating-pane drag.
     if app.float_drag.is_some() {
         app.float_drag = None;
         return;
     }
+    let label = PaneLabelRow::from_options(app);
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    // The release of the press that made a built-in double / triple click:
+    // tmux's MouseUp1Pane has no binding, so the word / line selection it
+    // just made stays until the 0.3s copy.
+    if app.click_finish_at.is_some() {
+        return;
+    }
+    if app.mode.in_copy() {
+        // The release cell, kept for the #199 click guard only.  It must not
+        // become the selection endpoint: tmux's `window_copy_drag_release`
+        // only clears the drag state, and the cursor moves on drag or
+        // bare-motion events alone, so the endpoint stays whatever the last
+        // drag left.  Taking the release cell here yanked a character the user
+        // never saw highlighted (see `handle_pane_mouse`).
+        let mut release_cell = None;
         if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
-            let (row, col) = copy_cell_for_area(*area, x, y);
-            app.copy_pos = Some((row, col));
+            release_cell = Some(copy_cell_for_area(label.content(*area), x, y, gutter.over(path)));
+            // Only a release with no drag endpoint of its own may position the
+            // cursor — a press that belonged to another pane, or that arrived
+            // before copy mode opened (#669).  Once a drag has anchored a
+            // selection, the endpoint is the last drag cell.
+            if app.copy_anchor.is_none() {
+                app.copy_pos = release_cell;
+            }
         }
         // If mouse-up is within 1 cell of mouse-down, it was a plain click
         // (any anchor set by jittery drag events is spurious). Clear it. (#199)
         // Mouse jitter during a click can shift the cursor by 1 cell.
         let click_origin = app.copy_mouse_down_cell.take();
-        if let (Some((dr, dc)), Some((ur, uc))) = (click_origin, app.copy_pos) {
+        if let (Some((dr, dc)), Some((ur, uc))) = (click_origin, release_cell.or(app.copy_pos)) {
             let row_diff = (dr as i32 - ur as i32).unsigned_abs();
             let col_diff = (dc as i32 - uc as i32).unsigned_abs();
             if row_diff <= 1 && col_diff <= 1 {
                 app.copy_anchor = None;
                 app.copy_pos = Some((dr, dc)); // snap to the original click position
+                // A click leaves copy mode open, so an offset pinned here is
+                // read by every keyboard selection that follows it.
+                app.copy_pos_scroll_offset = None;
                 return;
             }
+        }
+        // Raw clients (mouse-down/drag/up) forward the terminal's reports
+        // verbatim and cannot re-report what they painted, so a slip reported
+        // together with the release — a phone's coarse last report, coalesced
+        // motion — is dropped here by falling back to the endpoint of the last
+        // frame: no frame carried that cell, so it was never highlighted.  The
+        // release cell itself never extends the selection either way.
+        if let Some(published) = app.copy_pos_published {
+            app.copy_pos = Some(published);
+            // The published cell is a row of the frame on screen now, which is
+            // what `None` means.
+            app.copy_pos_scroll_offset = None;
         }
         // Auto-yank if a real selection exists, else clear the stale anchor.
         // Compare CONTENT positions (screen row minus the scroll offset it
@@ -1122,7 +1454,7 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
         // while the selection spans many scrolled lines.
         if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
             let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
-            let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+            let p_abs = p.0 as i64 - app.copy_pos_scroll_offset.unwrap_or(app.copy_scroll_offset) as i64;
             if (a_abs, a.1) != (p_abs, p.1) {
                 let _ = yank_selection(app);
             }
@@ -1145,7 +1477,7 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
 
     // Forward mouse release only when active pane wants mouse input.
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let (col, row) = pane_inner_cell_0based(area, x, y);
+        let (col, row) = label.cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if pane_wants_click(active) {
@@ -1159,11 +1491,12 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
 /// Forward a non-left mouse button press/release to the child.
 pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press: bool) {
     let (x, y) = map_client_coords(app, x, y);
+    let label = PaneLabelRow::from_options(app);
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let (col, row) = pane_inner_cell_0based(area, x, y);
+        let (col, row) = label.cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if pane_wants_click(active) {
@@ -1213,6 +1546,7 @@ pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) -> bool {
     }
     app.last_hover_pos = Some((x, y));
 
+    let label = PaneLabelRow::from_options(app);
     let win = &mut app.windows[app.active_idx];
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
@@ -1223,7 +1557,7 @@ pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) -> bool {
     mouse_log(&format!("remote_mouse_motion: x={} y={}", x, y));
 
     if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
-        let (col, row) = pane_inner_cell_0based(area, x, y);
+        let (col, row) = label.cell_0based(area, x, y);
         let win_name = win.name.clone();
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if pane_wants_bare_motion(active) {
@@ -1243,10 +1577,57 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
     (col, row)
 }
 
-fn copy_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
+/// The line number gutter each pane of the active window is measured over
+/// by a copy-mode mouse event.
+///
+/// The width belongs to the pane under the pointer, as tmux takes it from the
+/// pane the mouse event is for (`cmd_mouse_pane`, then
+/// `window_copy_cursor_unoffset` in `window_copy_start_drag`). psmux moves
+/// copy mode onto the pane a press lands on, and that pane is painted with its
+/// own gutter from then on, so measuring the press over the same gutter keeps
+/// the press, the drag and the release of one gesture in one frame. The
+/// widths are read before the event touches the layout; they depend on each
+/// pane's history and height, not on which pane is active.
+struct CopyGutter {
+    widths: Vec<(Vec<usize>, usize)>,
+}
+
+impl CopyGutter {
+    fn snapshot(app: &AppState) -> Self {
+        if !app.mode.in_copy() {
+            return CopyGutter { widths: Vec::new() };
+        }
+        let Some(win) = app.windows.get(app.active_idx) else {
+            return CopyGutter { widths: Vec::new() };
+        };
+        let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+        compute_rects(&win.root, app.last_window_area, &mut rects);
+        let widths = rects
+            .into_iter()
+            .map(|(path, _)| {
+                let w = crate::copy_mode::gutter_width_at(app, &path);
+                (path, w)
+            })
+            .collect();
+        CopyGutter { widths }
+    }
+
+    /// The gutter width a pointer over the pane at `path` is measured over.
+    fn over(&self, path: &[usize]) -> usize {
+        self.widths.iter().find(|(p, _)| p.as_slice() == path).map_or(0, |(_, w)| *w)
+    }
+}
+
+fn copy_cell_for_area(area: Rect, x: u16, y: u16, gutter: usize) -> (u16, u16) {
     // Convert global terminal coordinates to 0-based pane-local coordinates (no border offset).
     let col = x.saturating_sub(area.x).min(area.width.saturating_sub(1));
     let row = y.saturating_sub(area.y).min(area.height.saturating_sub(1));
+    // A copy-mode column counts the pane's content, and the pointer counts
+    // what is on screen: the line number gutter sits between the two
+    // (tmux `window_copy_cursor_unoffset`, window-copy.c). `gutter` is 0
+    // whenever no gutter is drawn, which leaves the column untouched.
+    let col = crate::copy_line_numbers::cursor_unoffset(
+        gutter, col as usize, area.width as usize) as u16;
     (row, col)
 }
 
@@ -1267,7 +1648,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
     }
 
     // Handle scroll while already in copy mode
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         mouse_log("  -> already in copy mode, scrolling within");
         if up {
             scroll_copy_up(app, 3);
@@ -1313,13 +1694,23 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
         (alt, target_area, sgr_btn, bs)
     };
 
-    mouse_log(&format!("  -> alt_screen={}", child_in_alt_screen));
+    {
+        let win = &app.windows[app.active_idx];
+        let p = active_pane(&win.root, &win.active_path);
+        mouse_log(&format!(
+            "  -> wheel gate: forward={} alt_screen={} proto_owner={:?}",
+            child_in_alt_screen,
+            p.map_or(false, pane_in_alt_screen),
+            p.and_then(|p| p.mouse_proto_owner),
+        ));
+    }
 
     if child_in_alt_screen {
         // Forward scroll to child TUI app (alternate screen = real TUI)
         mouse_log("  -> forwarding scroll to child TUI (alt screen)");
+        let label = PaneLabelRow::from_options(app);
         let win = &mut app.windows[app.active_idx];
-        let (col, row) = target_area_opt.map_or((0, 0), |area| pane_inner_cell_0based(area, x, y));
+        let (col, row) = target_area_opt.map_or((0, 0), |area| label.cell_0based(area, x, y));
         let win_name = win.name.clone();
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
             inject_mouse_combined(p, col, row, sgr_btn, true,
@@ -1346,6 +1737,9 @@ pub fn remote_scroll_down(app: &mut AppState, x: u16, y: u16) { remote_scroll_wh
 /// The client has already determined the target pane and computed pane-relative
 /// coordinates, so no coordinate translation is needed.
 pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i16, row: i16, press: bool) {
+    // The line number gutter of each pane, for the pointer column to be
+    // brought back through (see `CopyGutter`).
+    let gutter = CopyGutter::snapshot(app);
     // Find the pane by ID and focus it
     let win = &mut app.windows[app.active_idx];
     let mut found_path: Option<Vec<usize>> = None;
@@ -1373,7 +1767,7 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
     }
 
     // Handle copy mode: position cursor with pane-relative coordinates
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         // Visible pane extent, for clamping and edge detection.  The client
         // sends drag/release coordinates unclamped, so an out-of-range row
         // is the signal that the pointer crossed a pane edge.
@@ -1386,12 +1780,26 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
         let max_r = (rows_v.saturating_sub(1)) as i16;
         let max_c = (cols_v.saturating_sub(1)) as i16;
         let r = row.clamp(0, max_r.max(0)) as u16;
-        let c = col.clamp(0, max_c.max(0)) as u16;
+        // Clamped to the pane first, because the client sends the column
+        // unclamped, and then brought back through the gutter: the client
+        // reports where the pointer is on screen, and a copy-mode column
+        // counts content (tmux `window_copy_cursor_unoffset`).
+        let c = crate::copy_line_numbers::cursor_unoffset(
+            gutter.over(&path), col.clamp(0, max_c.max(0)) as usize, cols_v as usize) as u16;
         if button == 0 && press {
             // Left press: position cursor, clear selection
             app.copy_anchor = None;
             app.copy_pos = Some((r, c));
+            // A press is not a drag: the cell is in the view on screen now, and
+            // only a drag update, which records the endpoint and THEN edge
+            // scrolls, needs the pin.  Pinning on the press left the offset
+            // behind for every keyboard selection that followed the click.
+            app.copy_pos_scroll_offset = None;
             app.copy_mouse_down_cell = Some((r, c));
+            // A new gesture starts with nothing published; a frame that carries
+            // this selection publishes its endpoint for the raw mouse release
+            // to fall back on (see `sync_copy_freeze`).
+            app.copy_pos_published = None;
         } else if button == 32 {
             // Left drag: extend selection, but ignore same-cell micro-jitter
             // (#199) — only while the RAW coordinates are still inside the
@@ -1409,6 +1817,10 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                 app.copy_selection_mode = crate::types::SelectionMode::Char;
             }
             app.copy_pos = Some((r, c));
+            // Recorded BEFORE the edge auto-scroll below: the endpoint's own
+            // view offset is what makes its screen row mean a content line
+            // (see `copy_pos_scroll_offset`).
+            app.copy_pos_scroll_offset = Some(app.copy_scroll_offset);
             // tmux parity (#62): dragging on/past the pane's first or last
             // row scrolls the view so the selection keeps growing into
             // scrollback; speed rises with distance past the edge.  The
@@ -1426,27 +1838,80 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
                 app.copy_mouse_down_cell = None;
                 scroll_copy_down(app, 1 + ((row - max_r) as usize / 2).min(4));
             }
+        } else if button == 0 && !press && app.click_finish_at.is_some() {
+            // The release of a built-in double / triple click: the selection
+            // it made stays (see remote_mouse_up).
         } else if button == 0 && !press {
-            // Left release: finalize position
-            app.copy_pos = Some((r, c));
-            // If close to the original click, treat as click (no selection) (#199)
+            // Left release: finalize the drag.  The endpoint is NOT moved to
+            // the release cell.  tmux's `window_copy_drag_release` only clears
+            // the drag state; the copy-mode cursor is moved by drag
+            // (`window_copy_drag_update`) and bare-motion
+            // (`window_copy_move_mouse`) events alone.
+            //
+            // Taking the release cell yanks a character the user never saw
+            // selected: the highlight is painted from `copy_pos` (the last
+            // drag cell) and `exit_copy_mode` clears it in this same call,
+            // before any dump can paint the release cell.  So a terminal that
+            // reports the button release one cell past its last motion sample
+            // — a fast flick, coalesced motion, a phone or SSH client —
+            // copied a cell that was never highlighted.  Keeping the last drag
+            // cell is by construction exactly what was last painted.
+            //
+            // The release cell is still what the #199 click guard compares
+            // against (`r`/`c`), so a press/release pair within one cell stays
+            // a click.  A release with no drag endpoint of its own (a press
+            // that belonged to another pane, or that arrived before copy mode
+            // opened, #669) may still position the cursor.
+            if app.copy_anchor.is_none() {
+                app.copy_pos = Some((r, c));
+                app.copy_pos_scroll_offset = None;
+            }
             if let Some((dr, dc)) = app.copy_mouse_down_cell.take() {
                 if (dr as i32 - r as i32).unsigned_abs() <= 1
                     && (dc as i32 - c as i32).unsigned_abs() <= 1
                 {
                     app.copy_anchor = None;
                     app.copy_pos = Some((dr, dc));
+                    // A click leaves copy mode open, so a pin set here is read
+                    // by every keyboard selection made after it.
+                    app.copy_pos_scroll_offset = None;
                     return;
                 }
             }
+            // The endpoint is the newest drag the client reported, and it is
+            // not second-guessed here: only the client knows which cell it
+            // painted, and a client whose last motion never made it to the
+            // screen re-reports the cell it did paint immediately before this
+            // release (`copy_release_repin`, client.rs).  The release itself
+            // never moves the endpoint.
+            //
             // Auto-yank if a real selection exists.  Compare CONTENT
             // positions (screen row minus the scroll offset it was recorded
             // at, as yank_selection does), not screen cells: edge
             // auto-scroll can park the release on the anchor's screen cell
             // while the selection spans many scrolled lines.
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                // The end of a drag is tmux's MouseDragEnd1Pane, looked up in
+                // the copy-mode table: the built-in default is the yank and
+                // cancel below (copy-pipe-and-cancel); a user binding runs
+                // instead; unbound, the selection simply stays (tmux: no
+                // binding, nothing happens), which is what
+                // `unbind -T copy-mode-vi MouseDragEnd1Pane` is for.
+                let key = crate::mouse_keys::drag_end_pane_key();
+                match crate::mouse_keys::resolve(app, key, true) {
+                    crate::mouse_keys::Dispatch::Builtin => {}
+                    crate::mouse_keys::Dispatch::User(cmd) => {
+                        app.last_mouse_event = Some((pane_id, 0, false, Some((col, row)), std::time::Instant::now()));
+                        run_mouse_binding(app, pane_id, &cmd);
+                        return;
+                    }
+                    crate::mouse_keys::Dispatch::Forward | crate::mouse_keys::Dispatch::Drop => {
+                        mouse_log("  -> MouseDragEnd1Pane unbound: selection kept");
+                        return;
+                    }
+                }
                 let a_abs = a.0 as i64 - app.copy_anchor_scroll_offset as i64;
-                let p_abs = p.0 as i64 - app.copy_scroll_offset as i64;
+                let p_abs = p.0 as i64 - app.copy_pos_scroll_offset.unwrap_or(app.copy_scroll_offset) as i64;
                 if (a_abs, a.1) != (p_abs, p.1) {
                     let _ = yank_selection(app);
                 }
@@ -1505,7 +1970,7 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
 /// handle_pane_mouse).
 pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anchor_row: i16,
                        col: i16, row: i16, rect_sel: bool) {
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. } | Mode::PopupMode { .. }) {
+    if app.mode.in_copy() || matches!(app.mode, Mode::PopupMode { .. }) {
         return;
     }
 
@@ -1549,9 +2014,13 @@ pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anch
         crate::types::SelectionMode::Char
     };
     app.copy_pos = Some((row.clamp(0, max_r) as u16, col.clamp(0, max_c) as u16));
+    app.copy_pos_scroll_offset = Some(app.copy_scroll_offset);
     // A drag is in progress, not a click: the release must yank, never
     // snap back through the #199 click guard.
     app.copy_mouse_down_cell = None;
+    // This gesture's selection has not been published to the client yet; the
+    // next frame that carries it publishes the endpoint the release yanks to.
+    app.copy_pos_published = None;
     // The handoff fires with the pointer at/past an edge — start scrolling
     // immediately so the selection keeps growing (the bottom edge only
     // moves when the view was scrolled back; at offset 0 it is a no-op).
@@ -1568,17 +2037,43 @@ pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anch
 /// when the request came from a client too old to send it, in which case the
 /// pane centre is used as before.
 pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Option<(i16, i16)>) {
+    // Every exit from this function is logged under PSMUX_MOUSE_DEBUG=1.  The
+    // wheel has many ways to end up doing nothing (mouse off, popup open, a
+    // pane the gate hands to its child, wheel-down at a live prompt), and with
+    // no trace here a silent notch was indistinguishable from a lost event —
+    // exactly what made #629 unfalsifiable from a user's log.  `pane-scroll`
+    // is the verb the client sends whenever the pointer is inside a pane, so
+    // this is the branch users actually hit; `remote_scroll_wheel` (the
+    // pointer-outside-any-pane fallback) has had the same tracing all along.
+    mouse_log(&format!(
+        "handle_pane_scroll: pane={} up={} at={:?} mode={} mouse_enabled={}",
+        pane_id, up, at,
+        match &app.mode {
+            Mode::Passthrough => "Passthrough",
+            Mode::CopyMode => "CopyMode",
+            Mode::CopySearch { .. } => "CopySearch",
+            Mode::PopupMode { .. } => "PopupMode",
+            _ => "Other",
+        },
+        app.mouse_enabled,
+    ));
+
     // Server request dispatch already applies this gate. Keep it here too so
     // alternate/direct callers cannot scroll or enter copy mode with mouse off.
     if !app.mouse_enabled {
+        mouse_log("  -> mouse off, ignoring scroll");
         return;
     }
 
     // Ignore scroll in popup mode (#110)
-    if matches!(app.mode, Mode::PopupMode { .. }) { return; }
+    if matches!(app.mode, Mode::PopupMode { .. }) {
+        mouse_log("  -> popup mode, ignoring scroll");
+        return;
+    }
 
     // Handle scroll while already in copy mode (coordinates irrelevant)
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
+        mouse_log("  -> already in copy mode, scrolling within");
         if up {
             scroll_copy_up(app, 3);
         } else {
@@ -1609,9 +2104,19 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Opti
     // see pane_in_alt_screen for the full rationale.
     let alt = active_pane(&win.root, &win.active_path)
         .map_or(false, |p| pane_wheel_forward(p));
+    {
+        let p = active_pane(&win.root, &win.active_path);
+        mouse_log(&format!(
+            "  -> wheel gate: forward={} alt_screen={} proto_owner={:?}",
+            alt,
+            p.map_or(false, pane_in_alt_screen),
+            p.and_then(|p| p.mouse_proto_owner),
+        ));
+    }
 
     if alt {
         // Forward scroll to TUI app
+        mouse_log("  -> forwarding scroll to child TUI (pane owns the mouse)");
         let win = &mut app.windows[app.active_idx];
         let win_name = win.name.clone();
         let sgr_btn: u8 = if up { 64 } else { 65 };
@@ -1688,7 +2193,9 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Opti
 
     if is_legacy_pager && !up {
         // `more.com`: Enter is its "advance one line" key.
-        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+        mouse_log("  -> legacy pager (more.com), sending Enter x3");
+        // Three Enter KEYS for the program, so not for an input-off pane.
+        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path).filter(|p| p.accepts_input()) {
             for _ in 0..3 {
                 crate::input::write_key_seq(pane, b"\r");
             }
@@ -1698,12 +2205,289 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Opti
         // Everything else (shell prompt, inline TUI like pi, `more.com`
         // wheel-up, or a probe failure) — enter copy mode and scroll
         // psmux's own buffer, exactly like tmux.
+        mouse_log("  -> entering copy mode (shell scroll-up)");
         enter_copy_mode(app);
         scroll_copy_up(app, 3);
     } else if !app.scroll_enter_copy_mode {
         // scroll-enter-copy-mode off: scroll scrollback directly (#193)
+        mouse_log("  -> direct scrollback (scroll-enter-copy-mode off)");
         scroll_pane_scrollback(app, 3, up);
+    } else {
+        mouse_log("  -> scroll-down at live prompt (no-op, tmux parity)");
     }
+}
+
+/// A wheel notch over a pane, as the tmux key `WheelUpPane` /
+/// `WheelDownPane` with the held modifiers (`mods` is tmux's mouse mask).
+///
+/// The key is looked up the way tmux's server_client_key_callback does it
+/// (see `mouse_keys::resolve`): a user binding runs its command with the
+/// mouse pane as `-t =` / `{mouse}`; a built-in default binding runs psmux's
+/// own wheel handler (`handle_pane_scroll`), unchanged; an unbound key in
+/// root goes to the pane only if its program asked for mouse reports, and an
+/// unbound key in copy mode does nothing.
+pub fn handle_pane_wheel(app: &mut AppState, pane_id: usize, up: bool, at: Option<(i16, i16)>, mods: u8) {
+    if !app.mouse_enabled || matches!(app.mode, Mode::PopupMode { .. }) {
+        return handle_pane_scroll(app, pane_id, up, at);
+    }
+    let mods = crate::mouse_keys::mods_from_mask(mods);
+    let key = crate::mouse_keys::wheel_pane_key(up, mods);
+    let dispatch = crate::mouse_keys::resolve(app, key, app.mode.in_copy());
+    mouse_log(&format!("handle_pane_wheel: pane={} up={} mods={:?} -> {:?}", pane_id, up, mods, dispatch));
+    match dispatch {
+        crate::mouse_keys::Dispatch::Builtin => handle_pane_scroll(app, pane_id, up, at),
+        // An unmodified notch down with no root binding is what psmux's own
+        // handler already treats as "not a copy-mode entry": the program gets
+        // it when it asked for the mouse, plus psmux's scrollback extras
+        // (scroll-enter-copy-mode off, more.com).  Keep that exactly.
+        crate::mouse_keys::Dispatch::Forward if !up && mods.is_empty() => handle_pane_scroll(app, pane_id, up, at),
+        crate::mouse_keys::Dispatch::Forward => {
+            focus_pane_by_id(app, pane_id);
+            forward_wheel_to_active_pane(app, up, at, mods);
+        }
+        crate::mouse_keys::Dispatch::Drop => {}
+        crate::mouse_keys::Dispatch::User(cmd) => {
+            // psmux's wheel has always focused the pane under the pointer;
+            // keep that so untargeted commands in the binding act on it.
+            focus_pane_by_id(app, pane_id);
+            let btn = (if up { 64 } else { 65 }) + crate::mouse_keys::sgr_mod_bits(mods);
+            app.last_mouse_event = Some((pane_id, btn, true, at, std::time::Instant::now()));
+            run_mouse_binding(app, pane_id, &cmd);
+        }
+    }
+}
+
+/// A wheel notch over the status line: tmux's `WheelUpStatus` /
+/// `WheelDownStatus`, whose defaults are previous-window / next-window
+/// (key-bindings.c).  Unbound, nothing happens: there is no pane under the
+/// pointer to hand it to.
+pub fn handle_status_wheel(app: &mut AppState, up: bool, mods: u8) {
+    if matches!(app.mode, Mode::PopupMode { .. }) {
+        return;
+    }
+    let mods = crate::mouse_keys::mods_from_mask(mods);
+    let ev = if up { crate::mouse_keys::EV_WHEEL_UP } else { crate::mouse_keys::EV_WHEEL_DOWN };
+    let key = crate::mouse_keys::key(ev, 0, crate::mouse_keys::LOC_STATUS, mods);
+    let dispatch = crate::mouse_keys::resolve(app, key, app.mode.in_copy());
+    mouse_log(&format!("handle_status_wheel: up={} mods={:?} -> {:?}", up, mods, dispatch));
+    match dispatch {
+        crate::mouse_keys::Dispatch::Builtin => {
+            let _ = crate::commands::execute_command_string(app, if up { "previous-window" } else { "next-window" });
+        }
+        crate::mouse_keys::Dispatch::User(cmd) => {
+            let pane_id = {
+                let win = &app.windows[app.active_idx];
+                crate::tree::get_active_pane_id(&win.root, &win.active_path).unwrap_or(0)
+            };
+            app.last_mouse_event = None;
+            run_mouse_binding(app, pane_id, &cmd);
+        }
+        crate::mouse_keys::Dispatch::Forward | crate::mouse_keys::Dispatch::Drop => {}
+    }
+}
+/// A client routed mouse key (`mouse_keys::CLIENT_ROUTED`) that the client
+/// sent because it has a user binding. Resolved again here, so a binding
+/// changed in between is honoured; only a user binding runs.
+pub fn handle_mouse_key(app: &mut AppState, name: &str, target: &str, col: i16, row: i16, btn: u8) {
+    let Some(key) = crate::mouse_keys::parse(name) else { return };
+    let dispatch = crate::mouse_keys::resolve(app, key, app.mode.in_copy());
+    mouse_log(&format!("handle_mouse_key: {} target={} -> {:?}", name, target, dispatch));
+    let pane_for_clicks = target.strip_prefix('%').and_then(|s| s.parse::<usize>().ok());
+    if btn == 0 && name.ends_with("MouseDown1Pane") {
+        if let Some(p) = pane_for_clicks {
+            note_pane_press(app, p, col, row);
+        }
+    }
+    if let crate::mouse_keys::Dispatch::User(cmd) = dispatch {
+        let pane_id = pane_for_clicks;
+        app.last_mouse_event = pane_id.map(|p| (p, btn, true, Some((col, row)), std::time::Instant::now()));
+        run_mouse_binding_to(app, target, &cmd);
+    }
+}
+
+/// An unbound root mouse key, handed to the pane's program the way tmux's
+/// forward_key does: only a program that asked for the mouse gets it, and
+/// psmux itself does nothing (no focus change, no selection).
+pub fn forward_mouse_to_pane(app: &mut AppState, pane_id: usize, btn: u8, press: bool, at: Option<(i16, i16)>) {
+    if btn == 0 && press {
+        let (c, r) = at.unwrap_or((0, 0));
+        note_pane_press(app, pane_id, c, r);
+    }
+    let win_name = app.windows.get(app.active_idx).map(|w| w.name.clone()).unwrap_or_default();
+    let Some(pane) = crate::tree::find_pane_mut_by_id_global(app, pane_id) else { return };
+    let wants = if btn & 64 != 0 { pane_wheel_forward(pane) } else { pane_wants_click(pane) };
+    if !wants {
+        return;
+    }
+    let (col, row) = at.unwrap_or((5, 5));
+    let flags = if btn & 64 != 0 { mouse_inject::MOUSE_WHEELED } else if btn & 32 != 0 { mouse_inject::MOUSE_MOVED } else { 0 };
+    inject_mouse_combined(pane, col, row, btn, press, 0, flags, &win_name);
+}
+
+/// tmux's click timer for a left press in a pane (server-client.c
+/// server_client_check_mouse and server_client_click_timer). Called for every
+/// left press psmux sees in a pane. A press inside the double click window
+/// after a first one is SecondClick1Pane; a third is TripleClick1Pane, run at
+/// once; the window running out after a second press is DoubleClick1Pane
+/// (`click_timer_tick`).
+pub fn note_pane_press(app: &mut AppState, pane_id: usize, col: i16, row: i16) {
+    let now = std::time::Instant::now();
+    let window = std::time::Duration::from_millis(crate::mouse_keys::CLICK_TIMEOUT_MS);
+    match app.click_state {
+        Some((p, _, 1, deadline)) if p == pane_id && now < deadline => {
+            app.click_state = Some((pane_id, (col, row), 2, now + window));
+            let key = crate::mouse_keys::key(crate::mouse_keys::EV_SECOND_CLICK, 1, crate::mouse_keys::LOC_PANE, crossterm::event::KeyModifiers::NONE);
+            if let crate::mouse_keys::Dispatch::User(cmd) = crate::mouse_keys::resolve(app, key, app.mode.in_copy()) {
+                app.last_mouse_event = Some((pane_id, 0, true, Some((col, row)), now));
+                run_mouse_binding(app, pane_id, &cmd);
+            }
+        }
+        Some((p, _, 2, deadline)) if p == pane_id && now < deadline => {
+            app.click_state = None;
+            multi_click(app, false, pane_id, col, row);
+        }
+        _ => {
+            app.click_state = Some((pane_id, (col, row), 1, now + window));
+        }
+    }
+}
+
+/// The click timer and the built-in multi click finish, from the server loop.
+/// Returns true when it changed something (a frame is owed).
+pub fn click_timer_tick(app: &mut AppState) -> bool {
+    let now = std::time::Instant::now();
+    let mut acted = false;
+    if let Some((pane_id, (col, row), count, deadline)) = app.click_state {
+        if now >= deadline {
+            app.click_state = None;
+            if count == 2 {
+                multi_click(app, true, pane_id, col, row);
+                acted = true;
+            }
+        }
+    }
+    if let Some(at) = app.click_finish_at {
+        if now >= at {
+            app.click_finish_at = None;
+            if app.mode.in_copy() {
+                let _ = crate::server::run_send_keys_x(app, "copy-pipe-and-cancel", 1);
+            }
+            acted = true;
+        }
+    }
+    acted
+}
+
+/// DoubleClick1Pane (`double`) or TripleClick1Pane, resolved like tmux. The
+/// built-in is tmux's default: in copy mode select the word / line under the
+/// pointer, show it for 0.3s, copy and leave; outside copy mode the same after
+/// entering copy mode, unless the program has the mouse (it already got the
+/// presses: tmux's `send -M`) or pwsh-mouse-selection does its own word and
+/// line selection in the client.
+fn multi_click(app: &mut AppState, double: bool, pane_id: usize, col: i16, row: i16) {
+    let ev = if double { crate::mouse_keys::EV_DOUBLE_CLICK } else { crate::mouse_keys::EV_TRIPLE_CLICK };
+    let key = crate::mouse_keys::key(ev, 1, crate::mouse_keys::LOC_PANE, crossterm::event::KeyModifiers::NONE);
+    let dispatch = crate::mouse_keys::resolve(app, key, app.mode.in_copy());
+    mouse_log(&format!("multi_click: double={} pane={} at=({},{}) -> {:?}", double, pane_id, col, row, dispatch));
+    match dispatch {
+        crate::mouse_keys::Dispatch::User(cmd) => {
+            app.last_mouse_event = Some((pane_id, 0, true, Some((col, row)), std::time::Instant::now()));
+            run_mouse_binding(app, pane_id, &cmd);
+        }
+        crate::mouse_keys::Dispatch::Builtin => {
+            if !app.mode.in_copy() {
+                if app.pwsh_mouse_selection {
+                    return;
+                }
+                let wants = crate::tree::find_pane_mut_by_id_global(app, pane_id).map_or(false, |p| pane_wants_click(p));
+                if wants {
+                    return;
+                }
+                focus_pane_by_id(app, pane_id);
+                enter_copy_mode(app);
+            }
+            // Put the copy cursor on the clicked cell (the press path maps the
+            // pointer through the pane and the line number gutter).
+            handle_pane_mouse(app, pane_id, 0, col, row, true);
+            app.copy_mouse_down_cell = None;
+            let _ = crate::server::run_send_keys_x(app, if double { "select-word" } else { "select-line" }, 1);
+            app.click_finish_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+        }
+        crate::mouse_keys::Dispatch::Forward | crate::mouse_keys::Dispatch::Drop => {}
+    }
+}
+/// Run a user mouse binding's command for the pane the event happened in.
+/// The command line goes the route a keyboard binding takes, to the server's
+/// command parser (brace blocks, `\;` chains, if-shell, send-keys -M), with
+/// `-t =`, `-t=` and `{mouse}` pointed at the pane.
+pub(crate) fn run_mouse_binding(app: &mut AppState, pane_id: usize, cmd: &str) {
+    run_mouse_binding_to(app, &format!("%{}", pane_id), cmd);
+}
+
+/// `run_mouse_binding` with the mouse target spelled out (`%N` or `:N`).
+pub(crate) fn run_mouse_binding_to(app: &mut AppState, target: &str, cmd: &str) {
+    let cmd = crate::mouse_keys::resolve_mouse_targets_to(cmd, target);
+    match app.control_port {
+        Some(port) => {
+            let _ = crate::session::send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+        }
+        None => {
+            let _ = crate::commands::execute_command_string(app, &cmd);
+        }
+    }
+}
+/// `send-keys -M`: hand the mouse event of the running mouse binding to its
+/// pane, as tmux does (cmd-send-keys.c -> window_pane_key).  A pane in copy
+/// mode takes nothing this way (tmux's copy mode has no mode->key, so
+/// window_pane_key drops it); otherwise the event reaches the program only if
+/// it asked for mouse reports.
+pub fn send_mouse_event(app: &mut AppState) {
+    let Some((pane_id, btn, press, at, when)) = app.last_mouse_event else { return };
+    if when.elapsed() > std::time::Duration::from_secs(5) || app.mode.in_copy() {
+        return;
+    }
+    focus_pane_by_id(app, pane_id);
+    let win = &mut app.windows[app.active_idx];
+    let win_name = win.name.clone();
+    let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return };
+    // tmux input_key_mouse: a report only for a program that asked for one.
+    let wants = if btn & 64 != 0 { pane_wheel_forward(pane) } else { pane_wants_click(pane) };
+    if !wants {
+        return;
+    }
+    let (col, row) = at.unwrap_or((5, 5));
+    let flags = if btn & 64 != 0 { mouse_inject::MOUSE_WHEELED } else { 0 };
+    inject_mouse_combined(pane, col, row, btn, press, 0, flags, &win_name);
+}
+
+fn focus_pane_by_id(app: &mut AppState, pane_id: usize) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+    for (path, _area) in &rects {
+        if crate::tree::get_active_pane_id(&win.root, path) == Some(pane_id) {
+            win.active_path = path.clone();
+            break;
+        }
+    }
+}
+
+/// tmux input_key_mouse for a wheel event: an SGR report with the modifier
+/// bits, written only to a program that enabled mouse reporting.
+fn forward_wheel_to_active_pane(app: &mut AppState, up: bool, at: Option<(i16, i16)>, mods: crossterm::event::KeyModifiers) {
+    let win = &mut app.windows[app.active_idx];
+    let win_name = win.name.clone();
+    let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return };
+    if !pane_wheel_forward(pane) {
+        mouse_log("  -> unbound wheel key, pane has no mouse reporting: nothing (tmux parity)");
+        return;
+    }
+    let sgr_btn: u8 = (if up { 64 } else { 65 }) + crate::mouse_keys::sgr_mod_bits(mods);
+    let wheel_delta: i16 = if up { 120 } else { -120 };
+    let button_state = ((wheel_delta as i32) << 16) as u32;
+    let (col, row) = at.unwrap_or((5, 5));
+    inject_mouse_combined(pane, col, row, sgr_btn, true,
+        button_state, mouse_inject::MOUSE_WHEELED, &win_name);
 }
 
 /// Set split sizes at a given tree path during border drag.
@@ -1848,6 +2632,220 @@ pub fn swap_pane_between(app: &mut AppState, src_path: Vec<usize>, dst_path: Vec
     swapped
 }
 
+/// Swap two panes that live in DIFFERENT windows (`swap-pane -s A -t B` with
+/// A and B in separate windows, issue #689 part three).
+///
+/// tmux does this in `cmd_swap_pane_exec`: the two panes trade layout cells and
+/// window membership (cmd-swap-pane.c:143 to 155), each window's active pane
+/// becomes the pane that arrived unless `-d` was given (cmd-swap-pane.c:164 to
+/// 177), and both windows are re laid out (cmd-swap-pane.c:183 to 189).
+///
+/// psmux used to resolve BOTH halves inside `app.windows[app.active_idx]`, so
+/// `swap-pane -s s:0.0 -t s:1.0` resolved to the same pane twice and exited 0
+/// having done nothing.
+pub fn swap_pane_across_windows(
+    app: &mut AppState,
+    src_win: usize,
+    src_path: Vec<usize>,
+    dst_win: usize,
+    dst_path: Vec<usize>,
+    detach: bool,
+) -> bool {
+    if src_win == dst_win {
+        return swap_pane_between(app, src_path, dst_path, detach);
+    }
+    if src_win >= app.windows.len() || dst_win >= app.windows.len() { return false; }
+    let src_id = crate::tree::get_active_pane_id(&app.windows[src_win].root, &src_path);
+    let dst_id = crate::tree::get_active_pane_id(&app.windows[dst_win].root, &dst_path);
+    let (Some(src_id), Some(dst_id)) = (src_id, dst_id) else { return false };
+    if src_id == dst_id { return false; }
+    // Two distinct windows: borrow both roots at once.
+    let (lo, hi) = (src_win.min(dst_win), src_win.max(dst_win));
+    let (head, tail) = app.windows.split_at_mut(hi);
+    let swapped = if src_win < dst_win {
+        crate::tree::swap_nodes_across(&mut head[lo].root, &src_path, &mut tail[0].root, &dst_path)
+    } else {
+        crate::tree::swap_nodes_across(&mut tail[0].root, &src_path, &mut head[lo].root, &dst_path)
+    };
+    if !swapped { return false; }
+    // Each pane id now belongs to the other window's MRU list.
+    crate::tree::remove_from_mru(&mut app.windows[src_win].pane_mru, src_id);
+    crate::tree::remove_from_mru(&mut app.windows[dst_win].pane_mru, dst_id);
+    crate::tree::touch_mru(&mut app.windows[src_win].pane_mru, dst_id);
+    crate::tree::touch_mru(&mut app.windows[dst_win].pane_mru, src_id);
+    if !detach {
+        // Without -d each window activates the pane that arrived in it
+        // (cmd-swap-pane.c:165 to 167); the arriving pane sits in the slot the
+        // departing one vacated.
+        app.windows[src_win].active_path = src_path.clone();
+        app.windows[dst_win].active_path = dst_path.clone();
+    }
+    // With -d there is nothing to fix: psmux holds the active pane as a layout
+    // SLOT, so a window whose active slot was the swapped one already follows
+    // the arriving pane, and a window active elsewhere is left alone. That is
+    // exactly cmd-swap-pane.c:172 to 177.
+    //
+    // Both windows are re laid out, not just the active one: each pane must
+    // take the size of the cell it now occupies, and its PTY with it
+    // (cmd-swap-pane.c:183 and :187, window_pane_resize plus layout_fix_panes).
+    for w in [src_win, dst_win] {
+        let area = app.windows[w].area;
+        crate::tree::resize_window_panes(app, w, area);
+    }
+    true
+}
+
+/// Where a pane sits: a cell of a window's tiled tree, or a floating pane.
+enum PaneSlot {
+    Tiled(usize, Vec<usize>),
+    Float(usize, usize),
+}
+
+/// The window and floating index a `%id` spec (or `sess:@w.%id`) names, when
+/// that pane is a floating one.
+fn floating_spec(app: &AppState, spec: &str) -> Option<(usize, usize)> {
+    let pt = crate::cli::parse_target(crate::cli::strip_exact_match_prefix(spec.trim()));
+    if !pt.pane_is_id { return None; }
+    crate::tree::find_floating_by_id(app, pt.pane?)
+}
+
+/// Give `p` and its pseudo console a new size.
+fn resize_pane_pty(p: &mut crate::types::Pane, rows: u16, cols: u16) {
+    if p.last_rows != rows || p.last_cols != cols {
+        let _ = p.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        if let Ok(mut parser) = p.term.lock() { parser.screen_mut().set_size(rows, cols); }
+        p.last_rows = rows;
+        p.last_cols = cols;
+    }
+}
+
+/// Swap two panes when at least one is floating: the panes trade places, so
+/// the one that lands in a floating slot takes that float's position and size
+/// and the one that lands in a tiled cell takes the cell's (tmux exchanges
+/// the layout cells, cmd-swap-pane.c). Returns whether anything moved.
+fn swap_with_floating(app: &mut AppState, a: PaneSlot, b: PaneSlot) -> bool {
+    fn float_inner(fp: &crate::types::FloatingPane) -> (u16, u16) {
+        (fp.h.saturating_sub(2).max(1), fp.w.saturating_sub(2).max(1))
+    }
+    match (a, b) {
+        (PaneSlot::Float(w1, f1), PaneSlot::Float(w2, f2)) => {
+            if (w1, f1) == (w2, f2) { return false; }
+            // Each pane moves into the other's slot; the slots keep their
+            // geometry.
+            if w1 == w2 {
+                let fl = &mut app.windows[w1].floating;
+                let (lo, hi) = (f1.min(f2), f1.max(f2));
+                let (head, tail) = fl.split_at_mut(hi);
+                std::mem::swap(&mut head[lo].pane, &mut tail[0].pane);
+            } else {
+                let (lo, hi) = (w1.min(w2), w1.max(w2));
+                let (head, tail) = app.windows.split_at_mut(hi);
+                let (fa, fb) = if w1 < w2 { (f1, f2) } else { (f2, f1) };
+                std::mem::swap(&mut head[lo].floating[fa].pane, &mut tail[0].floating[fb].pane);
+            }
+            for (w, f) in [(w1, f1), (w2, f2)] {
+                let fp = &mut app.windows[w].floating[f];
+                fp.id = fp.pane.id;
+                let (r, c) = float_inner(fp);
+                resize_pane_pty(&mut fp.pane, r, c);
+            }
+            true
+        }
+        (PaneSlot::Float(fw, fi), PaneSlot::Tiled(tw, path)) | (PaneSlot::Tiled(tw, path), PaneSlot::Float(fw, fi)) => {
+            let tiled_id = match crate::tree::get_active_pane_id(&app.windows[tw].root, &path) {
+                Some(id) => id,
+                None => return false,
+            };
+            let float_id = app.windows[fw].floating[fi].id;
+            {
+                let (float_win, tiled_win): (&mut crate::types::Window, &mut crate::types::Window);
+                if fw == tw {
+                    let win = &mut app.windows[fw];
+                    let Some(leaf) = crate::tree::active_pane_mut(&mut win.root, &path) else { return false };
+                    std::mem::swap(&mut win.floating[fi].pane, leaf);
+                } else {
+                    let (lo, hi) = (fw.min(tw), fw.max(tw));
+                    let (head, tail) = app.windows.split_at_mut(hi);
+                    if fw < tw { float_win = &mut head[lo]; tiled_win = &mut tail[0]; }
+                    else { float_win = &mut tail[0]; tiled_win = &mut head[lo]; }
+                    let Some(leaf) = crate::tree::active_pane_mut(&mut tiled_win.root, &path) else { return false };
+                    std::mem::swap(&mut float_win.floating[fi].pane, leaf);
+                }
+            }
+            let fp = &mut app.windows[fw].floating[fi];
+            fp.id = fp.pane.id;
+            let (r, c) = float_inner(fp);
+            resize_pane_pty(&mut fp.pane, r, c);
+            let mru = &mut app.windows[tw].pane_mru;
+            crate::tree::remove_from_mru(mru, tiled_id);
+            crate::tree::touch_mru(mru, float_id);
+            let area = app.windows[tw].area;
+            crate::tree::resize_window_panes(app, tw, area);
+            true
+        }
+        (PaneSlot::Tiled(..), PaneSlot::Tiled(..)) => false,
+    }
+}
+
+/// Resolve a `swap-pane` pair from RAW target specs and perform the swap.
+/// `src` of None is tmux's default source: the current pane
+/// (cmd-swap-pane.c:38, `CMD_FIND_DEFAULT_MARKED`, which falls back to the
+/// current pane when no pane is marked).
+pub fn swap_pane_by_spec(
+    app: &mut AppState,
+    src: Option<&str>,
+    dst: &str,
+    detach: bool,
+) -> Result<bool, String> {
+    // A pane in another session lives in another server: refuse it rather
+    // than swap this session's pane of the same number.
+    for spec in [src, Some(dst)].into_iter().flatten() {
+        if let Some(s) = crate::commands::foreign_session_in_spec(app, spec) {
+            return Err(crate::commands::cross_session_refusal("swap-pane", &s));
+        }
+    }
+    if app.windows.is_empty() { return Err("can't find pane".to_string()); }
+    let active = app.active_idx.min(app.windows.len() - 1);
+    // A floating pane on either side (tmux cmd-swap-pane.c swaps a floating
+    // pane with any other pane by exchanging their cells: each takes the
+    // other's place and size). resolve_pane_spec knows the tiled tree only,
+    // so `swap-pane -s <float>` was "can't find pane" (issue #793 follow up).
+    let src_float = match src {
+        Some(s) => floating_spec(app, s),
+        None => {
+            let w = &app.windows[active];
+            w.floating_focus.filter(|fi| *fi < w.floating.len()).map(|fi| (active, fi))
+        }
+    };
+    let dst_float = floating_spec(app, dst);
+    if src_float.is_some() || dst_float.is_some() {
+        let src_slot = match src_float {
+            Some(f) => PaneSlot::Float(f.0, f.1),
+            None => {
+                let (w, p) = match src {
+                    Some(s) => resolve_pane_spec(app, s)?,
+                    None => (active, app.windows[active].active_path.clone()),
+                };
+                PaneSlot::Tiled(w, p)
+            }
+        };
+        let dst_slot = match dst_float {
+            Some(f) => PaneSlot::Float(f.0, f.1),
+            None => {
+                let (w, p) = resolve_pane_spec(app, dst)?;
+                PaneSlot::Tiled(w, p)
+            }
+        };
+        return Ok(swap_with_floating(app, src_slot, dst_slot));
+    }
+    let (sw, sp) = match src {
+        Some(s) => resolve_pane_spec(app, s)?,
+        None => (active, app.windows[active].active_path.clone()),
+    };
+    let (dw, dp) = resolve_pane_spec(app, dst)?;
+    Ok(swap_pane_across_windows(app, sw, sp, dw, dp, detach))
+}
+
 /// Resolve a tmux-style position token (e.g. `{top-right}`) to the path of the
 /// pane occupying that corner/edge of the current window.  Layout-independent:
 /// always finds whatever pane currently sits there.
@@ -1968,6 +2966,7 @@ mod window_ops_tests {
             id: 0,
             area: Rect::new(0, 0, 10, 5),
             window_size: None,
+            window_options: Default::default(),
             activity_flag: false,
             bell_flag: false,
             silence_flag: false,
@@ -1995,6 +2994,11 @@ mod window_ops_tests {
 
         let mut app = AppState::new("mouse-scrollback".to_string());
         app.mouse_enabled = mouse_enabled;
+        // vi keys copy the cell under the end of a drag too, so the yanks
+        // below are the cells the pointer covered. emacs keys (the default)
+        // leave that cell out, as tmux does; see
+        // an_emacs_drag_leaves_the_cell_under_the_pointer_out.
+        app.mode_keys = "vi".to_string();
         app.scroll_enter_copy_mode = true;
         app.last_window_area = Rect {
             x: 0,
@@ -2009,6 +3013,7 @@ mod window_ops_tests {
             id: 0,
             area: app.client_area,
             window_size: None,
+            window_options: Default::default(),
             activity_flag: false,
             bell_flag: false,
             silence_flag: false,
@@ -2161,13 +3166,19 @@ mod window_ops_tests {
 
         // A drag journey that ends exactly where it started: up to the top
         // edge (scrolls one line), down to the bottom edge (scrolls back),
-        // release on the anchor's content position.  Nothing is selected,
+        // then back onto the anchor's content position.  Nothing is selected,
         // but the drag still ends — tmux's copy-pipe-and-cancel cancels
         // copy mode either way, it never leaves the user stranded there.
+        //
+        // The return to the anchor is a DRAG, not the release: the endpoint
+        // follows drag/motion events only (tmux's window_copy_drag_release
+        // just clears the drag state), so the release cell cannot stand in
+        // for the motion that brought the pointer back.
         super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true);
         super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true);
         super::handle_pane_mouse(&mut app, 41, 32, 5, 7, true);
         assert_eq!(app.copy_scroll_offset, base, "the two edge scrolls must cancel out");
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 2, true); // back onto the anchor
         super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
         assert!(app.paste_buffers.is_empty(), "an empty selection must not yank");
         assert!(matches!(app.mode, Mode::Passthrough), "an empty drag must still exit copy mode");
@@ -2193,11 +3204,270 @@ mod window_ops_tests {
         // comparison.
         super::remote_mouse_up(&mut app, 5, 2);
         assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
-        assert!(app.paste_buffers[0].contains('\n'), "yank must span the scrolled lines");
+        assert!(app.paste_buffers[0].data.contains('\n'), "yank must span the scrolled lines");
         // A mouse yank cancels copy mode and returns to live view (#62),
         // same as the pane-mouse release path.
         assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
         assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    #[test]
+    fn client_entered_copy_mode_drag_anchors_at_press_and_yanks() {
+        // mouse-drag-enter-copy-mode: the client sends `copy-enter`, replays
+        // the press at the button-down cell, then drags. The selection must
+        // anchor at the press cell (not at the pane cursor) and yank on
+        // release, then leave copy mode like every other mouse drag (#62).
+        let mut app = make_scrollback_app(true);
+        crate::copy_mode::enter_copy_mode(&mut app);
+        assert!(matches!(app.mode, Mode::CopyMode));
+
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true); // press at (col 5, row 2)
+        super::handle_pane_mouse(&mut app, 41, 32, 9, 3, true); // drag to (col 9, row 3)
+        assert_eq!(app.copy_anchor, Some((2, 5)), "anchor must be the press cell");
+
+        super::handle_pane_mouse(&mut app, 41, 0, 9, 3, false); // release
+        assert_eq!(app.paste_buffers.len(), 1, "release must yank the selection");
+        assert!(matches!(app.mode, Mode::Passthrough), "a mouse yank exits copy mode");
+    }
+
+    /// Yank a single-row drag on the pane-mouse protocol, releasing on
+    /// `release_col` after dragging only as far as column 9.
+    fn yank_drag_released_at(release_col: i16) -> String {
+        let mut app = make_scrollback_app(true);
+        crate::copy_mode::enter_copy_mode(&mut app);
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true); // press at (col 5, row 2)
+        super::handle_pane_mouse(&mut app, 41, 32, 9, 2, true); // last drag: (col 9, row 2)
+        super::handle_pane_mouse(&mut app, 41, 0, release_col, 2, false);
+        assert!(
+            matches!(app.mode, Mode::Passthrough),
+            "the release must still finalize the drag"
+        );
+        app.paste_buffers
+            .first()
+            .map(|b| b.data.clone())
+            .expect("a real drag must yank on release")
+    }
+
+    #[test]
+    fn a_release_past_the_last_drag_must_not_extend_the_selection() {
+        // The copied text used to come out one character longer than the
+        // highlighted selection.  The endpoint is painted from `copy_pos`, the
+        // last DRAG cell, and `exit_copy_mode` clears it in the same call as
+        // the yank — so a release cell that trailed the last motion sample was
+        // never highlighted, yet still landed in the buffer.  tmux's
+        // `window_copy_drag_release` only clears the drag state (parity: the
+        // endpoint follows drag and bare-motion events, never the release).
+        let dragged_to = yank_drag_released_at(9);
+        let released_one_past = yank_drag_released_at(10);
+        assert_eq!(
+            released_one_past, dragged_to,
+            "a release cell the drag never reported must not be selected"
+        );
+        assert_eq!(dragged_to, "ry-75", "the drag must select exactly cols 5..=9");
+
+        // The other direction: a release that pulls back is not a retraction
+        // either (col 7 is two cells off the press, so this stays a drag and
+        // not a #199 click).  Retractions arrive as drag events, which do
+        // move the endpoint.
+        assert_eq!(
+            yank_drag_released_at(7), dragged_to,
+            "the release may not shrink the selection either"
+        );
+    }
+
+    /// tmux with emacs mode-keys (its default) copies a drag up to the cell
+    /// BEFORE the pointer, and paints the same: window_copy_get_selection and
+    /// screen_check_selection drop the bottom right end. Measured on tmux 3.4
+    /// and 3.8 by dragging over "abcdefghij" from c to g: emacs copies "cdef",
+    /// vi "cdefg".
+    #[test]
+    fn an_emacs_drag_leaves_the_cell_under_the_pointer_out() {
+        let mut app = make_scrollback_app(true);
+        app.mode_keys = "emacs".to_string();
+        crate::copy_mode::enter_copy_mode(&mut app);
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, true); // press at (col 5, row 2)
+        super::handle_pane_mouse(&mut app, 41, 32, 9, 2, true); // drag to col 9
+        let frame = crate::layout::dump_layout_json_fast(&mut app).expect("a frame");
+        assert!(
+            frame.contains("\"sel_start_col\":5,\"sel_end_row\":"),
+            "the highlight starts at the press: {frame}"
+        );
+        assert!(frame.contains("\"sel_end_col\":8,"), "the highlight stops before the pointer: {frame}");
+        super::handle_pane_mouse(&mut app, 41, 0, 9, 2, false);
+        assert_eq!(app.paste_top(), Some("ry-7"), "the copy is cols 5..=8");
+    }
+
+    #[test]
+    fn a_legacy_mouse_up_past_the_last_drag_must_not_extend_the_selection() {
+        // Same bug on the screen-coordinate protocol (mouse-down/drag/up x y),
+        // which converts the release against the pane's content rect itself.
+        fn yank_up_at(release_x: u16) -> String {
+            let mut app = make_scrollback_app(true);
+            crate::copy_mode::enter_copy_mode(&mut app);
+            super::remote_mouse_down(&mut app, 5, 2);
+            super::remote_mouse_drag(&mut app, 9, 2);
+            super::remote_mouse_up(&mut app, release_x, 2);
+            app.paste_buffers
+                .first()
+                .map(|b| b.data.clone())
+                .expect("a real drag must yank on release")
+        }
+        assert_eq!(
+            yank_up_at(10),
+            yank_up_at(9),
+            "a release past the last drag must not add a character"
+        );
+    }
+
+    /// The client re-reports the endpoint it painted just before a release
+    /// (`copy_release_repin`, client.rs).  A motion can reach the server — and
+    /// be written into a frame — and still never reach the screen, because the
+    /// release is handled before that frame is drawn: the highlight ends on
+    /// the previous cell while the server's frame says otherwise.  Only the
+    /// client can tell the two apart, so its re-pin is what the yank follows.
+    ///
+    /// This is the reported bug: highlight ends on `.` (col 4 here), the
+    /// buffer ends on the `9` after it (col 5).
+    #[test]
+    fn a_release_after_a_client_repin_yanks_the_painted_cell() {
+        let mut app = make_scrollback_app(true);
+        crate::copy_mode::enter_copy_mode(&mut app);
+        super::handle_pane_mouse(&mut app, 41, 0, 0, 2, true); // press at col 0
+        super::handle_pane_mouse(&mut app, 41, 32, 4, 2, true); // drag to col 4
+        let _ = crate::layout::dump_layout_json(&mut app).expect("a frame"); // painted: cols 0..=4
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 2, true); // the slip
+        let _ = crate::layout::dump_layout_json(&mut app).expect("a frame"); // written, never drawn
+        super::handle_pane_mouse(&mut app, 41, 32, 4, 2, true); // re-pin: what the client painted
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false); // release
+        assert_eq!(
+            app.paste_top(),
+            Some("histo"),
+            "the copy must match the highlight, not the cell the frame carried"
+        );
+    }
+
+    /// Control for the test above: with no re-pin the newest drag stands, even
+    /// when no frame carried it — which is exactly why the client has to send
+    /// one.  Pinned so the reason for `copy_release_repin` cannot be dropped
+    /// silently on this side.
+    #[test]
+    fn a_release_without_a_repin_follows_the_last_drag() {
+        let mut app = make_scrollback_app(true);
+        crate::copy_mode::enter_copy_mode(&mut app);
+        super::handle_pane_mouse(&mut app, 41, 0, 0, 2, true);
+        super::handle_pane_mouse(&mut app, 41, 32, 4, 2, true);
+        let _ = crate::layout::dump_layout_json(&mut app).expect("a frame");
+        super::handle_pane_mouse(&mut app, 41, 32, 5, 2, true);
+        let _ = crate::layout::dump_layout_json(&mut app).expect("a frame");
+        super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
+        assert_eq!(
+            app.paste_top(),
+            Some("histor"),
+            "without a re-pin the newest drag stands"
+        );
+    }
+
+    /// The raw protocol has no client that can say what it painted, so the
+    /// same-batch slip is dropped against the published endpoint there.
+    #[test]
+    fn a_legacy_mouse_up_slip_no_frame_carried_must_not_widen_the_yank() {
+        fn yank_after(slip_frame: bool) -> String {
+            let mut app = make_scrollback_app(true);
+            // The slip lands on column 10, one past the text of
+            // "history-75". vi keys hold the end on the last character
+            // (tmux 3.7 and later), which would hide the slip; emacs keys
+            // copy up to the end cell, so the slip shows as one more cell.
+            app.mode_keys = "emacs".to_string();
+            crate::copy_mode::enter_copy_mode(&mut app);
+            super::remote_mouse_down(&mut app, 5, 2);
+            super::remote_mouse_drag(&mut app, 9, 2);
+            let _ = crate::layout::dump_layout_json(&mut app).expect("a frame"); // col 9 published
+            super::remote_mouse_drag(&mut app, 10, 2); // the slip
+            if slip_frame {
+                let _ = crate::layout::dump_layout_json(&mut app).expect("a frame");
+            }
+            super::remote_mouse_up(&mut app, 10, 2);
+            app.paste_buffers
+                .first()
+                .map(|b| b.data.clone())
+                .expect("a real drag must yank on release")
+        }
+        assert_ne!(
+            yank_after(false),
+            yank_after(true),
+            "a slip no frame carried must not add a character on the raw protocol"
+        );
+    }
+
+    #[test]
+    fn emacs_mode_bare_g_does_not_jump_to_history_top() {
+        // tmux binds history-top to `g` in copy-mode-vi only; the emacs table
+        // uses M-<. An ungated `g` meant that any stray `g` — typing a prompt
+        // into a pane that was still in copy mode, e.g. after a thumb scroll on
+        // a phone — threw the view to the very top until the user pressed Esc.
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let before = app.copy_scroll_offset;
+        app.mode_keys = "emacs".to_string();
+        crate::input::send_text_to_active(&mut app, "g").expect("send-text g");
+        assert_eq!(app.copy_scroll_offset, before, "emacs 'g' must not move the view");
+        assert!(matches!(app.mode, Mode::CopyMode), "emacs 'g' must stay in copy mode");
+    }
+
+    #[test]
+    fn vi_mode_bare_g_still_jumps_to_history_top() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        app.mode_keys = "vi".to_string();
+        crate::input::send_text_to_active(&mut app, "g").expect("send-text g");
+        assert!(
+            app.copy_scroll_offset > 20,
+            "vi 'g' must still reach history-top (got {})",
+            app.copy_scroll_offset
+        );
+    }
+
+    #[test]
+    fn emacs_mode_alt_less_than_jumps_to_history_top() {
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        app.mode_keys = "emacs".to_string();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('<'),
+            crossterm::event::KeyModifiers::ALT,
+        );
+        crate::input::handle_key(&mut app, key).expect("handle_key M-<");
+        assert!(
+            app.copy_scroll_offset > 20,
+            "M-< must reach history-top in emacs mode (got {})",
+            app.copy_scroll_offset
+        );
+    }
+
+    #[test]
+    fn named_alt_less_than_reaches_history_top_in_both_tables() {
+        // Alt keys reach copy mode as NAMED keys (`send-key M-<`), not through
+        // handle_key's char arm, so the named dispatcher needs its own arm.
+        // Without it `send-keys M-<` was silently swallowed while `send-keys
+        // M-v` (page up) worked, measured on a 380 line scrollback.
+        for mode_keys in ["emacs", "vi"] {
+            let mut app = make_scrollback_app(true);
+            super::handle_pane_scroll(&mut app, 41, true, None);
+            app.mode_keys = mode_keys.to_string();
+            let before = app.copy_scroll_offset;
+            crate::input::send_key_to_active(&mut app, "M-<").expect("send-key M-<");
+            assert!(
+                app.copy_scroll_offset > before,
+                "M-< must reach history-top under mode-keys {mode_keys} (got {})",
+                app.copy_scroll_offset
+            );
+            crate::input::send_key_to_active(&mut app, "M->").expect("send-key M->");
+            assert_eq!(
+                app.copy_scroll_offset, 0,
+                "M-> must reach history-bottom under mode-keys {mode_keys}"
+            );
+        }
     }
 
     #[test]
@@ -2219,6 +3489,66 @@ mod window_ops_tests {
         assert_eq!(app.copy_scroll_offset, 6, "copy mode must keep the direct-scrolled view");
     }
 
+    /// The offset of the parser the focused pane is drawn from.
+    fn live_view_offset(app: &AppState) -> usize {
+        let win = &app.windows[app.active_idx];
+        crate::tree::active_pane(&win.root, &win.active_path)
+            .map(|p| p.term.lock().expect("term lock").screen().scrollback())
+            .expect("active pane")
+    }
+
+    /// Output reaching the focused pane, as the shell's reply to a key would.
+    fn pane_output(app: &AppState, bytes: &[u8]) {
+        let win = &app.windows[app.active_idx];
+        crate::tree::active_pane(&win.root, &win.active_path)
+            .expect("active pane")
+            .term
+            .lock()
+            .expect("term lock")
+            .process(bytes);
+    }
+
+    #[test]
+    fn typed_key_returns_direct_scrolled_view_to_live() {
+        let mut app = make_scrollback_app(true);
+        app.scroll_enter_copy_mode = false;
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::Passthrough), "direct scroll must not enter copy mode");
+        assert_eq!(live_view_offset(&app), 6);
+
+        // Left alone, the scrolled view stays anchored on the old rows: the
+        // prompt a typed Enter produces only pushes the offset further up.
+        pane_output(&app, b"PS> \r\n");
+        assert_eq!(live_view_offset(&app), 7, "a scrolled view stays anchored on new output");
+
+        // A key from the attached client snaps it back, and from there the
+        // view follows the output again.
+        assert!(crate::input::snap_interactive_to_live(&mut app), "a scrolled view must report the snap");
+        assert_eq!(live_view_offset(&app), 0, "typing must return the view to the live screen");
+        pane_output(&app, b"PS> \r\n");
+        assert_eq!(live_view_offset(&app), 0, "the live view must follow new output");
+
+        // At the live screen already there is nothing to snap or redraw.
+        assert!(!crate::input::snap_interactive_to_live(&mut app));
+    }
+
+    #[test]
+    fn typed_key_leaves_copy_mode_view_alone() {
+        // scroll-enter-copy-mode on: the wheel entered copy mode, and the key
+        // is a copy mode key, not input for the shell.
+        let mut app = make_scrollback_app(true);
+        super::handle_pane_scroll(&mut app, 41, true, None);
+        assert!(matches!(app.mode, Mode::CopyMode));
+        let offset = app.copy_scroll_offset;
+        assert!(offset > 0);
+
+        assert!(!crate::input::snap_interactive_to_live(&mut app), "copy mode keys must not snap the view");
+        assert!(matches!(app.mode, Mode::CopyMode));
+        assert_eq!(app.copy_scroll_offset, offset);
+        assert_eq!(live_view_offset(&app), offset, "the copy mode view must stay where the reader left it");
+    }
+
     #[test]
     fn copy_drag_release_after_edge_scroll_yanks_and_exits() {
         let mut app = make_scrollback_app(true);
@@ -2229,17 +3559,66 @@ mod window_ops_tests {
         super::handle_pane_mouse(&mut app, 41, 32, 5, 0, true); // scrolls the view
         // Release on the SAME screen cell as the press: scrolling made this
         // a real multi-line drag, so it must yank rather than be snapped
-        // back to a click — both the #199 click guard and the anchor/pos
-        // comparison work on screen cells, which the scroll invalidated.
+        // back to a click — the #199 click guard works on the release cell
+        // against the press cell, and the scroll invalidated that pair.
         super::handle_pane_mouse(&mut app, 41, 0, 5, 2, false);
         assert!(!app.paste_buffers.is_empty(), "release must yank the selection");
-        // Char-mode selection from (row 2, col 5)@offset 3 to (row 0, col 5)
-        // @offset 4 spans the two scrollback lines history-71/history-72,
-        // sliced at col 5 on both ends.
-        assert_eq!(app.paste_buffers[0], "ry-71\nhistor", "yank must span the scrolled lines");
+        // Char-mode selection from the press cell (row 2, col 5)@offset 3 to
+        // the last DRAG cell (row 0, col 5)@offset 3 — the drag's OWN offset,
+        // recorded before its edge scroll moved the view to offset 4.  Content
+        // rows -3..-1: history-70/71 and the live row history-72, sliced at
+        // col 5 on both ends.  The release cell is not the endpoint, so it
+        // neither extends nor shortens this.  This is also exactly the range
+        // the frame paints (see `a_direction_mismatched_drag_paints_and_yanks_
+        // the_same_range` for the pairing half of that invariant).
+        assert_eq!(app.paste_buffers[0], "ry-70\nhistory-71\nhistor",
+            "yank must span from the anchor to the last drag cell");
         // A mouse yank cancels copy mode and returns to live view (#62).
         assert!(matches!(app.mode, Mode::Passthrough), "mouse yank must exit copy mode");
         assert_eq!(app.copy_scroll_offset, 0);
+    }
+
+    /// A drag whose row and column directions differ must paint and yank the
+    /// SAME range.  The frame pairs each column with its own row (tmux: the
+    /// selection runs from the anchor cell to the endpoint cell); independent
+    /// min/max on rows and columns used to paint one range and copy another,
+    /// which is the reported "sometimes the selection and the copy disagree"
+    /// — it happened in every drag direction, on any selection whose endpoint
+    /// sat on a different row.
+    #[test]
+    fn a_direction_mismatched_drag_paints_and_yanks_the_same_range() {
+        let mut app = make_scrollback_app(true);
+        crate::copy_mode::enter_copy_mode(&mut app);
+        super::handle_pane_mouse(&mut app, 41, 0, 6, 4, true);  // press: row 4, col 6
+        super::handle_pane_mouse(&mut app, 41, 32, 2, 1, true); // drag : row 1, col 2
+
+        // What the client is told to paint: the top row keeps the ENDPOINT's
+        // column (2) and the bottom row the anchor's (6).
+        let frame = crate::layout::dump_layout_json(&mut app).expect("a frame");
+        let num = |key: &str| -> i64 {
+            let pat = format!("\"{key}\"");
+            let at = frame.find(&pat).unwrap_or_else(|| panic!("{key} in {frame}"));
+            let rest = &frame[at + pat.len()..];
+            let colon = rest.find(':').expect("colon");
+            rest[colon + 1..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .expect("a number")
+        };
+        assert_eq!(num("sel_start_row"), 1, "painted selection starts on the drag row");
+        assert_eq!(num("sel_start_col"), 2, "...with the DRAG's column");
+        assert_eq!(num("sel_end_row"), 4, "painted selection ends on the press row");
+        assert_eq!(num("sel_end_col"), 6, "...with the PRESS's column");
+
+        super::handle_pane_mouse(&mut app, 41, 0, 2, 1, false); // release on the drag cell
+        assert_eq!(
+            app.paste_top(),
+            Some("story-74\nhistory-75\nhistory-76\nhistory"),
+            "the copy must be the range the frame above points at (the frame's\n             rows are client-relative, the yank's are parser-relative, so this\n             pins the text)"
+        );
     }
 
     #[test]
@@ -2302,185 +3681,523 @@ mod window_ops_tests {
 }
 
 pub fn resize_pane_vertical(app: &mut AppState, amount: i16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == LayoutKind::Vertical {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    if idx + 1 < sizes.len() {
-                        let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx] as i16;
-                        sizes[idx] = new_size;
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        // tmux parity (#81): last child has no bottom border.
-                        // Resize the previous sibling with the same amount so
-                        // the border moves in the arrow direction.
-                        let new_size = (sizes[idx - 1] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx - 1] as i16;
-                        sizes[idx - 1] = new_size;
-                        sizes[idx] = (sizes[idx] as i16 - diff).max(1) as u16;
-                    }
-                }
-                return;
-            }
-        }
-    }
+    resize_active_pane_cells(app, LayoutKind::Vertical, amount as i32);
 }
 
 pub fn resize_pane_horizontal(app: &mut AppState, amount: i16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == LayoutKind::Horizontal {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    if idx + 1 < sizes.len() {
-                        let new_size = (sizes[idx] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx] as i16;
-                        sizes[idx] = new_size;
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        // tmux parity (#81): last child has no right border.
-                        // Resize the previous sibling with the same amount so
-                        // the border moves in the arrow direction.
-                        let new_size = (sizes[idx - 1] as i16 + amount).max(1) as u16;
-                        let diff = new_size as i16 - sizes[idx - 1] as i16;
-                        sizes[idx - 1] = new_size;
-                        sizes[idx] = (sizes[idx] as i16 - diff).max(1) as u16;
-                    }
-                }
-                return;
+    resize_active_pane_cells(app, LayoutKind::Horizontal, amount as i32);
+}
+
+/// Cells the cell `node` (currently `size` cells along the axis) can give up
+/// before it or any pane inside it goes under the minimum: tmux
+/// `layout_resize_check` (layout.c). A split of the same kind can give what
+/// all its children can; a split the other way only what its tightest child
+/// can.
+fn resize_available(node: &Node, size: u16, is_h: bool) -> u16 {
+    let min = if is_h { crate::pane::MIN_PTY_COLS } else { 1 };
+    match node {
+        Node::Leaf(_) => size.saturating_sub(min),
+        Node::Split { kind, sizes, children } => {
+            let same = matches!(kind, LayoutKind::Horizontal) == is_h;
+            // A split with nothing in it constrains nothing (a placeholder).
+            if children.is_empty() { return size.saturating_sub(min); }
+            if sizes.len() != children.len() { return 0; }
+            if same {
+                children.iter().zip(sizes.iter()).map(|(c, &s)| resize_available(c, s, is_h)).sum()
+            } else {
+                children.iter().map(|c| resize_available(c, size, is_h)).min().unwrap_or(0)
             }
         }
     }
 }
 
-/// Absolute resize: set the active pane's share to an exact size.
+/// tmux `layout_resize_layout` on one split's cells, in cells: grow or shrink
+/// cell `idx` by `change`, taking the space from the nearest cell that can
+/// spare it (toward the tail, then with `opposite` toward the head) exactly as
+/// layout_resize_pane_grow / layout_resize_pane_shrink do. Returns the
+/// change actually made.
+fn resize_cells(sizes: &mut [u16], children: &[Node], idx: usize, change: i32, opposite: bool, is_h: bool) -> i32 {
+    let n = sizes.len();
+    let avail = |sizes: &[u16], i: usize| resize_available(&children[i], sizes[i], is_h) as i32;
+    let mut needed = change;
+    while needed != 0 {
+        if needed > 0 {
+            let mut remove = (idx + 1..n).find(|&i| avail(sizes, i) > 0);
+            if remove.is_none() && opposite {
+                remove = (0..idx).rev().find(|&i| avail(sizes, i) > 0);
+            }
+            let Some(r) = remove else { break };
+            let amt = avail(sizes, r).min(needed);
+            sizes[idx] += amt as u16;
+            sizes[r] -= amt as u16;
+            needed -= amt;
+        } else {
+            let Some(r) = (0..=idx).rev().find(|&i| avail(sizes, i) > 0) else { break };
+            if idx + 1 >= n { break; }
+            let amt = avail(sizes, r).min(-needed);
+            sizes[idx + 1] += amt as u16;
+            sizes[r] -= amt as u16;
+            needed += amt;
+        }
+    }
+    change - needed
+}
+
+/// The split that `resize-pane` acts on for the active pane, and the cell in
+/// it: tmux walks up from the pane to the nearest parent of the resize's
+/// kind (layout_resize_pane). Returns (parent path, cell index).
+fn resize_target(win: &crate::types::Window, kind: LayoutKind) -> Option<(Vec<usize>, usize)> {
+    for depth in (0..win.active_path.len()).rev() {
+        let parent_path = win.active_path[..depth].to_vec();
+        let mut cur = &win.root;
+        let mut ok = true;
+        for &i in &parent_path {
+            match cur { Node::Split { children, .. } => match children.get(i) { Some(c) => cur = c, None => { ok = false; break; } }, Node::Leaf(_) => { ok = false; break; } }
+        }
+        if !ok { continue; }
+        if let Node::Split { kind: k, .. } = cur {
+            if *k == kind { return Some((parent_path, win.active_path[depth])); }
+        }
+    }
+    None
+}
+
+/// `resize-pane -L/-R/-U/-D N` on the active pane, in cells, with tmux's
+/// layout_resize_pane: a positive `change` moves the border after the pane's
+/// cell right/down; the last cell in a split moves the border before it,
+/// so the border always goes the way the arrow points (#81).
+///
+/// This used to add N to a percentage weight, so one step moved a border
+/// 1.2 columns on a 120 column window and every few steps skipped a column
+/// (61 -> 63), and on 30 rows three `-D 1` moved nothing at all.
+pub fn resize_active_pane_cells(app: &mut AppState, kind: LayoutKind, change: i32) {
+    if app.active_idx >= app.windows.len() { return; }
+    let win = &mut app.windows[app.active_idx];
+    if win.active_path.is_empty() || change == 0 { return; }
+    crate::tree::normalize_window_sizes(win);
+    let Some((parent_path, mut idx)) = resize_target(win, kind) else { return };
+    let is_h = matches!(kind, LayoutKind::Horizontal);
+    if let Some(Node::Split { sizes, children, .. }) = get_split_mut(&mut win.root, &parent_path) {
+        if sizes.len() != children.len() || sizes.len() < 2 { return; }
+        if idx + 1 == sizes.len() { idx -= 1; }
+        resize_cells(sizes, children, idx, change, true, is_h);
+    }
+}
+
+/// Absolute resize: `resize-pane -x/-y N` (tmux layout_resize_pane_to). The
+/// change is worked out on the pane's cell (or the ancestor that sits in a
+/// split of that kind): the last cell measures it from the other side, as
+/// tmux does, and then it is an ordinary layout_resize_pane.
 /// axis is "x" (width/horizontal) or "y" (height/vertical).
 pub fn resize_pane_absolute(app: &mut AppState, axis: &str, target: u16) {
-    let win = &mut app.windows[app.active_idx];
-    if win.active_path.is_empty() { return; }
-    let target_kind = if axis == "x" { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-    for depth in (0..win.active_path.len()).rev() {
-        let parent_path = win.active_path[..depth].to_vec();
-        if let Some(Node::Split { kind, sizes, .. }) = get_split_mut(&mut win.root, &parent_path) {
-            if *kind == target_kind {
-                let idx = win.active_path[depth];
-                if idx < sizes.len() {
-                    let old = sizes[idx];
-                    let new = target.max(1);
-                    let diff = new as i16 - old as i16;
-                    sizes[idx] = new;
-                    // Absorb the difference from a neighbour
-                    if idx + 1 < sizes.len() {
-                        sizes[idx + 1] = (sizes[idx + 1] as i16 - diff).max(1) as u16;
-                    } else if idx > 0 {
-                        sizes[idx - 1] = (sizes[idx - 1] as i16 - diff).max(1) as u16;
-                    }
+    if app.active_idx >= app.windows.len() { return; }
+    let kind = if axis == "x" { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+    let change = {
+        let win = &mut app.windows[app.active_idx];
+        if win.active_path.is_empty() { return; }
+        crate::tree::normalize_window_sizes(win);
+        let Some((parent_path, idx)) = resize_target(win, kind) else { return };
+        let Some(Node::Split { sizes, .. }) = get_split_mut(&mut win.root, &parent_path) else { return };
+        if idx >= sizes.len() { return; }
+        let size = sizes[idx] as i32;
+        if idx + 1 == sizes.len() { size - target as i32 } else { target as i32 - size }
+    };
+    resize_active_pane_cells(app, kind, change);
+}
+
+/// `rotate-window`: move every pane one slot along the window's pane order.
+///
+/// tmux (`cmd-rotate-window.c`) never touches the layout tree.  It re-points
+/// each pane at the NEXT pane's layout cell and then gives the pane that
+/// cell's geometry, PTY included:
+///
+/// ```text
+///     wp->layout_cell = wp2->layout_cell;
+///     wp->xoff = wp2->xoff; wp->yoff = wp2->yoff;
+///     window_pane_resize(wp, wp2->sx, wp2->sy);
+/// ```
+///
+/// Two things follow, and psmux used to get both wrong (#645):
+///
+///  1. Only the OCCUPANTS move.  Every cell keeps its position and its size,
+///     so the window's shape is identical before and after.  psmux rotated the
+///     root split's direct CHILDREN instead, which on a nested layout carried
+///     whole subtrees into slots sized for something else (a 34/4/10 column of
+///     three panes came back as 39/8/1).  Rotating the leaves, which is what a
+///     cell permutation is once the cells live in the tree, leaves every
+///     split's `sizes` and the tree shape alone.
+///
+///  2. Each moved pane is RESIZED to the cell it landed in.  psmux left every
+///     pane at the size of the cell it had just left, so `pane_height` and
+///     `pane_width` disagreed with `pane_top`/`pane_bottom`/`window_layout`,
+///     `split-window` refused a visually tall pane as "too small", and the
+///     child console kept the old row count.  `resize_all_panes` is the same
+///     path `resize-pane` takes, which is why `resize-pane -U 0` healed it.
+///
+/// `upward` is tmux's `-U`, which is also its default: the pane in the first
+/// cell moves to the last cell and everyone else moves up one.  `-D` is the
+/// reverse.  Focus stays on the same CELL, matching tmux, which re-points
+/// `w->active` at the pane that moved into the active pane's cell.
+pub fn rotate_panes(app: &mut AppState, upward: bool) {
+    if app.active_idx >= app.windows.len() { return; }
+    let rotated = {
+        let win = &mut app.windows[app.active_idx];
+        let mut leaves: Vec<(usize, Vec<usize>)> = Vec::new();
+        crate::tree::collect_leaf_paths_pub(&win.root, &mut Vec::new(), &mut leaves);
+        if leaves.len() < 2 {
+            false
+        } else {
+            // Swapping two LEAVES never changes the tree's shape, so the paths
+            // collected up front stay valid for the whole chain of swaps.
+            let paths: Vec<Vec<usize>> = leaves.into_iter().map(|(_, p)| p).collect();
+            let n = paths.len();
+            if upward {
+                // [A,B,C] -> [B,C,A]: cell 0 takes the second pane.
+                for i in 0..n - 1 {
+                    crate::tree::swap_nodes(&mut win.root, &paths[i], &paths[i + 1]);
                 }
-                return;
-            }
-        }
-    }
-}
-
-pub fn rotate_panes(app: &mut AppState, reverse: bool) {
-    let win = &mut app.windows[app.active_idx];
-    match &mut win.root {
-        Node::Split { children, .. } if children.len() >= 2 => {
-            if reverse {
-                // Rotate counter-clockwise: first element goes to end
-                let first = children.remove(0);
-                children.push(first);
             } else {
-                // Rotate clockwise: last element goes to front
-                let last = children.pop().unwrap();
-                children.insert(0, last);
+                // [A,B,C] -> [C,A,B]: cell 0 takes the last pane.
+                for i in (0..n - 1).rev() {
+                    crate::tree::swap_nodes(&mut win.root, &paths[i], &paths[i + 1]);
+                }
+            }
+            true
+        }
+    };
+    // tmux's window_pane_resize, deferred to one pass over the window: every
+    // pane takes the size of the cell it now occupies, and its PTY with it.
+    if rotated { crate::tree::resize_all_panes(app); }
+}
+
+/// One `break-pane` invocation, tmux `cmd-break-pane.c` argument set
+/// `"abdPF:n:s:t:"` (cmd-break-pane.c:37).
+///
+/// `src` and `dst` stay RAW here so the whole session, not just the active
+/// window, is searched when the request is applied: a `-s` naming a pane in
+/// another window is the entire point of issue #689.
+#[derive(Default, Clone, Debug)]
+pub struct BreakPaneRequest {
+    /// `-s <src-pane>`: the pane to break out. None means the current pane.
+    pub src: Option<String>,
+    /// `-t <dst-window>`: the destination window index. None means the next
+    /// free index. A pane component here is an error, exactly as tmux's
+    /// `CMD_FIND_WINDOW_INDEX` refuses one (cmd-find.c:1153).
+    pub dst: Option<String>,
+    /// `-d`: do NOT switch to the new window (cmd-break-pane.c:186).
+    pub detach: bool,
+    /// `-n <window-name>` (cmd-break-pane.c:104, 169 to 174).
+    pub name: Option<String>,
+    /// `-a` / `-b`: insert after / before the destination window
+    /// (cmd-break-pane.c:119 to 127, `winlink_shuffle_up`).
+    pub after: bool,
+    pub before: bool,
+}
+
+/// Result of a successful `break-pane`: where the pane ended up, for `-P`.
+#[derive(Debug, Clone)]
+pub struct BrokenPane {
+    /// Vec position of the window the pane now lives in.
+    pub win_pos: usize,
+    /// Pane id that was broken out.
+    pub pane_id: Option<usize>,
+}
+
+/// Resolve a tmux PANE target (`-s`, and `-t` of the pane taking commands) to
+/// `(window Vec position, pane path)` anywhere in this session.
+///
+/// tmux resolves these with `CMD_FIND_PANE` (cmd-break-pane.c:42,
+/// cmd-swap-pane.c:38 and :39), which searches the whole session and reports
+/// `can't find pane: <spec>` on a miss. psmux used to resolve both halves
+/// inside the ACTIVE window only, so a spec naming another window either hit
+/// the wrong pane or silently resolved to the same pane twice.
+pub fn resolve_pane_spec(app: &AppState, spec: &str) -> Result<(usize, Vec<usize>), String> {
+    let spec = crate::cli::strip_exact_match_prefix(spec.trim());
+    let miss = || format!("can't find pane: {}", spec);
+    if app.windows.is_empty() { return Err(miss()); }
+    let active = app.active_idx.min(app.windows.len() - 1);
+    // A `{position}` token is layout geometry in the current window.
+    if spec.starts_with('{') {
+        return pane_path_at_position(app, spec).map(|p| (active, p)).ok_or_else(miss);
+    }
+    if spec.is_empty() {
+        return Ok((active, app.windows[active].active_path.clone()));
+    }
+    let pt = crate::cli::parse_target(spec);
+    // Window half of the spec.
+    let mut win_pos: Option<usize> = None;
+    if pt.window_is_id {
+        if let Some(id) = pt.window {
+            win_pos = Some(app.windows.iter().position(|w| w.id == id)
+                .ok_or_else(|| format!("can't find window: @{}", id))?);
+        }
+    } else if let Some(d) = pt.window {
+        win_pos = Some(app.win_pos(d).ok_or_else(|| format!("can't find window: {}", d))?);
+    } else if let Some(ref n) = pt.window_name {
+        win_pos = Some(app.windows.iter().position(|w| w.name == *n)
+            .ok_or_else(|| format!("can't find window: {}", n))?);
+    } else {
+        // Nothing in the window slot. parse_target files a bare leading token
+        // as a SESSION name, including the `win.0` and `0.2` forms where tmux
+        // reads that token as a window (it splits on '.' for the pane and only
+        // then decides). tmux tries the session first and falls back to a
+        // window in the current session (cmd-find.c:348), so do the same: a
+        // token that is not this session's name is a window here.
+        match pt.session.as_deref() {
+            None => {}
+            Some(s) if s == app.session_name => {}
+            Some(s) => {
+                win_pos = Some(app.resolve_window_spec(s, false).map_err(|_| miss())?
+                    .pos().ok_or_else(miss)?);
             }
         }
-        _ => {}
+    }
+    match pt.pane {
+        Some(id) if pt.pane_is_id => {
+            // Pane ids are unique session wide, so `%N` resolves without a
+            // window half; an explicit window half still has to agree.
+            for (i, w) in app.windows.iter().enumerate() {
+                if let Some(p) = crate::tree::find_path_by_id(&w.root, id) {
+                    if win_pos.map_or(true, |wp| wp == i) { return Ok((i, p)); }
+                }
+            }
+            Err(miss())
+        }
+        Some(idx) => {
+            let wp = win_pos.unwrap_or(active);
+            let zero = idx.checked_sub(app.pane_base_index_of(wp)).ok_or_else(miss)?;
+            crate::tree::path_by_position(&app.windows[wp].root, zero)
+                .map(|p| (wp, p)).ok_or_else(miss)
+        }
+        None => {
+            let wp = win_pos.unwrap_or(active);
+            Ok((wp, app.windows[wp].active_path.clone()))
+        }
     }
 }
 
-pub fn break_pane_to_window(app: &mut AppState) {
-    let src_idx = app.active_idx;
-    let src_path = app.windows[src_idx].active_path.clone();
-    
-    // Extract the active pane from the current window using tree operations
+/// Resolve `break-pane -t` (a DESTINATION window index, tmux
+/// `CMD_FIND_WINDOW | CMD_FIND_WINDOW_INDEX`, cmd-break-pane.c:43).
+///
+/// Returns the display index the broken out window should take, or None for
+/// "the next free index" (tmux's `idx == -1`).
+fn resolve_break_dst(app: &AppState, spec: &str) -> Result<Option<usize>, String> {
+    let spec = crate::cli::strip_exact_match_prefix(spec.trim());
+    if spec.is_empty() { return Ok(None); }
+    let pt = crate::cli::parse_target(spec);
+    // tmux: "No pane is allowed if want an index." (cmd-find.c:1152 to 1156).
+    if pt.pane.is_some() { return Err("can't specify pane here".to_string()); }
+    if pt.window.is_none() && pt.window_name.is_none() {
+        return match pt.session.as_deref() {
+            // `-t <this session>` names no window, so the destination is the
+            // next free index (tmux leaves fs->idx at -1, cmd-find.c:351).
+            None => Ok(None),
+            Some(s) if s == app.session_name => Ok(None),
+            // A bare token that is not this session is read as a window.
+            Some(s) => match app.resolve_window_spec(s, true)? {
+                crate::types::WindowTarget::Pos(p) => Ok(Some(app.win_display_index(p))),
+                crate::types::WindowTarget::FreeIndex(i) => Ok(Some(i)),
+            },
+        };
+    }
+    match app.resolve_window_spec(spec, true)? {
+        crate::types::WindowTarget::Pos(p) => Ok(Some(app.win_display_index(p))),
+        crate::types::WindowTarget::FreeIndex(i) => Ok(Some(i)),
+    }
+}
+
+/// `break-pane`: move one pane out of its window into a window of its own.
+///
+/// Follows `cmd_break_pane_exec` (cmd-break-pane.c:89 to 207) in order:
+/// validate `-n`, apply `-a`/`-b` shuffling, refuse an index already in use
+/// (`index in use: N`, cmd-break-pane.c:148 to 151), detach the pane, build the
+/// new window, and select it unless `-d` was given (cmd-break-pane.c:186).
+pub fn break_pane(app: &mut AppState, req: &BreakPaneRequest) -> Result<BrokenPane, String> {
+    if app.windows.is_empty() { return Err("can't find pane".to_string()); }
+    let (src_idx, src_path) = match req.src.as_deref() {
+        Some(s) => resolve_pane_spec(app, s)?,
+        None => {
+            let i = app.active_idx.min(app.windows.len() - 1);
+            (i, app.windows[i].active_path.clone())
+        }
+    };
+    // tmux check_name: an empty window name is refused before anything moves.
+    if let Some(n) = req.name.as_deref() {
+        if n.trim().is_empty() { return Err(format!("invalid window name: {}", n)); }
+    }
+    let mut idx = match req.dst.as_deref() {
+        Some(d) => resolve_break_dst(app, d)?,
+        None => None,
+    };
+    // -a / -b: make room at (target + 1) / target and land there.
+    if req.after || req.before {
+        let base = idx.unwrap_or_else(|| app.win_display_index(app.active_idx.min(app.windows.len() - 1)));
+        let at = if req.after { base + 1 } else { base };
+        app.shuffle_window_indices_up(at);
+        idx = Some(at);
+    }
+    // An index already held by another window is tmux's "index in use: N", and
+    // it is checked BEFORE the pane is detached so a refusal changes nothing.
+    if let Some(want) = idx {
+        if app.win_pos(want).is_some() {
+            return Err(format!("index in use: {}", want));
+        }
+    }
+    // Remember the window the user is looking at so -d can put focus back even
+    // when the source window disappears (its Vec position may shift).
+    let prev_active_id = app.windows.get(app.active_idx).map(|w| w.id);
+
+    crate::tree::normalize_window_sizes(&mut app.windows[src_idx]);
     let src_root = std::mem::replace(&mut app.windows[src_idx].root,
         Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
     let (remaining, extracted) = crate::tree::extract_node(src_root, &src_path);
-    
-    if let Some(pane_node) = extracted {
-        let src_empty = remaining.is_none();
-        if let Some(rem) = remaining {
-            app.windows[src_idx].root = rem;
-            app.windows[src_idx].active_path = crate::tree::first_leaf_path(&app.windows[src_idx].root);
-        }
-        
-        // Determine the window name from the pane
-        let win_name = match &pane_node {
+    let Some(pane_node) = extracted else {
+        if let Some(rem) = remaining { app.windows[src_idx].root = rem; }
+        return Err("can't find pane".to_string());
+    };
+    let src_empty = remaining.is_none();
+    if let Some(rem) = remaining {
+        app.windows[src_idx].root = rem;
+        app.windows[src_idx].active_path = crate::tree::first_leaf_path(&app.windows[src_idx].root);
+    }
+    let broken_id = crate::tree::collect_pane_ids(&pane_node).first().copied();
+    if let Some(bid) = broken_id {
+        crate::tree::remove_from_mru(&mut app.windows[src_idx].pane_mru, bid);
+    }
+    let win_name = match req.name.as_deref() {
+        Some(n) => n.to_string(),
+        None => match &pane_node {
             Node::Leaf(p) => p.title.clone(),
             _ => format!("win {}", app.windows.len() + 1),
-        };
-        
-        // Create new window containing the extracted pane
-        let initial_mru = crate::tree::collect_pane_ids(&pane_node);
-        app.windows.push(Window {
-            root: pane_node,
-            active_path: vec![],
-            name: win_name,
-            id: app.next_win_id,
-            area: app.client_area,
-            window_size: None,
-            activity_flag: false,
-            bell_flag: false,
-            silence_flag: false,
-            last_output_time: std::time::Instant::now(),
-            last_seen_version: 0,
-            manual_rename: false,
-            layout_index: 0,
-            pane_mru: initial_mru,
-            zoom_saved: None,
-            linked_from: None,
-            floating: Vec::new(),
-            floating_focus: None,
-        });
-        app.next_win_id += 1;
-        app.on_window_appended();
-
-        if src_empty {
-            app.windows.remove(src_idx);
-            app.on_window_removed(src_idx);
+        },
+    };
+    let initial_mru = crate::tree::collect_pane_ids(&pane_node);
+    app.windows.push(Window {
+        root: pane_node,
+        active_path: vec![],
+        name: win_name,
+        id: app.next_win_id,
+        area: app.client_area,
+        window_size: None,
+        window_options: Default::default(),
+        activity_flag: false,
+        bell_flag: false,
+        silence_flag: false,
+        last_output_time: std::time::Instant::now(),
+        last_seen_version: 0,
+        // tmux clears automatic-rename when -n named the window, so the name
+        // the caller chose survives the next title change.
+        manual_rename: req.name.is_some(),
+        layout_index: 0,
+        pane_mru: initial_mru,
+        zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
+    });
+    app.next_win_id += 1;
+    app.on_window_appended();
+    let new_win_id = app.windows.last().map(|w| w.id);
+    if src_empty {
+        app.windows.remove(src_idx);
+        app.on_window_removed(src_idx);
+    }
+    // Place the new window at the requested display index.
+    if let Some(want) = idx {
+        if let Some(pos) = new_win_id.and_then(|id| app.windows.iter().position(|w| w.id == id)) {
+            app.move_window_to_index(pos, want)?;
         }
-
-        // Switch to the new window
-        app.active_idx = app.windows.len() - 1;
+    }
+    let new_pos = new_win_id
+        .and_then(|id| app.windows.iter().position(|w| w.id == id))
+        .unwrap_or(app.windows.len() - 1);
+    if req.detach {
+        // -d: stay where we were. Re-resolve by window id, because removing an
+        // emptied source window shifts every position after it.
+        let keep = prev_active_id.and_then(|id| app.windows.iter().position(|w| w.id == id));
+        app.active_idx = keep.unwrap_or_else(|| new_pos.min(app.windows.len() - 1));
     } else {
-        // Extraction failed — restore
-        if let Some(rem) = remaining {
-            app.windows[src_idx].root = rem;
+        app.active_idx = new_pos;
+    }
+    if app.active_idx >= app.windows.len() {
+        app.active_idx = app.windows.len() - 1;
+    }
+    Ok(BrokenPane { win_pos: new_pos, pane_id: broken_id })
+}
+
+/// Legacy no-flag entry point (in TUI binding, `prefix !`): break the active
+/// pane out and switch to it, tmux's default `break-pane`.
+pub fn break_pane_to_window(app: &mut AppState) {
+    let _ = break_pane(app, &BreakPaneRequest::default());
+}
+
+/// `clear-history`: drop the active pane's scrollback.
+///
+/// tmux (cmd-capture-pane.c:418) resets every mode on the pane first and then
+/// calls `grid_clear_history(wp->base.grid)`, i.e. the LIVE grid, with copy
+/// mode gone. That ordering is load bearing: while copy mode is up `pane.term`
+/// is the frozen snapshot, so clearing it would wipe the screen the user is
+/// reading and leave the live scrollback untouched.
+pub fn clear_active_pane_history(app: &mut AppState) {
+    if app.mode.in_copy() {
+        exit_copy_mode(app);
+    }
+    let history_limit = app.history_limit;
+    let win = &mut app.windows[app.active_idx];
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        p.leave_copy_snapshot();
+        if let Ok(mut parser) = p.term.lock() {
+            let host_win32_input = parser.screen().win32_input_requested();
+            let key_mode = parser.screen().extended_keys_mode();
+            *parser = vt100::Parser::new(p.last_rows, p.last_cols, history_limit);
+            // The console host is unchanged, and it asked for win32 input mode
+            // only once, at startup (issue #845).
+            parser.screen_mut().set_win32_input_requested(host_win32_input);
+            // The application is unchanged too, and so is the key mode it
+            // asked for (issue #860).
+            parser.screen_mut().set_extended_keys_mode(key_mode);
         }
     }
 }
 
-pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool) -> io::Result<()> {
+pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool, extra_env: &[(String, String)]) -> io::Result<()> {
     // tmux semantics: without -k, respawn only works on dead panes.
     // With -k, kill the running process first and respawn.
     {
         let win = &app.windows[app.active_idx];
         if let Some(pane) = crate::tree::active_pane(&win.root, &win.active_path) {
             if !pane.dead && !kill {
-                return Err(io::Error::new(io::ErrorKind::Other, "pane still active"));
+                // tmux spawn.c: "pane <session>:<window>.<pane> still active".
+                // This is a ROUTINE, user-caused refusal, not a server fault:
+                // the caller must get it back as a per-request error (the
+                // `?` that used to carry it out of `run_server` destroyed the
+                // whole session on a mistyped respawn-pane).
+                let pane_idx = crate::tree::pane_index_in_window(&win.root, &win.active_path)
+                    .unwrap_or(0);
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "pane {}:{}.{} still active",
+                        app.session_name,
+                        app.win_display_index(app.active_idx),
+                        pane_idx
+                    ),
+                ));
             }
+        }
+    }
+    // tmux spawn.c runs window_pane_reset_mode_all before screen_reinit: a
+    // pane in copy mode leaves it on respawn. Leaving it here also puts the
+    // LIVE parser back in `pane.term` (copy mode shows a snapshot), which is
+    // the one whose history the new process inherits below.
+    if app.mode.in_copy() {
+        exit_copy_mode(app);
+    }
+    {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+            pane.copy_state = None;
+            pane.leave_copy_snapshot();
         }
     }
     // If -k and pane is alive, kill the child process first
@@ -2502,6 +4219,9 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
             let (r, c, id, title) = (pane.last_rows, pane.last_cols, pane.id, pane.title.clone());
             if let Some(mut ep) = crate::popup::create_empty_pane(r.max(1), c.max(1), id) {
                 ep.title = title;
+                // -E goes through the same spawn_pane/screen_reinit in tmux,
+                // so the history stays here too (#708).
+                ep.term = Arc::new(Mutex::new(reinit_parser_keep_history(&pane.term, r, c, app.history_limit, app.allow_alternate_screen)));
                 *pane = ep;
             }
         }
@@ -2523,7 +4243,21 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let win = &mut app.windows[app.active_idx];
     let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
     let pane_id = pane.id;
-    
+    // tmux spawn.c: a respawn with no command of its own reuses the arguments
+    // already stored on the pane ("Replace the stored arguments if there are
+    // new ones. If not, the existing ones will be used (they will only exist
+    // for respawn)"), so `respawn-pane -k` on a pane created with a command
+    // re-runs THAT command, and only a pane created with the default shell
+    // comes back as a shell. Issue #580: this also keeps
+    // `#{pane_start_command}` honest across a respawn.
+    let new_start_command = command.map(|c| crate::pane::start_command_raw(Some(c)));
+    let inherited = if command.is_none() && !pane.start_command.is_empty() {
+        Some(pane.start_command.clone())
+    } else {
+        None
+    };
+    let command = command.or(inherited.as_deref());
+
     let size = PtySize { rows: pane.last_rows, cols: pane.last_cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     // Issue #399: honor an explicit `-- <command>` (e.g. Claude Code agent-teams
@@ -2539,6 +4273,13 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     crate::pane::set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    crate::pane::apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
+    // respawn-pane / respawn-window -e KEY=VALUE (#708): applied last so it
+    // overrides the global and session environment, the order tmux spawn.c
+    // builds the child's environment in (environ_for_session, then
+    // environ_copy(sc->environ, child)). Like tmux it is for THIS process
+    // only; a later respawn without -e does not inherit it.
+    for (k, v) in extra_env { shell_cmd.env(k, v); }
     if let Some(dir) = workdir {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -2550,7 +4291,15 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – required for ConPTY.
     drop(pair.slave);
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
+    // #708: tmux keeps the pane's history across a respawn. spawn.c reuses
+    // the pane and calls screen_reinit (screen.c), which clears the visible
+    // rows, homes the cursor and resets the modes but leaves the history
+    // above them alone. A fresh parser here threw the dead process's
+    // scrollback away. The screen moves into a NEW Arc so the old reader
+    // thread, which still holds the old one until its pipe drains, can only
+    // ever write into the empty parser left behind, never into the history
+    // the new process now owns.
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(reinit_parser_keep_history(&pane.term, size.rows, size.cols, app.history_limit, app.allow_alternate_screen)));
     let term_reader = term.clone();
     let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
@@ -2578,6 +4327,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.live_term = None;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
@@ -2587,14 +4337,63 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     // blanked #{pane_pid} and sent #{pane_current_command} to its
     // foreground-window fallback for the rest of the pane's life.
     pane.child_pid = child_pid;
+    // #580: a respawn that carried its own command replaces what the pane
+    // reports as `#{pane_start_command}`; a bare respawn keeps the recorded
+    // one (it just re-ran it above), and a bare respawn of a default-shell
+    // pane leaves it empty. Same rule as tmux spawn.c.
+    if let Some(c) = new_start_command {
+        pane.start_command = c;
+    }
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
     pane.scroll_fg_cache = None;
+    // Fresh ConPTY, fresh input state machine: the win32-input-mode latch that
+    // eats a bare ESC (#588) does not carry over to the respawned child.
+    pane.win32_input_latched = false;
+    // `input_off` (select-pane -d) is deliberately left alone: it belongs to
+    // the pane, not its process, and tmux's spawn.c keeps `wp->flags` across
+    // a respawn apart from PANE_STATUSREADY / PANE_STATUSDRAWN.
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
 
     Ok(())
+}
+
+/// The parser a respawned pane starts from (#708): the pane's own screen put
+/// through tmux's `screen_reinit`, so the history survives and everything
+/// else (visible rows, cursor, modes, alternate screen) starts over.
+///
+/// The screen is MOVED out of `old`, which keeps an empty parser: the dead
+/// process's reader thread may still hold `old` and flush a last read into it,
+/// and that must not land in the history the new process now owns.  A
+/// poisoned lock (its reader panicked) has nothing trustworthy to keep, so the
+/// pane starts empty, as it did before.  The size follows the pane in case it
+/// changed while the process was dead.
+pub(crate) fn reinit_parser_keep_history(
+    old: &Arc<Mutex<vt100::Parser>>,
+    rows: u16,
+    cols: u16,
+    history_limit: usize,
+    allow_alternate_screen: bool,
+) -> vt100::Parser {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let mut parser = match old.lock() {
+        // What is left behind is a full screen at the pane's size (no
+        // history), so a late flush from the old reader is processed exactly
+        // as it would have been before. A 1x1 placeholder panicked the server
+        // on the first wrapped line (see Grid::col_wrap).
+        Ok(mut guard) => std::mem::replace(&mut *guard, vt100::Parser::new(rows, cols, 0)),
+        Err(_) => vt100::Parser::new(rows, cols, history_limit),
+    };
+    let screen = parser.screen_mut();
+    screen.reinit_keep_history();
+    if screen.size() != (rows, cols) {
+        screen.set_size(rows, cols);
+    }
+    screen.set_allow_alternate_screen(allow_alternate_screen);
+    parser
 }
 
 /// Respawn a fresh default shell into a SPECIFIC pane (by window index + tree
@@ -2626,6 +4425,7 @@ pub fn heal_respawn_pane(
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     crate::pane::set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    crate::pane::apply_env_removals(&mut shell_cmd, &app.env_scopes.child_removals(&app.environment));
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     drop(pair.slave);
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
@@ -2656,6 +4456,7 @@ pub fn heal_respawn_pane(
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.live_term = None;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
@@ -2667,6 +4468,10 @@ pub fn heal_respawn_pane(
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
     pane.scroll_fg_cache = None;
+    // Fresh ConPTY, fresh input state machine: the win32-input-mode latch that
+    // eats a bare ESC (#588) does not carry over to the respawned child.
+    pane.win32_input_latched = false;
+    // `input_off` survives the respawn, as in tmux (see respawn_active_pane).
     pane.dead = false;
     pane.spawned_at = Some(std::time::Instant::now());
     Ok(())
@@ -2675,6 +4480,10 @@ pub fn heal_respawn_pane(
 #[cfg(test)]
 #[path = "../tests-rs/test_issue81_resize_direction.rs"]
 mod test_issue81_resize_direction;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_split_resize_tmux_cells.rs"]
+mod test_split_resize_tmux_cells;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue400_swap_pane_index_order.rs"]
@@ -2699,3 +4508,43 @@ mod test_issue597_legacy_mouse_bypass;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue613_wheel_gate_durability.rs"]
 mod test_issue613_wheel_gate_durability;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue621_wheel_stdin_block.rs"]
+mod test_issue621_wheel_stdin_block;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue623_record_reader_gate.rs"]
+mod test_issue623_record_reader_gate;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue629_ssh_vt_wheel.rs"]
+mod test_issue629_ssh_vt_wheel;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_respawn_pane_refusal_survives.rs"]
+mod test_respawn_pane_refusal_survives;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue645_rotate_geometry.rs"]
+mod test_issue645_rotate_geometry;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue657_wheel_nonshell_full_screen.rs"]
+mod test_issue657_wheel_nonshell_full_screen;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue669_border_status_mouse_rows.rs"]
+mod test_issue669_border_status_mouse_rows;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue689_break_swap_pane.rs"]
+mod tests_issue689_break_swap_pane;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue708_respawn_history_env.rs"]
+mod test_issue708_respawn_history_env;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue732_copy_mouse_gutter.rs"]
+mod test_issue732_copy_mouse_gutter;

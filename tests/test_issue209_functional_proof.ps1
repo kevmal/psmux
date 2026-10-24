@@ -209,7 +209,8 @@ if ($msg2 -eq "dur_proof") {
 Write-Host "`n=== FIX 7: display-message -I INPUT ===" -ForegroundColor Cyan
 
 Write-Host "[7a] -I flag consumed (doesn't corrupt message)" -ForegroundColor Yellow
-$msg = (& $PSMUX display-message -t $SESSION -p -I "/dev/stdin" "test" 2>&1 | Out-String).Trim()
+# tmux: -I is a boolean ("aCc:d:lINpt:F:v"), it takes no value.
+$msg = (& $PSMUX display-message -t $SESSION -p -I "test" 2>&1 | Out-String).Trim()
 if ($msg -eq "test") {
     Write-Pass "-I flag consumed, message content correct"
 } else {

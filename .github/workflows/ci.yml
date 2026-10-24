@@ -71,6 +71,22 @@ jobs:
       - name: Build x64 release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
 
+      - name: Verify window targets in an isolated namespace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
+          .\tests\test_window_pane_target_safety.ps1 -Binary $exe
+          foreach ($script in @(
+            '.\tests\test_relative_target_safety.py',
+            '.\tests\test_pane_selector_safety.py',
+            '.\tests\test_pane_target_resolution.py',
+            '.\tests\test_attached_target_safety.py'
+          )) {
+            python $script --binary $exe
+            if ($LASTEXITCODE -ne 0) { throw "$script failed with exit code $LASTEXITCODE" }
+          }
+
       - name: Run full Rust unit tests
         run: cargo test --all-targets
 
@@ -80,6 +96,12 @@ jobs:
           $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
           $env:PSMUX_EXE = $exe
           .\tests\run_smoke_integration.ps1
+
+      - name: Verify console Unicode and caller encoding
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target\x86_64-pc-windows-msvc\release\psmux.exe").Path
+          .\tests\test_console_unicode.ps1 -PsmuxExe $exe
 
       - name: Run raw SSH pipe mouse integration
         shell: pwsh

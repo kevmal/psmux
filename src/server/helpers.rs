@@ -1,6 +1,7 @@
 use std::io;
 
 use crate::format::expand_format_for_window;
+use crate::render_state::ClientRenderOptions;
 use crate::types::{AppState, Node, Window};
 use crate::util::WinInfo;
 
@@ -22,6 +23,73 @@ pub(crate) fn collect_pane_paths_server(
             }
         }
     }
+}
+
+/// A key press closes the status message, as in tmux, unless that message was
+/// shown with `display-message -N` (status_message_set ignore_keys): then it
+/// stays until its delay expires.
+pub(crate) fn clear_status_message_on_key(app: &mut AppState) {
+    let sticky = match (&app.status_message, app.status_message_ignore_keys) {
+        (Some((_, shown_at, _)), Some(ignore_from)) => *shown_at == ignore_from,
+        _ => false,
+    };
+    if !sticky {
+        app.status_message = None;
+        app.status_message_ignore_keys = None;
+    }
+}
+
+/// The session's default key table: tmux `server_client_get_key_table`, the
+/// `key-table` session option, root when unset or empty. A client goes back to
+/// it after every key, and a key not bound in it is passed to the pane.
+pub(crate) fn default_key_table(app: &AppState) -> &str {
+    match app.user_options.get("key-table").map(|s| s.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => "root",
+    }
+}
+
+/// The default key table for the attached client's state frame, left out when
+/// it is root so frames stay the same size for everyone who never sets it.
+pub(crate) fn append_default_key_table_json(table: &str, buf: &mut String) {
+    if table == "root" || !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"default_key_table\":\"");
+    buf.push_str(&json_escape_string(table));
+    buf.push_str("\"}");
+}
+
+/// Resolve a `switch-client -T <table>` request against the live key tables.
+///
+/// Issue #640. tmux's `cmd_switch_client_exec` calls
+/// `key_bindings_get_table(tablename, 0)` — create = 0 — and errors with
+/// "table %s doesn't exist" when the table has no bindings, so a typo in the
+/// table name is reported rather than latching a table that swallows the next
+/// key forever.
+///
+/// `Ok(None)` means "back to the default table": `root` is what
+/// `server_client_set_key_table(c, NULL)` resolves to, and it is stored as
+/// `None` so `#{client_key_table}` keeps reporting `root`/`copy-mode-vi` from
+/// the pane's own mode. `root` and `prefix` are always live in tmux, so they
+/// are accepted even when the user deleted every binding in them.
+pub(crate) fn resolve_switch_client_table(
+    app: &AppState,
+    table: &str,
+) -> Result<Option<String>, String> {
+    // `None` is the session's `key-table` (root unless set). Naming the
+    // default table is the same as dropping back to it, and root always
+    // exists, so with a non root default `-T root` latches root for one key.
+    let default = default_key_table(app);
+    if table == default {
+        return Ok(None);
+    }
+    if table == "root" {
+        return Ok(Some("root".to_string()));
+    }
+    if table == "prefix" || app.key_tables.contains_key(table) {
+        return Ok(Some(table.to_string()));
+    }
+    Err(format!("table {} doesn't exist", table))
 }
 
 /// Serialize key_tables into a compact JSON array for syncing to the client.
@@ -56,18 +124,49 @@ pub(crate) fn serialize_bindings_json(app: &AppState) -> String {
 /// currently ends with `}`. Emits nothing when the option is unset or `off`.
 /// Ships the option value, the active pane's scrollback size (for absolute /
 /// hybrid numbering), and the optional gutter styles.
+///
+/// The scrollback size also ships whenever the client is in copy mode with the
+/// option off, because the position indicator needs it as
+/// `copy_position_limit` (tmux `window_copy_formats`, #702).
+///
+/// `copy_hide_position` rides along on the same condition, and only when it is
+/// set, so an ordinary copy-mode frame carries no extra bytes for it (#704).
 pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
-    let Some(cln) = app.user_options.get("copy-mode-line-numbers") else { return; };
-    if cln == "off" || !buf.ends_with('}') { return; }
+    if !buf.ends_with('}') { return; }
+    let cln = app.user_options.get("copy-mode-line-numbers").filter(|v| v.as_str() != "off");
+    let in_copy = app.mode.in_copy();
+    if cln.is_none() && !in_copy { return; }
     let hsize = app.windows.get(app.active_idx)
         .and_then(|win| crate::tree::active_pane(&win.root, &win.active_path))
         .and_then(|p| p.term.lock().ok().map(|g| g.screen().scrollback_filled()))
         .unwrap_or(0);
     buf.pop();
+    buf.push_str(",\"copy_hsize\":");
+    buf.push_str(&hsize.to_string());
+    if app.copy_hide_position && in_copy {
+        buf.push_str(",\"copy_hide_position\":true");
+    }
+    // The highlight styles ride along only when a copy-mode frame has
+    // something to highlight and the user changed them (#694).
+    if in_copy && (app.copy_mark.is_some() || app.copy_search_marks) {
+        for (opt, key) in [
+            ("copy-mode-match-style", "copy_mode_match_style"),
+            ("copy-mode-current-match-style", "copy_mode_current_match_style"),
+            ("copy-mode-mark-style", "copy_mode_mark_style"),
+        ] {
+            if let Some(st) = app.user_options.get(opt) {
+                buf.push_str(",\"");
+                buf.push_str(key);
+                buf.push_str("\":\"");
+                buf.push_str(&json_escape_string(st));
+                buf.push('"');
+            }
+        }
+    }
+    let Some(cln) = cln else { buf.push('}'); return; };
     buf.push_str(",\"copy_mode_line_numbers\":\"");
     buf.push_str(&json_escape_string(cln));
-    buf.push_str("\",\"copy_hsize\":");
-    buf.push_str(&hsize.to_string());
+    buf.push('"');
     if let Some(st) = app.user_options.get("copy-mode-line-number-style") {
         buf.push_str(",\"copy_mode_line_number_style\":\"");
         buf.push_str(&json_escape_string(st));
@@ -90,6 +189,40 @@ pub(crate) fn append_floats_json(app: &AppState, buf: &mut String) {
     buf.pop();
     buf.push_str(&frag);
     buf.push('}');
+}
+
+/// Append the session's own name to a frame that currently ends with `}`.
+///
+/// Issue #7 batch D put it in the dump-state reply, but an attached client
+/// receives most of its frames from the push path, which builds the same JSON
+/// separately and had no such field. The client's `session_label` (default
+/// status-left, `command-prompt -I '#S'`, the rename overlay's fallback) then
+/// kept the port file base, `ns__name`, and never heard about a rename (#759
+/// follow up). Both builders call this so the two frames cannot drift again.
+pub(crate) fn append_session_name_json(name: &str, buf: &mut String) {
+    if !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"session_name\":\"");
+    buf.push_str(&json_escape_string(name));
+    buf.push_str("\"}");
+}
+
+/// The key table a `switch-client -T` left the client in, for the attached
+/// client's state frame. Absent means the default (root) table.
+///
+/// The attached client does its own key dispatch, so a table the SERVER set
+/// (`switch-client -T` from the CLI, the command prompt, run-shell, a hook)
+/// never reached it: `#{client_key_table}` said `mytbl` while the next key was
+/// still looked up in root. tmux has one `c->keytable` that every one of those
+/// routes writes and the key handler reads (cmd-switch-client.c:96,
+/// server-client.c server_client_handle_key), so the client must learn it.
+pub(crate) fn append_key_table_json(table: Option<&str>, buf: &mut String) {
+    let Some(t) = table else { return };
+    if !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"key_table\":\"");
+    buf.push_str(&json_escape_string(t));
+    buf.push_str("\"}");
 }
 
 pub(crate) fn json_escape_string(s: &str) -> String {
@@ -137,6 +270,7 @@ pub(crate) struct StatusFormats {
     pub window_status_current_style: String,
     pub mode_style: String,
     pub message_style: String,
+    pub client_render_options: ClientRenderOptions,
     /// Pre-built JSON array for the multi-line status bar.
     pub status_format_json: String,
     /// Expanded `set-titles-string`, or `None` when `set-titles` is off. The
@@ -148,11 +282,44 @@ pub(crate) struct StatusFormats {
 ///
 /// `status_style` is passed in rather than read from `app` because both callers
 /// hold it in a metadata cache that is only rebuilt on structural change.
-pub(crate) fn expand_status_formats(app: &AppState, status_style: &str) -> StatusFormats {
+///
+/// Infallible by design: this runs once per rendered frame inside
+/// `run_server`, where an `Err` would end the server and every pane with it.
+/// A render option that escaped catalog validation degrades to its default
+/// instead (the same fallback the client applies to a missing field).
+pub(crate) fn expand_status_formats(
+    app: &AppState,
+    status_style: &str,
+) -> StatusFormats {
     use crate::format::expand_format;
     // The one guard. Everything below expands #() asynchronously against the
     // TTL cache instead of blocking the event loop.
     let _async_fmt = crate::format::AsyncFormatGuard::new();
+    // #648: pane-border-indicators is a WINDOW option. The frame draws the
+    // active window's borders, so the active window's own entry wins over the
+    // server wide one.
+    let pane_border_indicators = crate::server::options::window_local_option(
+        app,
+        app.active_idx,
+        "pane-border-indicators",
+    )
+    .or_else(|| {
+        app.user_options
+            .get("pane-border-indicators")
+            .map(String::as_str)
+    })
+    .unwrap_or(crate::pane_border::INDICATORS_DEFAULT);
+    let pane_border_indicators =
+        crate::pane_border::PaneBorderIndicators::parse(pane_border_indicators)
+            .unwrap_or_else(|e| {
+                if crate::debug_log::server_log_enabled() {
+                    crate::debug_log::server_log(
+                        "render",
+                        &format!("{e}; falling back to the default"),
+                    );
+                }
+                crate::pane_border::PaneBorderIndicators::default()
+            });
     StatusFormats {
         status_style: expand_format(status_style, app),
         status_left: expand_format(&app.status_left, app),
@@ -165,6 +332,47 @@ pub(crate) fn expand_status_formats(app: &AppState, status_style: &str) -> Statu
         window_status_current_style: expand_format(&app.window_status_current_style, app),
         mode_style: expand_format(&app.mode_style, app),
         message_style: expand_format(&app.message_style, app),
+        client_render_options: ClientRenderOptions {
+            status_left_style: Some(expand_format(&app.status_left_style, app)),
+            status_right_style: Some(expand_format(&app.status_right_style, app)),
+            window_status_activity_style: Some(expand_format(
+                &app.window_status_activity_style,
+                app,
+            )),
+            window_status_bell_style: Some(expand_format(
+                &app.window_status_bell_style,
+                app,
+            )),
+            window_status_last_style: Some(expand_format(
+                &app.window_status_last_style,
+                app,
+            )),
+            window_style: Some(expand_format(
+                app.user_options.get("window-style").map(String::as_str).unwrap_or(""),
+                app,
+            )),
+            window_active_style: Some(expand_format(
+                app.user_options
+                    .get("window-active-style")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                app,
+            )),
+            pane_border_indicators: Some(pane_border_indicators),
+            // Only travels when the user actually set the option, so the
+            // default configuration adds nothing to every render frame.
+            codepoint_widths: if app.codepoint_widths.is_empty() {
+                None
+            } else {
+                Some(app.codepoint_widths.clone())
+            },
+            terminal_overrides: if app.terminal_overrides.is_empty() {
+                None
+            } else {
+                Some(app.terminal_overrides.clone())
+            },
+            word_separators: Some(app.word_separators.clone()),
+        },
         status_format_json: {
             let mut sf = String::from("[");
             for (i, fmt_str) in app.status_format.iter().enumerate() {
@@ -191,74 +399,127 @@ pub(crate) fn expand_status_formats(app: &AppState, status_style: &str) -> Statu
     }
 }
 
-/// Append live-client style fields shared by both render-state producers.
-pub(crate) fn append_extra_style_json(buf: &mut String, app: &AppState) {
-    if !buf.ends_with('}') { return; }
-    // Guard lives HERE, not at the call site. This runs on the per-repaint
-    // render path (both the DumpState handler and the server auto-push block),
-    // so any #() in these style options must expand async or it blocks the one
-    // event loop that also delivers keystrokes. Keeping the guard inside the
-    // function makes that impossible to forget when a new call site appears —
-    // which is exactly how the auto-push path lost it.
-    let _async_fmt = crate::format::AsyncFormatGuard::new();
-    buf.pop();
-    let window_style = app.user_options.get("window-style").map(String::as_str).unwrap_or("");
-    let window_active_style = app.user_options
-        .get("window-active-style")
-        .map(String::as_str)
-        .unwrap_or("");
-    for (key, raw) in [
-        ("status_left_style", app.status_left_style.as_str()),
-        ("status_right_style", app.status_right_style.as_str()),
-        ("wsa_style", app.window_status_activity_style.as_str()),
-        ("wsb_style", app.window_status_bell_style.as_str()),
-        ("wsl_style", app.window_status_last_style.as_str()),
-        ("window_style", window_style),
-        ("window_active_style", window_active_style),
-    ] {
-        buf.push_str(",\"");
-        buf.push_str(key);
-        buf.push_str("\":\"");
-        buf.push_str(&json_escape_string(&crate::format::expand_format(raw, app)));
-        buf.push('"');
+/// Append typed client-render options to a buffer ending in `}`.
+///
+/// # Errors
+///
+/// Returns an error if `buf` is not a JSON object or the options cannot be
+/// serialized as one.
+pub(crate) fn append_client_render_options_json(
+    buf: &mut String,
+    options: &ClientRenderOptions,
+) -> io::Result<()> {
+    if !buf.ends_with('}') {
+        return Err(io::Error::other(
+            "render-state JSON does not end with an object delimiter",
+        ));
     }
+    let encoded = serde_json::to_string(options).map_err(io::Error::other)?;
+    let fields = encoded
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| io::Error::other("client render options are not an object"))?;
+    if fields.is_empty() {
+        return Ok(());
+    }
+    buf.pop();
+    buf.push(',');
+    buf.push_str(fields);
     buf.push('}');
+    Ok(())
 }
 
 /// Build windows JSON with pre-expanded tab_text for each window.
 /// The tab_text is the fully expanded window-status-format / window-status-current-format.
 pub(crate) fn list_windows_json_with_tabs(app: &AppState) -> io::Result<String> {
-    // Async #() for the same reason as append_extra_style_json above — and this
-    // one expands window-status-format once PER WINDOW, so a synchronous #()
-    // here multiplies by the window count.
+    // This expands window-status-format once per window, so synchronous #()
+    // work here would multiply with the window count.
     let _async_fmt = crate::format::AsyncFormatGuard::new();
     let mut v: Vec<WinInfo> = Vec::new();
     for (i, w) in app.windows.iter().enumerate() {
         let is_active = i == app.active_idx;
+        // #648: window-status-format, its -current- twin and the five window
+        // status styles are WINDOW options. Each window's own entry wins over
+        // the server wide one; `window_local_option` borrows, so a window that
+        // set nothing (every window, until someone writes to one) costs no
+        // allocation on this per-frame path.
+        let local = |name: &str| crate::server::options::window_local_option(app, i, name);
         let fmt = if is_active {
-            &app.window_status_current_format
+            local("window-status-current-format")
+                .unwrap_or(&app.window_status_current_format)
         } else {
-            &app.window_status_format
+            local("window-status-format").unwrap_or(&app.window_status_format)
         };
         let tab = expand_format_for_window(fmt, app, i);
+        let owned = |name: &str| local(name).map(|value| expand_format_for_window(value, app, i));
         v.push(WinInfo {
             id: w.id,
             name: w.name.clone(),
             active: is_active,
             activity: w.activity_flag,
             bell: w.bell_flag,
-            last: i == app.last_window_idx,
+            last: app.last_window_pos() == Some(i),
             tab_text: tab,
+            ps_status: crate::program_status::window_status(w),
+            // Records stay out of the frame JSON: no client reads them, and
+            // 64 records with full titles and messages made every pushed frame
+            // about 150 KB. `list-windows -J` carries them for inspection.
+            ps_panes: Vec::new(),
             idx: app.win_display_index(i),
+            ws_style: owned("window-status-style"),
+            wsc_style: owned("window-status-current-style"),
+            wsa_style: owned("window-status-activity-style"),
+            wsb_style: owned("window-status-bell-style"),
+            wsl_style: owned("window-status-last-style"),
         });
     }
     serde_json::to_string(&v)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))
 }
 
+/// Refresh cached tabs/records when live status changes without structural changes.
+pub(crate) fn refresh_program_status_tabs(
+    app: &AppState,
+    cached_version: &mut u64,
+    cached_windows: &mut String,
+) -> io::Result<bool> {
+    let version = crate::program_status::version(app);
+    if version == *cached_version { return Ok(false); }
+    *cached_windows = list_windows_json_with_tabs(app)?;
+    *cached_version = version;
+    Ok(true)
+}
+
 /// Sum data_version counters across all panes in the active window.
+/// Whether the automatic rename walk (a process table snapshot per window) is
+/// due for a pane, tmux `names.c:66` style: only when the window has produced
+/// output since the last check, and at most once per throttle interval.
+///
+/// The check runs inside the `dump-state` request handler, so before #658 it
+/// ran only when a client asked for a frame, which an idle client never did.
+/// The #658 idle floor makes an attached client ask once a second, and without
+/// this gate every one of those requests walked the process table for every
+/// window: the cross terminal gate measured server plus client idle CPU at
+/// 3.7 percent of a core against 0.78 the same morning on the build before the
+/// floor (sweep 2026-09-16_02-02-11, T7). tmux answers the same question with
+/// `PANE_CHANGED`: no output since the last check means nothing to rename.
+///
+/// `last_output` is the window's last output stamp (advanced by
+/// `check_window_activity`, which runs earlier in the same request), and
+/// `last_check` is the pane's stamp from the previous walk.
+pub(crate) fn window_name_check_due(
+    last_output: std::time::Instant,
+    last_check: std::time::Instant,
+    throttle_ms: u128,
+) -> bool {
+    if last_output <= last_check {
+        return false;
+    }
+    last_check.elapsed().as_millis() >= throttle_ms
+}
+
 pub(crate) fn combined_data_version(app: &AppState) -> u64 {
-    let mut v = 0u64;
+    let mut v = crate::program_status::version(app);
     fn walk(node: &Node, v: &mut u64) {
         match node {
             Node::Leaf(p) => {
@@ -274,6 +535,18 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
     if let Some(win) = app.windows.get(app.active_idx) {
         walk(&win.root, &mut v);
     }
+    // #658: which window those counters came from is part of the identity of
+    // the frame they describe. Without this term the sum for window 0 and the
+    // sum for window 1 are the same number whenever their panes are equally
+    // idle, so the version guard on the "NC" fast path could not tell a window
+    // switch from no change at all. Mixed into a distinct field so it cannot
+    // cancel against a pane counter.
+    v = v.wrapping_add((app.active_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // A command prompt request opening or closing is a new frame for the
+    // client it targets (#789 follow up), whichever route queued it: a hook
+    // queues one with no request handler around it to mark the state dirty.
+    let prompt_term = app.prompt_request.as_ref().map_or(0u64, |r| r.id.wrapping_add(1));
+    v = v.wrapping_add(prompt_term.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
     // Include per-window status flags so non-active windows changing their
     // bell/activity/silence state forces a frame emission. Without this, the
     // status bar shows the bell or activity indicator only after some
@@ -297,6 +570,8 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
         crate::types::Mode::MenuMode { .. } => 7,
         crate::types::Mode::PaneChooser { .. } => 8,
         crate::types::Mode::BufferChooser { .. } => 9,
+        crate::types::Mode::CopyGoto { .. } => 11,
+        crate::types::Mode::CopyCommandPrompt(_) => 12,
         _ => 10,
     };
     v = v.wrapping_add(mode_tag.wrapping_mul(0x1_0000_0000));
@@ -354,17 +629,47 @@ pub(crate) fn window_data_version(win: &Window) -> u64 {
     v
 }
 
+/// What one `check_window_activity` pass did.
+pub(crate) struct WindowAlerts {
+    /// The alert hooks to run, one for each flag the pass newly set.
+    pub hooks: Vec<&'static str>,
+    /// Whether any window's bell, activity or silence flag changed. The
+    /// window list a frame carries is cached with each tab's expanded
+    /// window-status-format and its flags, so the caller must rebuild it,
+    /// as tmux redraws the status line when it sets a flag
+    /// (alerts.c:202-204, server_status_session).
+    pub flags_changed: bool,
+}
+
+fn alert_flags(win: &Window) -> (bool, bool, bool) {
+    (win.bell_flag, win.activity_flag, win.silence_flag)
+}
+
 /// Check non-active windows for output activity and set their activity_flag.
 /// Also checks bell_pending on all panes and sets window bell_flag,
 /// and checks monitor-silence timeout to set silence_flag.
-pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
+pub(crate) fn check_window_activity(app: &mut AppState) -> WindowAlerts {
     let active = app.active_idx;
-    let monitor_silence_secs = app.monitor_silence;
     let bell_action = app.bell_action.clone();
     let mut triggered_hooks: Vec<&'static str> = Vec::new();
+    let mut flags_changed = false;
     let mut forward_bell = false;
 
+    // #648: monitor-activity and monitor-silence are WINDOW options, so each
+    // window's alert rules come from its own table with the session-wide value
+    // as the parent, rather than once for the whole server as it used to be.
+    let attached = app.attached_clients > 0;
+    let global_monitor_activity = app.monitor_activity;
+    let global_monitor_silence = app.monitor_silence;
+
     for (i, win) in app.windows.iter_mut().enumerate() {
+        // Resolved per window inside the loop from the window's own table, so
+        // this tick path allocates nothing.
+        let monitor_activity =
+            crate::server::options::win_flag(win, "monitor-activity", global_monitor_activity);
+        let monitor_silence_secs =
+            crate::server::options::win_number(win, "monitor-silence", global_monitor_silence);
+        let flags_before = alert_flags(win);
         // ── Bell detection: check all panes for pending bells ──
         let has_bell = check_pane_bells(&win.root);
         if has_bell && i != active {
@@ -394,7 +699,7 @@ pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
         }
 
         // ── Activity detection ──
-        if i == active && app.attached_clients > 0 {
+        if i == active && attached {
             // Active window with a client viewing it: alerts are seen the
             // moment they happen, so clear the flags (tmux clears alerts when
             // the window is current in an attached session). #559: a DETACHED
@@ -414,11 +719,12 @@ pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
                 win.last_output_time = std::time::Instant::now();
             }
             win.last_seen_version = cur;
+            flags_changed |= alert_flags(win) != flags_before;
             continue;
         }
         let cur = window_data_version(win);
         if cur != win.last_seen_version {
-            if app.monitor_activity && !win.activity_flag {
+            if monitor_activity && !win.activity_flag {
                 win.activity_flag = true;
                 triggered_hooks.push("alert-activity");
             }
@@ -435,11 +741,12 @@ pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
                 triggered_hooks.push("alert-silence");
             }
         }
+        flags_changed |= alert_flags(win) != flags_before;
     }
     if forward_bell {
         app.bell_forward = true;
     }
-    triggered_hooks
+    WindowAlerts { hooks: triggered_hooks, flags_changed }
 }
 
 /// Propagate OSC 0/2 titles from the vt100 parser to pane.title for all windows.
@@ -476,15 +783,24 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
 
 /// Ingest one staged pane OSC 52 payload: paste buffer plus client forward.
 ///
-/// tmux parity (input.c input_osc_52): a pane initiated OSC 52 is BOTH
-/// forwarded to the host terminal AND added to the paste buffer stack via
-/// paste_add, and tmux does this server side during input parsing whether or
-/// not a client is attached. The buffer add here is therefore unconditional.
+/// tmux (input.c input_osc_52_parse) accepts a pane initiated OSC 52 only on
+/// `set-clipboard on`: it then forwards it to the host terminal AND adds it
+/// to the paste buffer stack via paste_add, server side during input parsing,
+/// whether or not a client is attached. On `external` and `off` tmux drops
+/// the sequence entirely; `external` only lets tmux's own copies (copy mode,
+/// set-buffer -w) set the terminal clipboard.
+///
+/// psmux matches the buffer half (only `on` adds a buffer, #771) and keeps
+/// one deliberate difference: on `external`, the default, the payload is
+/// still forwarded, because that forward is how an application's clipboard
+/// write (nvim, an agent CLI) reaches the Windows clipboard through the
+/// attached client. `off` forwards nothing.
+///
 /// The one-shot `clipboard_osc52` forward slot is OVERWRITTEN with the
 /// newest payload: a clipboard collapse must keep the latest write, and in a
 /// detached session the slot would otherwise wedge on the first never
 /// delivered payload and serve stale content when a client finally attaches
-/// (every payload still lands in the buffer stack regardless).
+/// (on `on` every payload still lands in the buffer stack regardless).
 ///
 /// Called from the dump-state builders (attached clients, per frame) and
 /// from the main loop's 100ms housekeeping tick (detached sessions).
@@ -495,11 +811,25 @@ pub(crate) fn drain_osc52(app: &mut AppState) {
     let Some((_sel, b64)) = take_pane_clipboard(app) else { return };
     let Ok(b64_str) = std::str::from_utf8(&b64) else { return };
     let Some(text) = crate::util::base64_decode(b64_str) else { return };
-    app.paste_buffers.insert(0, text.clone());
-    if app.paste_buffers.len() > 10 {
-        app.paste_buffers.pop();
+    // `on` lets the application create a buffer; `external` only forwards.
+    // tmux's option says so in as many words, "whether to allow applications
+    // to create paste buffers with an escape sequence ('on' only)", and
+    // input_osc_52_parse returns before decoding unless the value is `on`
+    // (input.c, the `!= 2` guard). The forward below is not gated on `on`:
+    // see the doc comment for why psmux still forwards on `external`.
+    if app.set_clipboard == "on" {
+        app.paste_add(text.clone());
     }
     app.clipboard_osc52 = Some(text);
+}
+
+/// The clipboard write and bell staged for the next frame, taken so they go
+/// out once.
+pub(crate) fn take_frame_oneshots(app: &mut AppState) -> crate::frame_oneshot::OneShots {
+    crate::frame_oneshot::OneShots {
+        clip_b64: app.clipboard_osc52.take().map(|t| crate::util::base64_encode(&t)),
+        bell: std::mem::take(&mut app.bell_forward),
+    }
 }
 
 /// Drain a pending OSC 52 clipboard payload from any pane in the tree.
@@ -610,6 +940,32 @@ pub(crate) fn drain_cpr_pending(node: &mut crate::types::Node) {
     }
 }
 
+/// Issue #597: write any DA1/DA2/DSR/DECRQM answers this pane's parser thread
+/// composed into the pane's PTY input.
+///
+/// The PTY writer, not `mouse_inject::send_vt_response`: at pane startup the
+/// party waiting for the DA1 answer is the console host itself (OpenConsole
+/// opens with `ESC[1t ESC[c` and parks the child's console connect until the
+/// answer arrives on the input pipe), and a console input record would never
+/// reach it.  It is the same path `drain_cpr_pending` above uses for ESC[6n,
+/// which is measured working under both the inbox host and OpenConsole.
+pub(crate) fn drain_device_replies(node: &mut crate::types::Node) {
+    use std::io::Write as _;
+    match node {
+        crate::types::Node::Leaf(p) => {
+            if let Some(bytes) = crate::types::take_device_replies(p.id) {
+                let _ = p.writer.write_all(&bytes);
+                let _ = p.writer.flush();
+            }
+        }
+        crate::types::Node::Split { children, .. } => {
+            for c in children {
+                drain_device_replies(c);
+            }
+        }
+    }
+}
+
 /// Issue #473: format an RGB triple as the xterm 16-bit-per-channel reply
 /// payload (`rgb:RRRR/GGGG/BBBB`), scaling 8-bit values by duplication.
 fn x11_rgb((r, g, b): (u8, u8, u8)) -> String {
@@ -626,8 +982,20 @@ fn x11_rgb((r, g, b): (u8, u8, u8)) -> String {
 ///   * Complete OSC replies written to the pseudoconsole input pipe are
 ///     consumed by ConPTY before the child sees them, so they are injected
 ///     as console KEY_EVENT records via WriteConsoleInputW instead
-///     (`send_vt_response`), falling back to the pipe if injection fails
-///     (e.g. no child pid, or non-Windows where the pipe is not filtered).
+///     (`send_vt_response`).
+///
+/// When injection fails on Windows the OSC reply is LOST, and since #597 the
+/// code says so rather than writing it to the pipe anyway.  A reporter on
+/// 19045 whose injection was failing saw the colour replies never arrive and
+/// read the pipe write as a fallback that was also broken.  Measured on 26200
+/// with the `PSMUX_FAKE_INJECT_FAIL` seam and again with a plain write to a
+/// live pane's input pipe: a `PLAIN` payload and a CSI reply arrive byte for
+/// byte, a complete OSC arrives as nothing at all, and a DCS arrives as a bare
+/// `ESC` with its body eaten.  So the pipe was never a second channel for an
+/// OSC on this platform, and for a DCS it is worse than none: a lone `ESC` is
+/// an Escape keypress to whatever is reading the pane.  The pipe write is kept
+/// only where it is the sole channel and is known to work: no child pid, and
+/// non-Windows, where nothing filters the pipe.
 ///
 /// ConPTY also consumes the OSC 10;?/11;? QUERIES on the output path, so they
 /// normally never reach psmux.  Applications that need the full picture
@@ -640,8 +1008,21 @@ pub(crate) fn answer_color_queries(
     child_pid: Option<u32>,
     colors: &crate::types::HostColors,
 ) {
+    answer_color_queries_for_pane(bits, writer, child_pid, colors, None);
+}
+
+/// Issue #685: as [`answer_color_queries`], with the asking pane's own OSC 4
+/// palette taking precedence over the host terminal's, the way tmux answers
+/// from `wp->palette` first.
+pub(crate) fn answer_color_queries_for_pane(
+    bits: u32,
+    writer: &mut dyn std::io::Write,
+    child_pid: Option<u32>,
+    colors: &crate::types::HostColors,
+    pane_palette: Option<[Option<(u8, u8, u8)>; 16]>,
+) {
     if bits == 0 { return; }
-    let (scheme, osc) = build_color_replies(bits, colors);
+    let (scheme, osc) = build_color_replies_for_pane(bits, colors, pane_palette);
     if let Some(scheme) = scheme {
         let _ = writer.write_all(scheme.as_bytes());
         let _ = writer.flush();
@@ -649,12 +1030,38 @@ pub(crate) fn answer_color_queries(
     if osc.is_empty() { return; }
     let mut delivered = false;
     if let Some(pid) = child_pid {
-        delivered = crate::platform::mouse_inject::send_vt_response(pid, &osc);
+        delivered = crate::platform::mouse_inject::send_vt_reply(pid, &osc);
     }
-    if !delivered {
-        let _ = writer.write_all(osc.as_bytes());
-        let _ = writer.flush();
+    if delivered { return; }
+    match osc_delivery_fallback(child_pid.is_some()) {
+        OscFallback::Pipe => {
+            let _ = writer.write_all(osc.as_bytes());
+            let _ = writer.flush();
+        }
+        OscFallback::Lost => {
+            crate::platform::mouse_inject::log_lost_reply(child_pid, "OSC colour", osc.len());
+        }
     }
+}
+
+/// What to do with an OSC reply that console injection could not deliver.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum OscFallback {
+    /// Write it to the pane's input pipe: the only channel there is, and one
+    /// that carries an OSC everywhere except in front of a ConPTY.
+    Pipe,
+    /// Nothing left to try.  ConPTY consumes an OSC written to a pane's input
+    /// pipe (measured), so writing it there would deliver nothing and can leak
+    /// a stray control byte into the pane.  Say it was lost instead.
+    Lost,
+}
+
+/// Issue #597: pick the fallback for an OSC reply injection could not deliver.
+///
+/// `had_pid` is false when psmux never learned the pane child's process id, in
+/// which case injection was never attempted and the pipe is all there is.
+pub(crate) fn osc_delivery_fallback(had_pid: bool) -> OscFallback {
+    if cfg!(windows) && had_pid { OscFallback::Lost } else { OscFallback::Pipe }
 }
 
 /// Build the reply strings for a color-query bitmask: the CSI scheme reply
@@ -663,6 +1070,23 @@ pub(crate) fn answer_color_queries(
 pub(crate) fn build_color_replies(
     bits: u32,
     colors: &crate::types::HostColors,
+) -> (Option<String>, String) {
+    build_color_replies_for_pane(bits, colors, None)
+}
+
+/// Issue #685: the same reply, but answering palette queries from the asking
+/// pane's OWN OSC 4 palette when it has an entry for that index.
+///
+/// tmux does exactly this: `input_osc_4` (`input.c:2947`) calls
+/// `colour_palette_get` on the pane's palette and replies from it, and only
+/// when the pane has no entry does it forward the question to the real
+/// terminal (`input_add_request`, `INPUT_REQUEST_PALETTE`).  Without the
+/// override a pane that had just set index 4 to `#000080` would be told the
+/// outer terminal's `#0037DA`, which is the same mismatch #685 is about.
+pub(crate) fn build_color_replies_for_pane(
+    bits: u32,
+    colors: &crate::types::HostColors,
+    pane_palette: Option<[Option<(u8, u8, u8)>; 16]>,
 ) -> (Option<String>, String) {
     // Light/dark scheme query: CSI ?996n → CSI ?997;1n (dark) / ?997;2n (light).
     let scheme = if bits & crate::types::COLOR_QUERY_SCHEME != 0 {
@@ -680,7 +1104,9 @@ pub(crate) fn build_color_replies(
     }
     for i in 0..16usize {
         if bits & (1u32 << i) != 0 {
-            if let Some(rgb) = colors.palette[i] {
+            // The pane's own entry wins; the host's is the fallback.
+            let own = pane_palette.and_then(|p| p[i]);
+            if let Some(rgb) = own.or(colors.palette[i]) {
                 osc.push_str(&format!("\x1b]4;{};{}\x1b\\", i, x11_rgb(rgb)));
             }
         }
@@ -706,13 +1132,15 @@ pub(crate) fn answer_color_queries_sync(
     bits: u32,
     child_pid: Option<u32>,
     colors: &crate::types::HostColors,
+    pane_id: usize,
 ) -> bool {
     if bits == 0 { return true; }
-    let (scheme, osc) = build_color_replies(bits, colors);
+    let (scheme, osc) =
+        build_color_replies_for_pane(bits, colors, crate::types::pane_palette(pane_id));
     let combined = format!("{}{}", scheme.as_deref().unwrap_or(""), osc);
     if combined.is_empty() { return true; }
     match child_pid {
-        Some(pid) => crate::platform::mouse_inject::send_vt_response(pid, &combined),
+        Some(pid) => crate::platform::mouse_inject::send_vt_reply(pid, &combined),
         None => false,
     }
 }
@@ -724,7 +1152,8 @@ pub(crate) fn drain_color_queries(node: &mut crate::types::Node, colors: &crate:
         crate::types::Node::Leaf(p) => {
             let bits = p.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
             if bits != 0 {
-                answer_color_queries(bits, &mut *p.writer, p.child_pid, colors);
+                let own = crate::types::pane_palette(p.id);
+                answer_color_queries_for_pane(bits, &mut *p.writer, p.child_pid, colors, own);
             }
         }
         crate::types::Node::Split { children, .. } => {
@@ -840,9 +1269,130 @@ mod tests_live_client_styles;
 mod tests_render_path_async_format;
 
 #[cfg(test)]
+#[path = "../../tests-rs/test_issue633_followup_render_fallback.rs"]
+mod tests_issue633_followup_render_fallback;
+
+#[cfg(test)]
 #[path = "../../tests-rs/test_issue556_color_reply_order.rs"]
 mod tests_issue556_color_reply_order;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue559_monitor_silence.rs"]
 mod tests_issue559_monitor_silence;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue876_bell_status_refresh.rs"]
+mod tests_issue876_bell_status_refresh;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue759_session_name_frame.rs"]
+mod tests_issue759_session_name_frame;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue658_rename_walk_activity_gate.rs"]
+mod tests_issue658_rename_walk_activity_gate;
+
+
+/// What [`request_client_prompt`] did with a `command-prompt` request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PromptRequestOutcome {
+    /// The request is queued for a client under this id.
+    Queued(u64),
+    /// That client already has a prompt request open, so this one is dropped,
+    /// as tmux drops a prompt for a client that has one (`tc->prompt_string
+    /// != NULL`, cmd-command-prompt.c:100).
+    Ignored,
+}
+
+/// The client a prompt opens on when `-t` names none: the most recently
+/// active attached client that can draw one (tmux's best client,
+/// cmd-find.c `cmd_find_best_client`). Control mode clients have no screen.
+pub fn best_prompt_client(app: &AppState) -> Option<u64> {
+    app.client_registry
+        .values()
+        .filter(|ci| !ci.is_control)
+        .max_by_key(|ci| (ci.last_activity, ci.id))
+        .map(|ci| ci.id)
+}
+
+/// `command-prompt <args>` run anywhere but a client's own key binding: from
+/// the command line, a hook, or a binding the server runs. The prompt opens on
+/// an attached client (tmux status_prompt_set on the target client), which
+/// receives it in its state frame as `prompt_request` and opens it with the
+/// same parse and the same editor a prefix binding's prompt has (#789 follow
+/// up). Before this, the command line kept only `-I` and opened a prompt in
+/// the server that no client drew.
+///
+/// `args` is everything after `command-prompt`. Formats in `-I` and in the
+/// labels are expanded here, where the session's values are; the template is
+/// expanded only with `-F`, as tmux does.
+pub fn request_client_prompt(app: &mut AppState, args: &str) -> Result<PromptRequestOutcome, String> {
+    let spec = crate::client::parse_command_prompt_args(args);
+    // tmux's prompt types (status.c:52); anything else is refused
+    // (cmd-command-prompt.c:151).
+    if let Some(t) = spec.prompt_type.as_deref() {
+        if !matches!(t, "command" | "search" | "target" | "window-target") {
+            return Err(format!("unknown type: {}", t));
+        }
+    }
+    let client_id = match spec.target.as_deref() {
+        Some(t) => {
+            // `%N` is tmux shorthand for the client on /dev/pts/N.
+            let wanted = match t.strip_prefix('%') {
+                Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => format!("/dev/pts/{}", n),
+                _ => t.to_string(),
+            };
+            match crate::format::find_client_by_name(app, &wanted) {
+                Some(id) => id,
+                // Anything that is not a client name named this server's
+                // session: the command line routed here by it already.
+                None if !wanted.starts_with('/') => {
+                    best_prompt_client(app).ok_or_else(|| "no current client".to_string())?
+                }
+                None => return Err(format!("can't find client: {}", t)),
+            }
+        }
+        None => best_prompt_client(app).ok_or_else(|| "no current client".to_string())?,
+    };
+    if app.prompt_request.as_ref().is_some_and(|r| r.client_id == client_id) {
+        return Ok(PromptRequestOutcome::Ignored);
+    }
+    let expand = |s: &str| if s.contains('#') { crate::format::expand_format(s, app) } else { s.to_string() };
+    let prompts: Vec<(Option<String>, String)> = spec
+        .prompts()
+        .into_iter()
+        .map(|(label, initial)| (label.map(|l| expand(&l)), expand(&initial)))
+        .collect();
+    // Untimed: `%%` is the placeholder here, and a strftime pass would turn
+    // it into `%` before any answer is put in (tmux keeps it: `-F
+    // '#{session_name}-%%'` answered q gives `<session>-q`).
+    let template = if spec.format {
+        spec.template.as_deref().map(|t| crate::format::expand_format_untimed(t, app))
+    } else {
+        spec.template.clone()
+    };
+    let pid = app.client_registry.get(&client_id).map_or(0, |ci| ci.pid);
+    app.prompt_request_seq += 1;
+    let id = app.prompt_request_seq;
+    // The same precedence the copy mode prompt and tmux use: -1 over -N over
+    // -k (cmd-command-prompt.c:157 to :166).
+    let single = spec.single;
+    let numeric = !single && spec.numeric;
+    let key = !single && !numeric && spec.key;
+    app.prompt_request = Some(crate::types::PromptRequest {
+        id,
+        pid,
+        client_id,
+        prompts,
+        template,
+        key,
+        single,
+        numeric,
+        search: spec.search,
+    });
+    Ok(PromptRequestOutcome::Queued(id))
+}
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_cli_command_prompt_client.rs"]
+mod test_cli_command_prompt_client;

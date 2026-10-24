@@ -5,9 +5,12 @@ nowhere for an error message to land on screen, so psmux writes what it knows to
 This page lists every diagnostic file psmux can produce, the environment variables that turn the
 optional ones on, and what to attach when you file a bug report.
 
-Everything on this page is read only observation, with one exception called out where it appears:
-`PSMUX_FAKE_WIN_BUILD` moves psmux onto a different branch on purpose, so that a platform specific
-path can be reproduced on a machine that is not that platform.
+Everything on this page is read only observation, with three exceptions called out where they
+appear: `PSMUX_FAKE_WIN_BUILD` moves psmux onto a different branch on purpose,
+`PSMUX_FAKE_INJECT_FAIL` makes a Windows call fail on purpose, and `PSMUX_PASTE_INJECT` moves a
+paste onto the other delivery channel on purpose, all so that a path you cannot otherwise reach on
+your machine can be reproduced on it. The last of the three is also a real escape hatch: it is the
+supported way to correct psmux's guess about your conhost.
 
 ## Debug Logging
 
@@ -23,7 +26,7 @@ your disk.
 | `PSMUX_INPUT_DEBUG=1` | `~/.psmux/input_debug.log` | Every input event plus the console mode in effect when it arrived |
 | `PSMUX_SERVER_DEBUG=1` | `~/.psmux/server_debug.log` | Server side request tracing and session switching |
 | `PSMUX_SESSION_DEBUG=1` | `~/.psmux/session_debug.log` | Session registry scans and stale port cleanup |
-| `PSMUX_MOUSE_DEBUG=1` | `~/.psmux/mouse_debug.log` | Mouse injection, screen to pane coordinate mapping, and the wheel gate's decision per notch (which mouse protocol the pane holds and who enabled it) |
+| `PSMUX_MOUSE_DEBUG=1` | `~/.psmux/mouse_debug.log` | Mouse injection, screen to pane coordinate mapping, the wheel gate's decision per notch (which mouse protocol the pane holds and who enabled it), every reply psmux injects into a pane, and a full console state report whenever an injection cannot attach to a pane |
 | `PSMUX_SSH_DEBUG=1` | `~/.psmux/ssh_input.log` | SSH escape sequence decoding into Win32 input records |
 | `PSMUX_LATENCY_LOG=1` | `~/.psmux/latency.log` | Keypress to render latency, measured client side |
 | `PSMUX_PANE_RAW=1` | `~/.psmux/pane_raw.bin` | The raw byte stream a pane's child wrote, before psmux's VT parser touched it. The file to read when a colour, a mode switch or a mouse DECSET seems to be missing: it shows what the program (and conhost, which echoes console mode changes into the same stream as `ESC [ ? 1003 ; 1006 h` / `l`) actually emitted |
@@ -43,6 +46,13 @@ Two more details worth knowing:
 
 - `PSMUX_SESSION_DEBUG` appends rather than truncates. Registry cleanup runs in every short-lived
   `psmux` CLI process, so truncating on open would erase the log before you could read it.
+- `PSMUX_INPUT_DEBUG` appends too, for the same reason. Two processes write it: the attached client
+  (which decides whether a burst of characters is a paste) and the server (which decides which
+  channel carries that paste into the pane). Each opens the file on its first line, so while it
+  truncated, whichever wrote second erased the other's evidence, and the first one's next write
+  landed at its old offset and left a hole of NUL bytes behind it. Each process writes a banner
+  naming itself when it opens the file, so the two halves stay attributable, and the file holds
+  more than one run: delete it before a reproduction if you want only that run in it.
 - `PSMUX_LATENCY_LOG=1` also enables a server side companion at
   `%USERPROFILE%\psmux_server_latency.log` holding dump-state build times. Read the two together
   to tell a slow server from a slow client.
@@ -90,6 +100,330 @@ must be set on the **server** process to affect a pane, so kill the server first
 `$env:PSMUX_NO_WARM = "1"` so that a warm server spawned earlier, without your setting, does not
 answer instead.
 
+### Reading an Injection Failure
+
+Some things psmux sends a pane cannot go down the pane's input pipe, because the ConPTY host in
+front of the pane consumes them: the XTVERSION and OSC colour replies psmux answers a program's
+own questions with, a Win32 mouse record, a Ctrl+C. Those are written straight into the pane's
+console input buffer instead, and to do that the server has to briefly leave its own console and
+join the pane's, with `FreeConsole` followed by `AttachConsole`.
+
+When that attach is refused, nothing psmux injects reaches the pane, and the symptom is broad and
+confusing: a program's terminal probes go unanswered, the wheel does nothing, colours come out
+wrong. `PSMUX_MOUSE_DEBUG=1` writes one line per attempt, and on a refusal a full report:
+
+```
+[platform] send_vt_response: AttachConsole(18572) FAILED err=5 | ERROR_ACCESS_DENIED: the caller is
+  still attached to a console, or the target console refuses this caller (integrity or session
+  mismatch) | server pid=37420 elevated=false integrity=0x2000 | console before FreeConsole:
+  window=0x1080BAA clients=[37420] | FreeConsole ok=true err=6 | console after: window=0x0
+  clients=NONE(err=6) | target alive=true image=pwsh.exe parent=37420 (psmux.exe) elevated=false
+  integrity=0x2000 | os build=19045 | retry: FreeConsole ok=true err=6 AttachConsole err=5 (...)
+```
+
+Read it in this order:
+
+- **`console after`** is the field that splits the two meanings of `err=5`. `window=0x0` with
+  `clients=NONE` means the server really did let go of its console, so a refusal is the pane's
+  console turning the server away. Anything else means the detach did not take, and the server was
+  still attached when it asked.
+- **`FreeConsole ok=`** says whether the detach itself reported success. `err=6` alongside
+  `ok=true` is normal: `FreeConsole` leaves a stale error code behind when it succeeds.
+- **`integrity=`** on the two processes should match. `0x2000` is a normal session, `0x3000` is
+  elevated. A server and a pane child at different levels is a refusal that no retry can fix.
+- **`target alive=false`** means the pane's program had already exited, which is benign.
+- **`retry:`** appears only for `err=5`, and shows the second attempt psmux makes behind another
+  detach. If the retry succeeds there is no report at all, only a one line note saying so.
+
+A healthy pane logs successes instead, one per reply:
+
+```
+[platform] send_vt_response: pid=36960 text_len=16 records=16 written=16 ok=true
+```
+
+And a reply that could not be delivered is named rather than dropped in silence:
+
+```
+[platform] XTVERSION reply LOST: 16 bytes for pid=Some(40776) could not be injected ...
+```
+
+### The Injection Failure Seam
+
+| Variable | What it does |
+|---|---|
+| `PSMUX_FAKE_INJECT_FAIL=1` | Points every console attach at a process id that does not exist, so injection fails for real |
+
+The report above is unreachable on a host where injection works, which is most of them. This
+variable makes it reachable: the detach still happens, the attach fails for real, the failure
+report is written and every caller takes its real failure branch, so you see exactly what a pane
+looks like when psmux cannot reach it.
+
+This is diagnostic only, and while it is set a pane gets no XTVERSION reply, no OSC colour reply,
+no injected mouse record and no Ctrl+C injection. Set it on the **server** process, with
+`$env:PSMUX_NO_WARM = "1"` and a killed server first, reproduce, then clear it.
+
+### The Paste Route Seam
+
+| Variable | What it does |
+|---|---|
+| `PSMUX_PASTE_INJECT=1` | Delivers a bracketed paste as `KEY_EVENT` records, as if this host's conhost stripped the markers from the pipe |
+| `PSMUX_PASTE_INJECT=0` | Pins the ConPTY input pipe, whatever the build says |
+
+A bracketed paste has to reach the pane child with `ESC[200~` in front of it and `ESC[201~` behind
+it. psmux writes those into the pane's ConPTY input pipe, and on Windows 10 19045 the inbox
+conhost (10.0.19041.1) removes exactly those twelve bytes and hands the child the payload alone.
+The write reports success, so there is nothing for psmux to notice. Measured with a standalone
+pseudoconsole host and no psmux in the chain (issue #684):
+
+```
+19045  input pipe          host wrote 28 bytes, child received 16, markers gone
+19045  WriteConsoleInputW  host wrote 31 records, child received 31 bytes, markers intact
+26200  input pipe          host wrote 28 bytes, child received 28 bytes, markers intact
+26200  WriteConsoleInputW  host wrote 31 records, child received 31 bytes, markers intact
+```
+
+So psmux gates the paste on the build number, at 22523, the same seam the mouse path already draws
+for the same defect on the same channel in the same direction. Below it, a pane whose child has
+`ENABLE_VIRTUAL_TERMINAL_INPUT` set gets the paste as `KEY_EVENT` records instead. Only 19045 and
+26200 are measured; everything between them is unknown, which is what this variable is for. If
+your pastes arrive unbracketed on a build above 22523, set it to `1`; if injection misbehaves on a
+build below it, set it to `0`, and please report either.
+
+`=1` opens the build half of the gate only. A pane whose child reads `INPUT_RECORD`s rather than
+bytes always keeps the pipe, because it cannot reassemble a VT sequence out of per character key
+events and would show the markers as the literal characters `[200~` in the editor (issue #98).
+No setting of this variable can ask for that.
+
+`PSMUX_INPUT_DEBUG=1` records the whole decision and the channel that carried the paste:
+
+```
+[paste] use_bracket=true text_len=490 text_preview="LINE0-..."
+[paste] route decision: vt_byte_reader=true build=Some(26200) gate=22523 PSMUX_PASTE_INJECT=Some(true) -> Inject
+[paste] route=inject pid=29004 text_len=490 ok=true
+```
+
+Set it on the **server** process, with `$env:PSMUX_NO_WARM = "1"` and a killed server first,
+reproduce, then clear it.
+
+### The Console Host Seam
+
+| Variable | What it does |
+|---|---|
+| `PSMUX_CONPTY_DIR=<dir>` | Loads `<dir>\conpty.dll` and uses the `OpenConsole.exe` next to it as every pane's console host |
+| unset (the default) | The system ConPTY in `kernel32.dll`, driving the inbox `conhost.exe` |
+
+Every psmux pane is a pseudoconsole, and the process that owns that pseudoconsole is a console
+host. By default that host is the `conhost.exe` shipped in the Windows you are running, reached
+through the `CreatePseudoConsole` export in `kernel32.dll`. Microsoft also publishes the same
+component out of band, as a `conpty.dll` plus an `OpenConsole.exe`, so an application can carry a
+newer console host than the one in the box. That is how Windows Terminal and WezTerm work.
+
+psmux does not ship either file and never loads one on its own. Nothing but `kernel32.dll` is
+touched unless you name a directory yourself, which is the point of this variable: it is an
+escape hatch for a host whose inbox `conhost.exe` has a defect you are stuck with, not a
+supported configuration. The DLL is loaded by absolute path with
+`LOAD_WITH_ALTERED_SEARCH_PATH`, so the `OpenConsole.exe` that gets spawned is the one beside the
+DLL you named and not something else off the search path. If the directory does not exist, holds
+no `conpty.dll`, or holds one that will not load or does not export the three ConPTY entry
+points, psmux logs the reason and falls back to `kernel32.dll`, so a bad value costs you nothing
+but the default behaviour.
+
+Where to get the files: the `Microsoft.Windows.Console.ConPTY` package on nuget.org, which is
+MIT licensed and carries `runtimes\win-x64\native\conpty.dll` and
+`build\native\runtimes\x64\OpenConsole.exe`. Put the two side by side in one directory and point
+the variable at it.
+
+On Windows 10 19045 this is the one setting that repairs the whole family of inbox conhost
+defects at once, measured by a reporter on #597 and #684 with the package at 1.24.2607.10001:
+device queries (DA1, DA2, DSR, DECRQM) are answered while a program waits on them instead of
+being held until the next paint, bracketed pastes keep their `ESC[200~` / `ESC[201~` markers on
+the ConPTY input pipe, and non ASCII pastes (Latin 1, CJK) arrive byte exact where the inbox
+host on that build mangles them. Under it psmux also takes the cheaper pipe route for a
+bracketed paste rather than the `WriteConsoleInputW` injection it uses on the inbox host below
+build 22523; `PSMUX_PASTE_INJECT=1` still forces injection if you need it.
+
+The inbox host also drops a cursor move made while the cursor is hidden, on Windows 11 26200 as
+well as on 19045 (#726). A program that draws its own caret hides the hardware cursor with
+`ESC[?25l` and still moves it onto the caret with CUP, because the outer terminal anchors IME
+composition (Korean, Japanese, Chinese) to that cursor whether it is shown or not. Claude Code and
+other Ink based CLIs work this way. The inbox host never paints a hidden cursor, so that final CUP
+never reaches the pseudoconsole output and psmux sees the cursor wherever the last drawn cell left
+it. psmux moves the outer terminal's hidden cursor to the pane's cursor on every frame, like tmux,
+but on the inbox host that is the wrong cell. Measured with a probe that writes
+`ESC[?25l ... ESC[5;6H` into a 100 by 29 pane:
+
+```
+                              inbox conhost      OpenConsole (from WezTerm)
+#{cursor_x},#{cursor_y}       0,28               5,4
+same probe without ESC[?25l   5,4                5,4
+```
+
+Under `PSMUX_CONPTY_DIR` the composition lands on the caret. One limit remains with either host:
+a pane resize makes the console host repaint its buffer, and a hidden cursor is not put back
+afterwards, so the position is only right again once the program redraws, which Ink based CLIs do
+on every resize.
+
+Measured on Windows 11 26200 with that package at 1.24.2607.10001, against the inbox host, three
+runs each:
+
+```
+                              inbox conhost      OpenConsole 1.24.2607.10001
+launch to prompt, median      596 ms             711 ms    (bare pwsh 415 / 457 ms)
+keystroke to screen, pwsh     16.74 ms median    2.19 to 2.47 ms median
+DA1 / DA2 / DSR / DECRQM      answered by host   answered by psmux
+XTVERSION                     answered by psmux  answered by psmux
+```
+
+#### Who answers the terminal's round trip questions
+
+A program in a pane can ask the terminal what it is and what modes it has on. psmux answers
+**DA1** (`ESC[c`), **DA2** (`ESC[>c`), **DSR** (`ESC[5n` and `ESC[6n`) and **DECRQM**
+(`ESC[?<mode>$p`) itself, with the same bytes tmux sends: `ESC[?1;2c`, `ESC[>84;0;0c`, `ESC[0n`,
+`ESC[<row>;<col>R` and `ESC[?<mode>;<value>$y` with 1 set, 2 reset, 0 not recognised
+(`input.c`, `INPUT_CSI_DA`, `INPUT_CSI_DA_TWO`, `INPUT_CSI_DSR`, `INPUT_CSI_QUERY_PRIVATE`).
+`ESC[>q` (XTVERSION) is answered too, and `ESC[1t` is ignored, again like tmux.
+
+On the inbox `conhost.exe` none of that is visible, because that host answers those four itself
+and never forwards them to psmux. A host that forwards them instead, which is what recent
+OpenConsole builds do, used to leave them unanswered, and that cost two things at once: a program
+in the pane got zero bytes back for DA1, DA2 and DECRQM, and **every pane launch stalled about
+three seconds**, because OpenConsole opens a pane by writing `ESC[1t ESC[c` toward psmux and
+parks the child inside its console connect until the DA1 reply arrives. psmux answering the
+queries removes both: prompt at 616 / 617 / 615 ms where it used to be 3777 / 3747 / 3799 ms.
+
+One deliberate difference from tmux: DECRQM for mode **2026** (synchronized output) reports `0`,
+not recognised, rather than tmux's `2`. psmux has no synchronized output to offer, and `0` is
+byte for byte what the inbox host already answers on this build, so a pane sees the same reply
+whichever console host is under it.
+
+The keystroke win is real and large. Set this when you want it, knowing you are also taking on a
+console host that Windows Update does not patch for you.
+
+`PSMUX_NO_PASSTHROUGH=1` is independent of this and does not change either number.
+
+## Measuring the Terminal Around You
+
+The sections above are about what psmux tells you. This one is the other direction: what the
+terminal psmux is running in will tell psmux, which decides what psmux can promise.
+
+### `scripts\probe-terminal-cursor.ps1`
+
+```powershell
+.\scripts\probe-terminal-cursor.ps1 -Eye
+```
+
+Run it in the terminal you want to measure, not inside psmux or tmux. A multiplexer answers
+these queries itself, so the result would describe the multiplexer and not the terminal, and the
+script refuses to run when `TMUX` or `PSMUX_SESSION` is set. Either PowerShell will do.
+
+It asks five questions, one at a time, and reads the replies off the console input buffer:
+
+| Sent | What it asks |
+|---|---|
+| `ESC[>q` | XTVERSION, which terminal is this |
+| `ESC[?12$p` | DECRQM, is the cursor blinking |
+| `ESC[?25$p` | DECRQM, is the cursor visible. A control: every terminal implements mode 25, so a silent 12 beside a spoken 25 means 12 specifically is unsupported |
+| `ESC P$q SP q ESC\` | DECRQSS, what is the cursor style |
+| `ESC[c` | DA1, answered by almost everything, so a silence here means the queries are not getting through at all |
+
+With `-Eye` it then walks mode 12 both ways, a steady bar and the reset, and DECSCUSR 0 through
+8, asking you after each one what you see. That is the part no query can answer: whether what a
+terminal reports is what it draws. Nothing is left changed, whatever state the probe finds is
+written back before it returns. The last thing it prints is a Markdown block to paste into a
+reply on the terminal survey discussion, stamped with the time, the version of the script and
+the shell, so a result can be placed later.
+
+Why any of this matters to psmux. The shape goes out as DECSCUSR, and its reset, `ESC[0 q`,
+means the terminal's default rather than what the user had. The blink is worse: terminals have no
+setting for it, so it is only ever moved by a sequence, and DEC private mode 12 has two states
+and no default to go back to. So the only way to put either back exactly is to read it first,
+and not every terminal answers, which is what there is to measure.
+
+What each answer makes possible, with reading the cursor at attach and restoring only what psmux
+changed being issue #735:
+
+| The terminal | What is possible |
+|---|---|
+| answers DECRQM for mode 12 | the blink is put back exactly on exit |
+| does not | psmux can only undo its own write, by its opposite |
+| answers DECRQSS with a style | the shape is put back exactly on exit |
+| refuses, or says nothing | psmux falls back to `ESC[0 q`, which is where tmux stops |
+| draws mode 12, not just tracks it | `cursor-blink` works on its own |
+| tracks it without drawing it | the blink has to come from the shape, as in `cursor-style blinking-bar` |
+| draws neither | nothing psmux sends moves the blink, the terminal decides it |
+
+Three things measured this way are worth knowing before you read a report:
+
+A terminal can answer a query faithfully and ignore the mode the query describes. WezTerm reports
+mode 12 exactly as it was set and never uses it to decide whether to blink, while conhost, which
+refuses DECRQSS, does act on mode 12. The two halves come apart, so an answer tells you nothing
+about the behaviour.
+
+A report can also be frozen. The VS Code terminal answers DECRQSS with `2`, a steady block, and
+goes on answering `2` after a bar has been asked for and drawn. A restore built on that would
+write `ESC[2 q` on the way out and leave a block behind for someone who had configured an
+underline, which is worse than falling back to the terminal's own default.
+
+And a report can be true about every write and wrong about the state it was found in. Alacritty
+answered that mode 12 was set over a cursor that was not blinking, then tracked both writes
+faithfully afterwards. Reading the report back after a write does not catch that one, which is
+the argument for restoring only what was changed rather than asserting whatever was read.
+
+Eight terminals are measured in the terminal survey discussion, with the raw output of each run:
+Windows Terminal, conhost, Alacritty, WezTerm, mintty, the VS Code terminal, ConEmu and the
+JetBrains terminal. Every shape DECSCUSR names is drawn in all eight. What differs is whether the
+cursor can be read back, and which of the two ways of asking for a blink the terminal acts on.
+
+### `scripts\probe-emoji-width.ps1`
+
+```powershell
+.\scripts\probe-emoji-width.ps1
+```
+
+How many columns the terminal gives an emoji sequence. Run it in the terminal you want measured,
+not inside psmux or tmux, and not through a pipe: it needs a console whose cursor it can read.
+Either PowerShell will do.
+
+It writes ten sequences one at a time with `WriteConsoleW`, which is the call psmux writes with,
+reads the console's own cursor before and after, and erases each line it used. The difference is
+the number of columns the host gave that sequence. Nothing is taken from a width table.
+
+| Sequence | What it separates |
+|---|---|
+| `U+0041`, `U+3042` | ASCII and a wide character, the control |
+| `U+2764` and `U+2764 U+FE0F` | whether a variation selector makes a text presentation character wide |
+| `U+1F44D` | an emoji that is wide on its own |
+| `U+1F44D U+1F3FD` | a skin tone modifier |
+| `U+1F1EF U+1F1F5` | a regional indicator pair |
+| `U+1F3F3 U+FE0F ZWJ U+1F308`, and a four person family | sequences joined with a zero width joiner |
+
+The run ends with a block that draws each sequence followed by a bar at the column the console
+counted. A glyph that reaches past its own bar was drawn wider than it was counted, and a gap
+before the bar is the opposite, so a screenshot of that block carries what the table cannot.
+
+### `scripts\probe-pane-emoji-shift.ps1`
+
+```powershell
+pwsh -NoProfile -File .\scripts\probe-pane-emoji-shift.ps1
+```
+
+Where a pane's text actually lands. This one runs INSIDE a psmux pane. It prints a ruler, then a
+line per sequence holding the sequence and a `>>` marker, and asks psmux through
+`display-message -p '#{cursor_x}'` where it believes the cursor is. If the marker sits left of
+the column psmux names, the terminal drew the sequence narrower than psmux counted it and the gap
+is the error; if the text after it is overwritten, the terminal drew it wider. Three CJK
+characters on the first line are the control, six columns everywhere measured so far.
+
+The two probes answer different questions and do not always agree inside one terminal. The first
+measures what the console counts for a raw write; this one measures what the screen does once
+psmux has drawn its grid. A terminal whose console counts eleven columns for a joined sequence
+can still draw it as one glyph, and what a user sees is the second.
+
+It forces the output encoding to UTF-8 before writing, and reads each line back with
+`capture-pane` to check the characters arrived. Without the first, .NET turns anything the console
+code page cannot hold into a question mark, one per UTF-16 code unit, and the numbers that come
+back look plausible; the first run of this script measured a row of question marks.
+
 ## Always On Diagnostic Files
 
 These three are written without any variable being set. They exist because the failures they
@@ -113,6 +447,11 @@ leaving it buried, so in most cases you will see the real cause on screen. The f
 record. Only a log written during the current startup attempt is surfaced. An older one is treated
 as stale and ignored.
 
+Every server sharing the data directory appends to this one file, each report under a header
+`=== session <name> pid <pid> at epoch <seconds> ===`, so two servers that fail together keep both
+reports, and each client echoes the report of the server it started. When the file reaches 512 KB it
+is renamed to `server-startup.log.1` (replacing any older copy) and a fresh file is started.
+
 ### `~/.psmux/config-warnings.log`
 
 Non-fatal config parse problems, such as an unknown option name, a malformed value, or an unknown
@@ -127,7 +466,8 @@ This is the file to check first when a config line appears to have been silently
 
 Written by the server's panic handler: the panic message and a full backtrace. The handler also
 removes that session's `.port` and `.key` files, so a crashed server does not leave stale discovery
-files behind for the next client to trip over.
+files behind for the next client to trip over. Like the startup log it is appended to by every
+server in the data directory, one headed report per panic, and rotated to `crash.log.1` at 512 KB.
 
 If this file exists and its timestamp matches your problem, attach it. It is the single most useful
 artifact in a bug report.
@@ -250,6 +590,7 @@ them into a public issue.
 ## See Also
 
 - [configuration.md](configuration.md) for the supported options and user facing environment variables
+- [configuration.md](configuration.md) for `cursor-style` and `cursor-blink`, which the terminal probe is about
 - [warm-sessions.md](warm-sessions.md) for the `__warm__` server and how to disable it
 - [performance.md](performance.md) for what the latency numbers should look like
 - [faq.md](faq.md) for the common questions these logs usually answer

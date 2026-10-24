@@ -19,6 +19,7 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         id,
         area: ratatui::layout::Rect::new(0, 0, 120, 30),
         window_size: None,
+        window_options: Default::default(),
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -80,7 +81,7 @@ fn detached_session_fires_silence_on_every_window() {
     app.attached_clients = 0; // detached
     app.active_idx = 0;
 
-    let hooks = check_window_activity(&mut app);
+    let hooks = check_window_activity(&mut app).hooks;
 
     assert!(
         app.windows[0].silence_flag,
@@ -133,7 +134,7 @@ fn monitor_silence_zero_means_off() {
     app.monitor_silence = 0; // default: disabled
     app.attached_clients = 0;
 
-    let hooks = check_window_activity(&mut app);
+    let hooks = check_window_activity(&mut app).hooks;
 
     assert!(!app.windows[0].silence_flag, "monitor-silence 0 must never flag");
     assert!(!app.windows[1].silence_flag, "monitor-silence 0 must never flag");
@@ -146,8 +147,8 @@ fn silence_flag_latches_and_hook_fires_once() {
     app.monitor_silence = 3;
     app.attached_clients = 0;
 
-    let first = check_window_activity(&mut app);
-    let second = check_window_activity(&mut app);
+    let first = check_window_activity(&mut app).hooks;
+    let second = check_window_activity(&mut app).hooks;
 
     assert!(app.windows[0].silence_flag, "flag must stay set while silent");
     assert!(first.contains(&"alert-silence"));

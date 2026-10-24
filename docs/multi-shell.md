@@ -276,18 +276,25 @@ creation time. When the new pane is served from the warm pool (a pre-spawned cop
 `default-shell`, see [warm-sessions.md](warm-sessions.md)), that shell is already running, so psmux
 instead types a `cd` line into it and clears the screen. The line is written in the syntax of the
 shell that is actually running, chosen from the effective `default-shell`
-([#600](https://github.com/psmux/psmux/issues/600)):
+([#600](https://github.com/psmux/psmux/issues/600)). The choice is made on the **basename** of that
+setting, so every spelling of one shell behaves the same: a bare name or a full path, forward or
+backslashes, with or without `.exe`, in any letter case, quoted, and with arguments after it
+([#672](https://github.com/psmux/psmux/issues/672)):
 
 | `default-shell` | Injected line |
 |---|---|
 | `pwsh`, `powershell` | `cd '<dir>'; [System.IO.Directory]::SetCurrentDirectory(...); cls` (the second call keeps the Win32 working directory in step so `#{pane_current_path}` follows) |
 | `cmd` | `cd /d "<dir>" & cls` |
 | `bash`, `zsh`, `sh`, `fish`, `dash`, `ksh`, `tcsh`, `csh`, `ash`, `busybox` | `cd '<dir>'; clear` with the path written with forward slashes |
+| `nu`, `nushell` | `cd '<dir>'; clear` with the path as given (a backslash is an ordinary character in nu single quotes); a path containing an apostrophe switches to double quotes (`cd "<dir>"`, every backslash doubled) because a nushell single-quoted string has no quote escape at all |
 | anything else | the PowerShell form |
 
-Nushell and `wsl` fall into the last row. If you use one of those as your `default-shell` and the
-injected line errors, turn warm panes off with `set -g warm off` so every pane starts cold in the
-requested directory instead.
+`git-bash.exe` (Git Bash's GUI launcher, which psmux runs as the console `bash.exe` beside it)
+counts as bash. `wsl` falls into the last row; a `default-shell` of
+`C:\Windows\System32\bash.exe` is WSL's bash and gets the bash row, because the shell on the other
+side of it is a POSIX shell. If your `default-shell` falls into the last row and the injected line
+errors, turn warm panes off with `set -g warm off` so every pane starts cold in the requested
+directory instead.
 
 ## Tips
 

@@ -342,3 +342,51 @@ fn send_control_normalizes_a_missing_trailing_newline() {
         obs.seen
     );
 }
+
+// A loopback protocol peer, never a psmux server. These guards cover the
+// refactored reply path and the warm-claim helper, where upstream added a
+// client half-close independently of send_control.
+fn assert_reply_exchange_is_passive(warm_claim: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind private peer");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut auth = String::new();
+        let mut cmd = String::new();
+        reader.read_line(&mut auth).unwrap();
+        reader.read_line(&mut cmd).unwrap();
+        assert_eq!(auth, "AUTH fork-test-key\n");
+        assert_eq!(cmd, "session-info\n");
+        writer.write_all(b"OK\nreply\n").unwrap();
+        writer.flush().unwrap();
+        reader.get_ref().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut tail = String::new();
+        let remains_open = matches!(reader.read_line(&mut tail), Err(ref e)
+            if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+                || e.raw_os_error() == Some(997));
+        tx.send(remains_open).unwrap();
+        // Dropping both halves provides the server-side EOF the client awaits.
+    });
+    let reply = if warm_claim {
+        super::send_auth_cmd_response(&format!("127.0.0.1:{port}"), "fork-test-key", b"session-info\n")
+    } else {
+        super::exchange_on_port(port, "fork-test-key", None, "session-info", Some(Duration::from_secs(2)))
+    }.expect("read complete reply");
+    assert_eq!(reply, "reply\n");
+    assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "client must wait for peer EOF rather than half-close first");
+}
+
+#[test]
+fn warm_claim_reply_keeps_the_passive_close() {
+    assert_reply_exchange_is_passive(true);
+}
+
+#[test]
+fn factored_exchange_keeps_the_passive_close_and_newline() {
+    assert_reply_exchange_is_passive(false);
+}

@@ -18,6 +18,15 @@ pub const GIT_HASH_FULL: &str = env!("PSMUX_GIT_HASH_FULL");
 pub const GIT_DATE: &str = env!("PSMUX_GIT_DATE");
 pub const GIT_DIRTY: &str = env!("PSMUX_GIT_DIRTY");
 
+/// Fork default `escape-time` in ms, retained from the pre-upgrade build.
+/// Upstream defaults to 10 ms; users can opt in with `set -s escape-time 10`.
+/// The client still applies its ambiguous-Escape ceiling in ssh_input.
+pub const DEFAULT_ESCAPE_TIME_MS: u64 = 500;
+
+/// `AppState::last_window_idx` when the session has no last window (a fresh
+/// session, or after the last window was killed).
+pub const NO_LAST_WINDOW: usize = usize::MAX;
+
 /// Human-readable build provenance line, e.g.
 ///
 ///   `psmux 3.3.7 (a1b2c3d 2026-07-20)`
@@ -43,7 +52,7 @@ pub enum ControlNotification {
     WindowClose { window_id: usize },
     WindowRenamed { window_id: usize, name: String },
     WindowPaneChanged { window_id: usize, pane_id: usize },
-    LayoutChange { window_id: usize, layout: String },
+    LayoutChange { window_id: usize, layout: String, visible_layout: String, flags: String },
     SessionChanged { session_id: usize, name: String },
     SessionRenamed { name: String },
     SessionWindowChanged { session_id: usize, window_id: usize },
@@ -54,6 +63,10 @@ pub enum ControlNotification {
     Pause { pane_id: usize },
     /// Extended output with age information (when pause-after is active).
     ExtendedOutput { pane_id: usize, age_ms: u64, data: String },
+    /// Pane output queued by the server loop through the client's
+    /// `ControlOutputGate`; the writer decides when it reaches it whether it
+    /// goes out as %output, %extended-output, a %pause, or not at all (#826).
+    PaneOutput { pane_id: usize, data: String, seq: u64, queued_at: Instant },
     /// Subscription value changed notification.
     SubscriptionChanged {
         name: String,
@@ -64,6 +77,11 @@ pub enum ControlNotification {
         value: String,
     },
     Exit { reason: Option<String> },
+    /// This control client was detached (detach-client). Written as a bare
+    /// `%exit`, as tmux's client prints it for a control client
+    /// (client.c:416-421), once the command in flight has written its
+    /// reply; the connection then closes (#825).
+    Detached,
     PasteBufferChanged { name: String },
     PasteBufferDeleted { name: String },
     ClientSessionChanged { client: String, session_id: usize, name: String },
@@ -75,7 +93,7 @@ pub struct ControlClient {
     pub client_id: u64,
     pub cmd_counter: u64,
     pub echo_enabled: bool,
-    pub notification_tx: mpsc::SyncSender<ControlNotification>,
+    pub notification_tx: mpsc::Sender<ControlNotification>,
     pub paused_panes: HashSet<usize>,
     /// `refresh-client -B name:what:format` subscriptions.
     /// Key = subscription name, Value = (target, format_string).
@@ -84,12 +102,9 @@ pub struct ControlClient {
     pub subscription_values: HashMap<String, String>,
     /// Last time each subscription was checked (rate limit: 1/s per sub).
     pub subscription_last_check: HashMap<String, Instant>,
-    /// `refresh-client -f pause-after=N`: pause output if client falls behind by N seconds.
-    pub pause_after_secs: Option<u64>,
-    /// Panes whose output is currently paused due to pause-after threshold.
-    pub output_paused_panes: HashSet<usize>,
-    /// Timestamp of last output sent per pane (for pause-after age tracking).
-    pub pane_last_output: HashMap<usize, Instant>,
+    /// pause-after age, paused panes and the per pane backlog age, shared
+    /// with the connection's writer thread (#826).
+    pub output_gate: Arc<crate::control::ControlOutputGate>,
     /// Default viewport reported by `refresh-client -C`.
     pub size: Option<(u16, u16)>,
     /// Per-window viewport overrides reported as `refresh-client -C @id:WxH`.
@@ -122,6 +137,58 @@ pub struct ClientInfo {
     /// (issue #566). `None` means this client has not switched yet, which is
     /// the honest answer rather than somebody else's history.
     pub last_session: Option<String>,
+    /// Process id of the attached client (`#{client_pid}`), 0 until known.
+    ///
+    /// The server reads it from the owner of the client's end of the loopback
+    /// connection, so it is the real attaching process for a TUI client, a
+    /// read only one and a control mode one alike (issue #724).
+    pub pid: u32,
+    /// `attach -r` (tmux CLIENT_READONLY): the client may look but not type.
+    pub readonly: bool,
+    /// The client's terminal has focus (tmux CLIENT_FOCUSED), from its own
+    /// focus-in / focus-out reports.
+    pub focused: bool,
+}
+
+/// A `command-prompt` the server asks one attached client to open (#789 follow
+/// up). The command line that ran `psmux command-prompt` has no prompt of its
+/// own, so, as in tmux (status_prompt_set on the target client), the prompt
+/// opens on an attached client and runs there exactly as a prefix binding's
+/// does. It travels in the state frame as `prompt_request`.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct PromptRequest {
+    pub id: u64,
+    /// The target client's process id. 0 when the server does not know it,
+    /// and then any attached client takes the request.
+    pub pid: u32,
+    /// The target client's connection id; the server's own bookkeeping.
+    #[serde(skip)]
+    pub client_id: u64,
+    /// One `(label, initial text)` per prompt, formats already expanded.
+    pub prompts: Vec<(Option<String>, String)>,
+    pub template: Option<String>,
+    pub key: bool,
+    pub single: bool,
+    pub numeric: bool,
+    pub search: bool,
+}
+
+/// The synthetic tty a client is listed under (`#{client_name}`): its process
+/// id when known, else its connection id (issue #724).
+pub fn client_tty_name(cid: u64, pid: Option<u32>) -> String {
+    match pid {
+        Some(p) if p != 0 => format!("/dev/pts/{}", p),
+        _ => format!("/dev/pts/{}", cid),
+    }
+}
+
+/// Which client a format is expanded for (`display-message -c`, issue #724).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientSel {
+    /// A server-side client id (a control mode client asking about itself).
+    Id(u64),
+    /// A client name or tty as the user typed it (`/dev/pts/3`, `pts/3`).
+    Name(String),
 }
 
 /// A pane's standing authorization to receive wheel reports (issue #613).
@@ -146,9 +213,20 @@ pub struct WheelAuth {
 
 pub struct Pane {
     pub master: Box<dyn MasterPty>,
-    pub writer: Box<dyn std::io::Write + Send>,
+    pub writer: Box<dyn crate::pane::PaneInputSink>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
+    /// While copy mode displays this pane, `term` holds a frozen *snapshot* of
+    /// the screen and this holds the live parser, which the PTY reader keeps
+    /// feeding through its own `Arc` (see `Pane::enter_copy_snapshot`).
+    ///
+    /// Copy mode on a snapshot is what tmux does (`window_copy_init` copies the
+    /// pane's grid).  Without it the frozen view sits on the live grid, so rows
+    /// entering scrollback churn underneath the offset the user is anchored to;
+    /// once those rows are evicted the view is stranded on the oldest retained
+    /// line — psmux reproduced as `#{scroll_position} == #{history_size}` while
+    /// pi redrew, stuck until Esc.
+    pub live_term: Option<Arc<Mutex<vt100::Parser>>>,
     pub last_rows: u16,
     pub last_cols: u16,
     pub id: usize,
@@ -191,12 +269,63 @@ pub struct Pane {
     /// When true, the child's console input has VTI set, meaning VT mouse
     /// sequences can be delivered.  Refreshed every 2 seconds.
     pub vti_mode_cache: Option<(Instant, bool)>,
-    /// Cached ENABLE_MOUSE_INPUT query result (for mouse injection heuristic).
-    /// When true, the child's console has ENABLE_MOUSE_INPUT set, meaning it
-    /// reads MOUSE_EVENT records via ReadConsoleInputW (crossterm/ratatui apps).
-    /// When false, the child expects VT SGR mouse sequences (nvim, vim).
+    /// Cached console INPUT MODE WORD of the pane's child (for the mouse
+    /// injection heuristics).  `None` inside the tuple means the probe itself
+    /// failed; the whole field being `None` means it has not run yet.
     /// Refreshed every 2 seconds.
-    pub mouse_input_cache: Option<(Instant, bool)>,
+    ///
+    /// The whole word is cached rather than one bit because the two questions
+    /// asked of it need different parts of it: `ENABLE_MOUSE_INPUT` alone says
+    /// the console can deliver MOUSE_EVENT records (it is set in the inherited
+    /// Windows default, so it does NOT mean the child asked), while the raw
+    /// mode shape says the child deliberately configured itself to read them.
+    pub mouse_input_cache: Option<(Instant, Option<u32>)>,
+    /// True once psmux has written a WIN32 INPUT MODE key sequence
+    /// (`ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`) into this pane's ConPTY input
+    /// pipe — today only `send-keys C-<letter>`, which needs that form so the
+    /// child sees a real `VK + LEFT_CTRL_PRESSED` record (issue #305).
+    ///
+    /// It has to be remembered because writing one is a ONE-WAY latch on the
+    /// other side: conhost's input state machine concludes the terminal speaks
+    /// win32 input mode and, from then on, stops dispatching a DANGLING `ESC`
+    /// at the end of a write as the Escape key — it holds it as the possible
+    /// start of a longer sequence instead.  A bare `0x1b` therefore never
+    /// reaches the pane application again (issue #588: one `send-keys ... C-m`
+    /// and Escape stopped working in bash, in nvim, in WSL).  Measured under a
+    /// bare pseudoconsole: `1b` alone arrives as `key=Escape` before the win32
+    /// sequence and is swallowed after it, while the same key written AS a
+    /// win32 sequence arrives correctly either way.
+    ///
+    /// So once this is set, `input::write_pane_input` encodes a lone Escape in
+    /// win32 form too, which is the only thing conhost still accepts.  It
+    /// belongs to the pane because the latch belongs to that one ConPTY: a new
+    /// window is unaffected, and `respawn_active_pane` clears it with the rest
+    /// of the per-ConPTY caches.
+    pub win32_input_latched: bool,
+    /// `select-pane -d` / `-e`: tmux's per-pane `PANE_INPUTOFF` flag
+    /// (cmd-select-pane.c sets and clears it, tmux.h `PANE_INPUTOFF`).
+    ///
+    /// While it is set, nothing typed or sent as INPUT reaches the pane's
+    /// program: tmux's `window_pane_key` (window.c) returns before
+    /// `input_key_pane` for such a pane, so keys from an attached client,
+    /// every `send-keys` form, `send-prefix` and forwarded mouse events are
+    /// dropped, `window_pane_copy_key` leaves the pane out of a
+    /// `synchronize-panes` fan out, and `paste-buffer` writes nothing
+    /// (cmd-paste-buffer.c checks the flag before `bufferevent_write`).
+    ///
+    /// Two things deliberately still get through, because tmux does not route
+    /// them through `window_pane_key`'s program half: keys a pane MODE consumes
+    /// (copy mode and its prompts, `send-keys -X`), and the server's own replies
+    /// to the program's terminal queries (CPR, DA, OSC 4/10/11 colours, focus
+    /// reports).  The replies share `writer` with input, which is why the gate
+    /// lives at the input entry points (`input::input_target_accepts_input`
+    /// and its callers) and never in the writer.
+    ///
+    /// Like tmux's `wp->flags`, it belongs to the pane, not to its process:
+    /// `respawn-pane` keeps it (spawn.c only clears PANE_STATUSREADY and
+    /// PANE_STATUSDRAWN on a respawn), and swap/break/join-pane move it with
+    /// the pane.  Exposed read-only as `#{pane_input_off}`.
+    pub input_off: bool,
     /// Cached foreground-process classification for the scroll-wheel
     /// alternate-scroll decision (issue #277): `(timestamp, is_shell,
     /// foreground_exe_name)`. `is_shell` mirrors
@@ -283,6 +412,129 @@ pub struct Pane {
     /// #450 pwsh `ReadLineFromFile` FailFast right after a warm-pane transplant)
     /// and respawned in place, so the user still gets a working window.
     pub spawned_at: Option<Instant>,
+    /// The command operand this pane was created with, exposed read-only as
+    /// `#{pane_start_command}` (issue #580). tmux keeps the spawn argv on the
+    /// pane (`window_pane.argc/argv`, set in `spawn.c` only when a command was
+    /// actually given) and `format_cb_start_command` stringifies it, which
+    /// yields the EMPTY STRING for a pane running the plain default shell.
+    /// psmux carries the operand as one string, so the same contract is: empty
+    /// for a default-shell pane (including a transplanted warm-pool spare),
+    /// the user's command otherwise. Set at every spawn site
+    /// (`new-session`/`new-window`/`split-window`, string and `--` argv form)
+    /// and replaced by `respawn-pane`/`respawn-window` ONLY when that respawn
+    /// carried a command of its own (tmux spawn.c: "Replace the stored
+    /// arguments if there are new ones").
+    pub start_command: String,
+    /// The directory this pane was ASKED to start in, kept until the shell is
+    /// observed to actually be somewhere (issue #615 follow up).
+    ///
+    /// tmux stores the requested cwd on the pane (`window_pane.cwd`, spawn.c)
+    /// and the child is `chdir`ed into it before `exec`, so `#{pane_current_path}`
+    /// is right from the instant the pane exists.  psmux cannot do that for a
+    /// pane claimed from the warm pool: that shell is ALREADY RUNNING in the
+    /// directory the pool spawned it in (the server's own cwd), and a running
+    /// process's cwd cannot be set from outside, so `-c <dir>` is honoured by
+    /// typing a `cd` into it (`pane::silent_rehome`).  That line runs instantly
+    /// on an idle box and seconds later when the machine is loaded and the
+    /// spare is still booting.  Until it does, the PEB reading is the POOL's
+    /// directory, and `#{pane_current_path}` used to report it.
+    /// That is how `split-window -c <dir>` could answer with the server's own
+    /// working directory, which is never a directory the user asked for.
+    ///
+    /// With the hint set, the requested directory is reported for exactly as
+    /// long as the pane's process is still sitting in the pre-`cd` directory.
+    /// The moment the reading moves, whether to the requested directory or
+    /// anywhere else because the user typed their own `cd` first, the live
+    /// reading takes over permanently.
+    pub cwd_hint: Option<CwdHint>,
+}
+
+impl Pane {
+    /// May input reach this pane's program?  False after `select-pane -d`
+    /// (see [`Pane::input_off`]); every key, paste and mouse forward to the
+    /// program checks this.
+    pub fn accepts_input(&self) -> bool {
+        !self.input_off
+    }
+
+    /// Display this pane through a copy-mode snapshot: `term` becomes a frozen
+    /// copy of the current screen and the live parser is parked in
+    /// `live_term`.  The PTY reader keeps feeding the live parser, so the
+    /// application keeps running while the user reads.
+    ///
+    /// Idempotent: a second call while a snapshot is installed does nothing.
+    pub fn enter_copy_snapshot(&mut self) {
+        if self.live_term.is_some() {
+            return;
+        }
+        let snapshot = match self.term.lock() {
+            Ok(term) => term.snapshot(),
+            // Poisoned mutex (reader thread panicked): stay on the live screen
+            // rather than dropping the pane's terminal.
+            Err(_) => return,
+        };
+        let live = Arc::clone(&self.term);
+        self.term = Arc::new(Mutex::new(snapshot));
+        self.live_term = Some(live);
+    }
+
+    /// Drop the snapshot and show the live screen again, with everything the
+    /// application printed while copy mode was up.  Idempotent.
+    pub fn leave_copy_snapshot(&mut self) {
+        if let Some(live) = self.live_term.take() {
+            self.term = live;
+        }
+    }
+
+    /// The parser holding the pane's **live** screen.
+    ///
+    /// While copy mode is up `term` is the frozen snapshot the user is
+    /// reading, and this is the parser the PTY reader keeps feeding.
+    /// Commands that inspect the pane itself rather than the copy-mode
+    /// view -- `capture-pane` and its `-e`/`-S`/`-E` variants, matching
+    /// tmux, whose capture reads `wp->base` and never the copy-mode
+    /// grid -- must go through here.  Outside copy mode it is `term`.
+    pub fn live_parser(&self) -> &Arc<Mutex<vt100::Parser>> {
+        self.live_term.as_ref().unwrap_or(&self.term)
+    }
+
+    /// The view parser plus, while a copy-mode snapshot is installed, the live
+    /// parser behind it.
+    ///
+    /// Anything that reconfigures the terminal (resize, `history-limit`,
+    /// `alternate-screen`) must reach both, or the live screen comes back with
+    /// a stale geometry the moment copy mode exits.
+    pub fn each_term(&self) -> impl Iterator<Item = &Arc<Mutex<vt100::Parser>>> {
+        std::iter::once(&self.term).chain(self.live_term.iter())
+    }
+
+    /// Mutable counterpart of [`Pane::each_term`].
+    pub fn for_each_term_mut<F: FnMut(&mut Arc<Mutex<vt100::Parser>>)>(&mut self, mut f: F) {
+        f(&mut self.term);
+        if let Some(live) = self.live_term.as_mut() {
+            f(live);
+        }
+    }
+}
+
+/// A pane's requested-but-not-yet-observed working directory. See
+/// [`Pane::cwd_hint`].
+#[derive(Debug)]
+pub struct CwdHint {
+    /// The pane process the hint describes.  A `respawn-pane` (or any other
+    /// path that puts a different child behind the pane) changes `child_pid`,
+    /// which retires the hint without every respawn site having to know it
+    /// exists.
+    pub pid: Option<u32>,
+    /// The directory the pane was asked for, in native form.
+    pub requested: String,
+    /// The reading taken the moment before the `cd` was injected: the
+    /// directory the process is in until the shell moves itself. `None` when
+    /// nothing could be read, in which case any successful reading is trusted.
+    pub stale: Option<String>,
+    /// Latched once a reading other than `stale` is seen, so a later `cd` back
+    /// into `stale` cannot resurrect the hint.
+    pub settled: std::sync::atomic::AtomicBool,
 }
 
 /// Pre-spawned shell ready to be transplanted into a new window instantly.
@@ -291,7 +543,7 @@ pub struct Pane {
 /// perceived "instant tab" experience.
 pub struct WarmPane {
     pub master: Box<dyn MasterPty>,
-    pub writer: Box<dyn std::io::Write + Send>,
+    pub writer: Box<dyn crate::pane::PaneInputSink>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -305,6 +557,686 @@ pub struct WarmPane {
     pub rows: u16,
     pub cols: u16,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// When this spare's shell was created. The pool hands out the OLDEST
+    /// spare first, because a spare's usefulness is entirely a function of how
+    /// much of its shell startup has already elapsed: transplanting a spare
+    /// that was spawned 5ms ago costs the caller the whole shell boot, exactly
+    /// as a cold spawn would.
+    pub spawned_at: std::time::Instant,
+    /// Has this spare's shell finished starting? A spare becomes a pool member
+    /// about 25ms after it is asked for (that is just `CreateProcess` plus a
+    /// ConPTY) but is not worth transplanting for another ~400ms, which is how
+    /// long pwsh takes to put a prompt on the screen. Handing out a spare in
+    /// between is indistinguishable from a cold spawn: the window opens and
+    /// sits blank for the rest of the shell's startup.
+    ///
+    /// Maintained by [`WarmPane::refresh_ready`]; only ready spares are ever
+    /// handed to a caller.
+    pub ready: bool,
+    /// Readiness bookkeeping: the last `data_version` seen and when it last
+    /// changed, which is how "the shell stopped writing" is detected.
+    pub last_dv: u64,
+    pub last_change: std::time::Instant,
+    /// Trace bookkeeping (`PSMUX_WARM_TRACE=1`): whether the "spare became
+    /// ready" line has already been emitted for this spare.
+    pub trace_settled: bool,
+    /// Whether [WarmPane::ready] was set by the [WARM_READY_MAX_WAIT]
+    /// backstop rather than by the shell going quiet. Trace and diagnostics.
+    pub ready_via_backstop: bool,
+    /// The directory this spare's shell was STARTED in: the `cwd` handed to
+    /// `CreateProcessW`, read back off the command it was built with.
+    ///
+    /// A creation asking for that same directory gets a shell that is already
+    /// exactly what a cold spawn there would produce, so it is transplanted as
+    /// is. Re-homing it anyway types `cd <dir>; cls` into the shell, blanks the
+    /// pane, and leaves the window empty until the shell has run that line and
+    /// drawn a fresh prompt, which is a whole shell round trip on the critical
+    /// path of every warm creation, and costs 100 to 300 ms whenever the
+    /// machine is busy (for example while the claim's own refills boot).
+    pub spawn_cwd: Option<std::ffi::OsString>,
+    /// The host terminal palette this spare's shell was spawned with, planted
+    /// on it as `PSMUX_HOST_COLORS` (`pane::set_host_colors_env`).
+    ///
+    /// A child's environment block cannot be changed from outside once it is
+    /// running, so this is not bookkeeping — it is the palette this spare will
+    /// hand to whatever process it is transplanted into, for the rest of that
+    /// pane's life. The server usually learns its real palette only when a
+    /// client attaches and reports it, which is after the pool has been
+    /// filled, so a spare can easily be holding a palette the server no longer
+    /// believes. Recorded here so such a spare can be retired instead of
+    /// transplanted (see `warm_pane_sync::for_host_colors_change`).
+    pub host_colors: Option<HostColors>,
+}
+
+/// How long a spare's output has to stay unchanged before its shell counts as
+/// started.
+///
+/// Measured, not guessed: a pwsh spare writes its prompt and goes quiet about
+/// 155ms after spawn, and a claim of a spare 374ms old was instant while claims
+/// at 30ms and 40ms both cost ~380ms more. 250ms of quiet puts readiness at
+/// ~405ms after spawn, which is exactly where the instant claims begin.
+pub const WARM_READY_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Backstop: a spare this old counts as ready however little it has written.
+///
+/// Readiness is inferred from output, so a `default-shell` that prints nothing
+/// at all (or never stops printing) would otherwise never be handed out and
+/// every creation would cold spawn forever. Past this age the pool behaves as
+/// it did before readiness existed, which is the old, merely imperfect,
+/// behaviour rather than a new failure.
+pub const WARM_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Holds a fresh server's background shell spawns (the spare pool refill and
+/// the warm standby server) while a shell somebody is waiting on is booting.
+///
+/// Measured: a pwsh 7 that boots while other pwsh 7 processes boot beside it
+/// waits, it does not compute. With no psmux involved at all, one pwsh launched
+/// together with K others reached its first line of script later than alone by
+/// ~70 ms (K=1), ~110 ms (K=2) and ~200 ms (K=4), at the same CPU time, while
+/// four Windows PowerShell 5.1 neighbours cost it only ~30 ms. A neighbour that
+/// starts later costs less: two started 150, 300 and 450 ms after the measured
+/// shell cost it ~90, ~50 and ~0 ms. A cold `new-session` used to start four
+/// such neighbours while the user's own shell was booting, which was the whole
+/// of the old bimodal launch.
+///
+/// The hold watches every pane that exists while it is on, not only the first:
+/// a window or split created during the hold finds the pool empty and cold
+/// spawns, and releasing the pool beside that spawn would hand the contention
+/// the launch lost straight to the first window. A shell counts as started
+/// when its screen shows visible text (a pwsh prompt, or whatever its profile
+/// prints first; ConPTY's own startup sequences draw nothing), or when it has
+/// written and then been quiet for [`WARM_READY_QUIET`] (a shell that draws
+/// nothing visible). [`WARM_READY_MAX_WAIT`] after the last pane joined, the
+/// hold lets go regardless.
+pub struct BootHold {
+    shells: Vec<HeldShell>,
+    armed: std::time::Instant,
+    /// The standby server spawn that was due at startup and is owed on release.
+    pub standby_owed: bool,
+}
+
+struct HeldShell {
+    pane_id: usize,
+    data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+    last_dv: u64,
+    last_change: std::time::Instant,
+    started: bool,
+}
+
+/// Whether a pane's screen shows any visible character.
+fn screen_has_text(term: &std::sync::Mutex<vt100::Parser>) -> bool {
+    match term.lock() {
+        Ok(p) => p.screen().contents().chars().any(|c| !c.is_whitespace()),
+        Err(_) => true,
+    }
+}
+
+impl BootHold {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self { shells: Vec::new(), armed: now, standby_owed: false }
+    }
+    /// Start watching a pane. A pane already watched is ignored; a new one
+    /// restarts the backstop, since somebody is now waiting on it.
+    pub fn watch(
+        &mut self,
+        pane_id: usize,
+        data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.shells.iter().any(|s| s.pane_id == pane_id) {
+            return false;
+        }
+        let last_dv = data_version.load(std::sync::atomic::Ordering::Relaxed);
+        let started = last_dv > 0 && screen_has_text(&term);
+        self.shells.push(HeldShell { pane_id, data_version, term, last_dv, last_change: now, started });
+        self.armed = now;
+        true
+    }
+    pub fn watching(&self, pane_id: usize) -> bool {
+        self.shells.iter().any(|s| s.pane_id == pane_id)
+    }
+    /// Whether every watched shell has started (or the backstop has expired).
+    pub fn released(&mut self, now: std::time::Instant) -> bool {
+        let mut all = true;
+        for s in self.shells.iter_mut().filter(|s| !s.started) {
+            let dv = s.data_version.load(std::sync::atomic::Ordering::Relaxed);
+            if dv != s.last_dv {
+                s.last_dv = dv;
+                s.last_change = now;
+                if screen_has_text(&s.term) {
+                    s.started = true;
+                }
+                if crate::startup_trace::on() {
+                    crate::startup_trace::mark_detail(
+                        "srv.boot.output",
+                        &format!("pane={} dv={} started={}", s.pane_id, dv, s.started),
+                    );
+                }
+            }
+            if !s.started && dv > 0 && now.saturating_duration_since(s.last_change) >= WARM_READY_QUIET {
+                s.started = true;
+            }
+            all &= s.started;
+        }
+        all || now.saturating_duration_since(self.armed) >= WARM_READY_MAX_WAIT
+    }
+}
+
+impl WarmPane {
+    /// One token describing this spare for the warm trace:
+    /// `id:age ms:state:data_version:quiet ms`, state being `Q` (ready because
+    /// its output went quiet), `B` (ready only by the backstop) or `W` (still
+    /// warming).
+    pub fn trace_token(&self, now: std::time::Instant) -> String {
+        let st = if !self.ready { "W" } else if self.ready_via_backstop { "B" } else { "Q" };
+        format!(
+            "{}:{:.0}:{}:{}:{:.0}",
+            self.pane_id,
+            now.saturating_duration_since(self.spawned_at).as_secs_f64() * 1000.0,
+            st,
+            self.data_version.load(std::sync::atomic::Ordering::Relaxed),
+            now.saturating_duration_since(self.last_change).as_secs_f64() * 1000.0
+        )
+    }
+    /// Trace only: the last non blank line on this spare's screen.
+    pub fn trace_last_line(&self) -> String {
+        match self.term.lock() {
+            Ok(p) => p
+                .screen()
+                .contents()
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect(),
+            Err(_) => String::from("<poisoned>"),
+        }
+    }
+    /// Recompute [`WarmPane::ready`]. Cheap enough for every loop tick: one
+    /// relaxed atomic load per spare, and it returns immediately once ready.
+    pub fn refresh_ready(&mut self, now: std::time::Instant) -> bool {
+        if self.ready {
+            return true;
+        }
+        let dv = self.data_version.load(std::sync::atomic::Ordering::Relaxed);
+        if dv != self.last_dv {
+            self.last_dv = dv;
+            self.last_change = now;
+        }
+        let quiet = now.saturating_duration_since(self.last_change);
+        if dv > 0 && quiet >= WARM_READY_QUIET {
+            self.ready = true;
+        } else if now.saturating_duration_since(self.spawned_at) >= WARM_READY_MAX_WAIT {
+            self.ready = true;
+            self.ready_via_backstop = true;
+        }
+        self.ready
+    }
+}
+
+/// The pool of pre spawned spare shells that `new-window` and `split-window`
+/// transplant instead of paying a shell boot.
+///
+/// This used to be a bare `Option<WarmPane>`: a pool of depth one. Depth one
+/// is enough when creations are minutes apart and hopeless when they are not,
+/// because a spare is only worth anything once its shell has finished
+/// starting. Claim the single spare, refill, and the refill is a brand new
+/// shell; the very next creation claims that newborn and pays its whole boot.
+/// That is the alternating fast/slow pattern users see when they open several
+/// windows in a row.
+///
+/// Spares are handed out oldest first (`pop_front`) so a claim always gets the
+/// most nearly booted shell available.
+#[derive(Default)]
+pub struct WarmPool {
+    spares: VecDeque<WarmPane>,
+    /// How many spares to keep while nobody is creating anything. 0 disables
+    /// the pool entirely.
+    pub target: usize,
+    /// Spares whose spawn has been handed to the background spawner and has
+    /// not landed back in `spares` yet. Counted towards the target so a burst
+    /// does not queue one spawn per loop tick.
+    pub inflight: usize,
+    /// Until when the pool is allowed to hold more than `target`. Set by a
+    /// claim that found no ready spare, which is the only honest signal that
+    /// the idle depth is too shallow for what the user is doing right now.
+    surge_until: Option<std::time::Instant>,
+    /// When the last claim happened, ready or not. Drives surplus trimming.
+    last_claim: Option<std::time::Instant>,
+    /// No spare below this pane id may be handed out any more.
+    ///
+    /// A creation that finds the pool empty allocates a fresh id, which is above
+    /// every id the in flight refills already reserved. When those refills land,
+    /// their ids are in the past: handing one out would make the visible sequence
+    /// go backwards, which is what produced `%2 %3 %12 %4`. They are dropped on
+    /// arrival instead.
+    issued_floor: usize,
+}
+
+/// Default depth of the spare shell pool (`warm-pool-size`).
+///
+/// Retain the fork's pre-upgrade single spare (formerly Option<WarmPane>).
+/// Upstream uses three for burst latency at the cost of more idle shells.
+/// Users can choose that tradeoff with `set -g warm-pool-size 3`; zero or
+/// `PSMUX_NO_WARM=1` turns the pool off.
+pub const WARM_POOL_SIZE_DEFAULT: usize = 1;
+
+/// Hard ceiling on `warm-pool-size`. Each spare is a real shell process plus a
+/// ConPTY, so an unbounded pool is an unbounded memory leak by configuration.
+pub const WARM_POOL_SIZE_MAX: usize = 8;
+
+/// Hard ceiling on the pool while it is surging, and the multiple of `target`
+/// a surge is allowed to reach.
+///
+/// A surge exists because depth alone cannot serve a run of creations: a spare
+/// takes ~400ms to become useful, so creations arriving every 20ms outrun any
+/// fixed depth, and the pool refills one shell per claim while the caller needs
+/// far more than one. Surging spawns the whole batch CONCURRENTLY instead, so a
+/// run of creations pays one shell startup between them all rather than one
+/// each. The multiple keeps a user who deliberately set `warm-pool-size 1` for
+/// memory reasons from being handed eight shells.
+pub const WARM_POOL_SURGE_MAX: usize = 8;
+pub const WARM_POOL_SURGE_FACTOR: usize = 4;
+
+/// How long a surge allowance outlives the claim that triggered it. Long enough
+/// to cover a human run of window opening, short enough that the memory comes
+/// back while they are still looking at the result.
+pub const WARM_SURGE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How close together two claims have to be to count as a run.
+///
+/// A surge needs TWO signals, not one: a claim that found nothing ready, and
+/// another claim just before it. A lone miss is not a burst, and treating it as
+/// one has a measured cost: a cold `new-session` misses by definition (its only
+/// spare is newborn), and surging there fired eight shell spawns alongside the
+/// session's own starting shell and made startup ~100ms slower.
+pub const WARM_BURST_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Resolve the boot time pool depth: `PSMUX_NO_WARM` wins (0), then
+/// `PSMUX_WARM_POOL_SIZE` (clamped), then the compiled default. The config
+/// option `warm-pool-size` overrides this once the config has been parsed.
+pub fn default_warm_pool_size() -> usize {
+    if std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        return 0;
+    }
+    std::env::var("PSMUX_WARM_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.min(WARM_POOL_SIZE_MAX))
+        .unwrap_or(WARM_POOL_SIZE_DEFAULT)
+}
+
+impl WarmPool {
+    pub fn new(target: usize) -> Self {
+        Self { spares: VecDeque::new(), target, inflight: 0, surge_until: None, last_claim: None, issued_floor: 0 }
+    }
+    /// Claim the oldest spare whatever its state. Used by the shrink and
+    /// teardown paths, which only want the process handle back.
+    pub fn take(&mut self) -> Option<WarmPane> {
+        self.spares.pop_front()
+    }
+    /// Hand a spare to a creation. Returns it and whether it was ready.
+    ///
+    /// Readiness decides WHICH spare is handed out, never whether a spare is
+    /// handed out at all. A warming spare still beats a cold spawn: it is
+    /// already some way into its shell startup and costs no `CreateProcess`.
+    /// Gating the claim on readiness outright made a cold `new-session` 330ms
+    /// slower, because its one and only spare is by definition newborn.
+    ///
+    /// What readiness buys is correct ACCOUNTING. An unready claim is reported
+    /// to [`WarmPool::note_claim`] as a miss, which opens a surge window, and
+    /// it is the surge that turns a run of creations from "one shell startup
+    /// each" into "one shell startup between them all".
+    pub fn claim(&mut self) -> (Option<WarmPane>, bool) {
+        // #450: a spare's shell can die while it idles here. A corpse must
+        // never be handed out, and must not sit in the pool occupying a slot
+        // that would otherwise be refilled with a working shell.
+        self.reap_dead();
+        let now = std::time::Instant::now();
+        for wp in self.spares.iter_mut() {
+            wp.refresh_ready(now);
+        }
+        // ALWAYS the front, which `push` keeps as the lowest pane id. Two
+        // reasons, and they happen to agree:
+        //
+        //  - Pane ids must be handed out in creation order. A spare's id is
+        //    allocated when it is SPAWNED, because it is planted in the shell's
+        //    environment as TMUX_PANE and a child's environment cannot be
+        //    rewritten later. So the claim order IS the visible id order, and
+        //    anything other than lowest-id-first shows up as shuffled ids.
+        //  - The lowest id is also the earliest spawned, hence the furthest
+        //    through its shell startup, which is the one worth handing over.
+        //
+        // Picking the first READY spare instead looked equivalent and was not:
+        // spares are spawned concurrently, so they neither land nor become
+        // ready in id order. Ten splits in a row came out
+        // %2 %3 %4 %5 %12 %9 %11 %6 %7 %8.
+        let wp = self.spares.pop_front();
+        if let Some(ref w) = wp {
+            // Handing this id out puts every lower id in the past, exactly as a
+            // cold spawn taking `next_pane_id` does, so record it as issued.
+            //
+            // The pool is sorted and this took its front, so normally the id
+            // handed out IS the lowest outstanding one and this changes
+            // nothing. It matters when the pool ran dry: refills are spawned
+            // concurrently and land in whatever order the OS finishes them, so
+            // a claim that waited for an in flight spare can be handed the
+            // FIRST one to land rather than the lowest, and the lower ids are
+            // still on their way. Without this they landed afterwards, passed
+            // `push` because the floor had never moved, and were handed to the
+            // next creation: a burst of five new windows came out
+            // `%2 %3 %4 %11 %9`. `set_issued_floor` was only ever called on the
+            // cold spawn path, which is the one case where no spare is handed
+            // out at all.
+            self.note_issued(w.pane_id);
+        }
+        let was_ready = wp.as_ref().map(|w| w.ready).unwrap_or(false);
+        (wp, was_ready)
+    }
+    /// How many spares have finished starting. Does not recompute readiness;
+    /// call after [`WarmPool::refresh_all`] or a [`WarmPool::claim`].
+    /// Trace only: every pooled spare as a [WarmPane::trace_token].
+    pub fn trace_tokens(&self) -> String {
+        let now = std::time::Instant::now();
+        self.spares.iter().map(|w| w.trace_token(now)).collect::<Vec<_>>().join(" ")
+    }
+    pub fn ready_len(&self) -> usize {
+        self.spares.iter().filter(|w| w.ready).count()
+    }
+    /// Recompute readiness for every spare. Returns how many just flipped to
+    /// ready, so the caller can trace the edge.
+    pub fn refresh_all(&mut self, now: std::time::Instant) -> usize {
+        let mut flipped = 0;
+        for wp in self.spares.iter_mut() {
+            if !wp.ready && wp.refresh_ready(now) {
+                flipped += 1;
+            }
+        }
+        flipped
+    }
+    /// Record that a creation wanted a spare. `satisfied` is false when no
+    /// ready spare was available.
+    ///
+    /// A surge opens only when the claim follows another claim within
+    /// [`WARM_BURST_WINDOW`]: one claim on its own is an isolated creation, not
+    /// a run, and over-reacting to it costs startup time for no benefit (a cold
+    /// `new-session` misses by definition).
+    ///
+    /// Given a run, three things open or hold the surge open, and #661 is the
+    /// third of them:
+    ///
+    ///  - a MISS: the run has already outrun the idle depth.
+    ///  - a claim that took the LAST READY spare. The next claim in this run is
+    ///    then certain to miss, and a spare takes ~400ms to become useful, so
+    ///    waiting for that miss to react guarantees one slow creation per burst.
+    ///  - the run CONTINUING while a surge is serving it. The surge used to
+    ///    decay from the last MISS, so a run the surge was serving well renewed
+    ///    nothing: five seconds after the single miss that opened it,
+    ///    [`WarmPool::trim_surplus`] killed six ready spares in the middle of a
+    ///    run of splits arriving every ~265ms, and the pool fell straight back
+    ///    to alternating one ready spare with none, ie the defect the pool
+    ///    exists to remove. The window now decays from the last CREATION, which
+    ///    is what [`WARM_SURGE_HOLD`] always described, so the surplus still
+    ///    comes back five seconds after the user stops creating panes and idle
+    ///    memory is unchanged.
+    pub fn note_claim(&mut self, satisfied: bool) {
+        let now = std::time::Instant::now();
+        let following_another = self
+            .last_claim
+            .map(|t| now.saturating_duration_since(t) <= WARM_BURST_WINDOW)
+            .unwrap_or(false);
+        self.last_claim = Some(now);
+        if !following_another {
+            return;
+        }
+        // `ready_len` here is the pool AFTER this claim took its spare: the
+        // claim sites call this straight after `claim`.
+        if !satisfied || self.ready_len() == 0 || self.is_surging() {
+            self.surge_until = Some(now + WARM_SURGE_HOLD);
+        }
+    }
+    /// Forget every claim so far. A server's own first window takes the early
+    /// spare through the claim path, and counting that as a claim made the
+    /// user's first `new-window` a "burst" and fired a full surge of shells
+    /// beside it.
+    pub fn forget_claims(&mut self) {
+        self.last_claim = None;
+        self.surge_until = None;
+    }
+    pub fn is_surging(&self) -> bool {
+        matches!(self.surge_until, Some(t) if std::time::Instant::now() < t)
+    }
+    /// Expire the surge window now. Tests need this because the real one lasts
+    /// [`WARM_SURGE_HOLD`], and a unit test must not sleep for five seconds.
+    #[cfg(test)]
+    pub fn end_surge_for_test(&mut self) {
+        self.surge_until = None;
+    }
+    /// Forget that a claim ever happened, so the next one is not read as part of
+    /// a run. Tests need this because the real gap is [`WARM_BURST_WINDOW`] and
+    /// a unit test must not sleep for a second and a half.
+    #[cfg(test)]
+    pub fn forget_last_claim_for_test(&mut self) {
+        self.last_claim = None;
+    }
+    /// How many spares the pool should be holding right now. `standby` caps a
+    /// `__warm__` helper at one: it creates no windows of its own, so spares
+    /// beyond the one its claimant will want first are pure idle memory, and a
+    /// standby never surges.
+    pub fn effective_target(&self, standby: bool) -> usize {
+        if self.target == 0 {
+            return 0;
+        }
+        if standby {
+            return self.target.min(1);
+        }
+        if self.is_surging() {
+            return self
+                .target
+                .saturating_mul(WARM_POOL_SURGE_FACTOR)
+                .min(WARM_POOL_SURGE_MAX)
+                .max(self.target);
+        }
+        self.target
+    }
+    /// Release spares held only because of a surge that has now expired.
+    pub fn trim_surplus(&mut self) -> usize {
+        if self.is_surging() {
+            return 0;
+        }
+        self.trim_to(self.target)
+    }
+    /// Kill spares beyond `keep`, NEWEST first: the oldest spares are the ones
+    /// whose startup is furthest along, so dropping them would throw away the
+    /// 400ms the pool just spent making them useful.
+    pub fn trim_to(&mut self, keep: usize) -> usize {
+        let mut killed = 0;
+        while self.spares.len() > keep {
+            if let Some(mut wp) = self.spares.pop_back() {
+                wp.child.kill().ok();
+                killed += 1;
+            } else {
+                break;
+            }
+        }
+        killed
+    }
+    /// Return a freshly spawned spare to the pool, keeping the pool sorted by
+    /// pane id.
+    ///
+    /// Sorted, not appended: refills are spawned concurrently, so they finish
+    /// and land in whatever order the OS gets round to them, which is not the
+    /// order their ids were allocated in. Appending would make the front of the
+    /// queue the first spare to LAND rather than the first to have been created,
+    /// and [`WarmPool::claim`] hands out the front. The pool is at most
+    /// [`WARM_POOL_SURGE_MAX`] deep, so the insert is a walk over a handful of
+    /// entries.
+    pub fn push(&mut self, mut wp: WarmPane) {
+        // Its id is already in the past: a creation that found the pool empty
+        // has since taken a higher one. Handing this out would walk the visible
+        // sequence backwards. See `issued_floor`.
+        if wp.pane_id < self.issued_floor {
+            crate::warm_trace!(
+                "pool: refused spare pane={} pid={:?} below floor {}",
+                wp.pane_id, wp.child_pid, self.issued_floor
+            );
+            if let Some(pid) = wp.child_pid {
+                crate::platform::process_kill::kill_pid_tree(pid);
+            }
+            wp.child.kill().ok();
+            return;
+        }
+        let at = self
+            .spares
+            .iter()
+            .position(|w| w.pane_id > wp.pane_id)
+            .unwrap_or(self.spares.len());
+        self.spares.insert(at, wp);
+    }
+    /// Record that `id` has been handed out, so every spare below it is refused
+    /// on arrival by [`WarmPool::push`].
+    ///
+    /// Raises the floor and nothing else. The pooled spares are left alone on
+    /// purpose: this is called from [`WarmPool::claim`], which has just taken
+    /// the front of a pool kept sorted by id, so nothing below what it handed
+    /// out is still in there. The caller that needs the pooled spares dropped
+    /// too is [`WarmPool::set_issued_floor`].
+    fn note_issued(&mut self, id: usize) {
+        if id > self.issued_floor {
+            self.issued_floor = id;
+        }
+    }
+    /// Refuse every spare below `id` from now on, and drop the pooled ones.
+    /// Called by a creation that is about to allocate `id` for itself because no
+    /// spare was available. Returns how many pooled spares were discarded.
+    pub fn set_issued_floor(&mut self, id: usize) -> usize {
+        if id <= self.issued_floor {
+            return 0;
+        }
+        self.issued_floor = id;
+        let before = self.spares.len();
+        let floor = id;
+        let mut dropped = VecDeque::new();
+        while let Some(mut wp) = self.spares.pop_front() {
+            if wp.pane_id < floor {
+                wp.child.kill().ok();
+            } else {
+                dropped.push_back(wp);
+            }
+        }
+        self.spares = dropped;
+        before - self.spares.len()
+    }
+    pub fn issued_floor(&self) -> usize {
+        self.issued_floor
+    }
+    pub fn len(&self) -> usize {
+        self.spares.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.spares.is_empty()
+    }
+    /// How many more spares should be spawned right now, counting the ones
+    /// already being spawned in the background.
+    pub fn deficit(&self) -> usize {
+        self.deficit_for(self.target)
+    }
+    /// `deficit` against a target other than the configured one. Callers pass
+    /// [`WarmPool::effective_target`], which is what applies the standby cap and
+    /// the surge allowance.
+    pub fn deficit_for(&self, target: usize) -> usize {
+        target.saturating_sub(self.spares.len() + self.inflight)
+    }
+    pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, WarmPane> {
+        self.spares.iter()
+    }
+    pub fn iter_mut(&mut self) -> std::collections::vec_deque::IterMut<'_, WarmPane> {
+        self.spares.iter_mut()
+    }
+    /// Kill and drop every spare. Used by every "the pool is now stale or the
+    /// server is going away" site; leaving a spare behind here is how orphan
+    /// shells get created.
+    pub fn kill_all(&mut self) {
+        let n = self.spares.len();
+        // The tree, not just the direct child: a spare's shell can already
+        // have children of its own, and TerminateProcess on the parent alone
+        // leaves those running (#686). One process snapshot for every spare:
+        // a tree kill per spare walked the whole process table each time, 9
+        // to 11 ms a walk, three walks on every kill-session with the default
+        // pool.
+        if n > 0 {
+            let mut children: Vec<&mut Box<dyn portable_pty::Child>> =
+                self.spares.iter_mut().map(|wp| &mut wp.child).collect();
+            crate::platform::process_kill::kill_process_trees_batch(&mut children);
+        }
+        self.spares.clear();
+        if n > 0 {
+            crate::warm_trace!("pool: killed {n} pooled spare(s)");
+        }
+    }
+    /// Empty the pool now and kill what was in it on a thread of its own.
+    ///
+    /// For a respawn on a live server (a claim adopting the client's
+    /// environment, an option change): the stale spares must leave the pool
+    /// before anything can claim them, but killing them is a process table
+    /// walk plus a pseudoconsole close each, and doing it on the loop thread
+    /// held up the claimed session's first frame by 15 to 20 ms. Each one is
+    /// registered with the in flight reaper until it is dead, so a teardown
+    /// that starts meanwhile still kills it. Teardown itself keeps using
+    /// [`WarmPool::kill_all`], which finishes before the process exits.
+    pub fn retire_all(&mut self) -> usize {
+        let mut spares: Vec<WarmPane> = self.spares.drain(..).collect();
+        let n = spares.len();
+        if n == 0 {
+            return 0;
+        }
+        let ids: Vec<usize> = spares.iter().map(|w| w.pane_id).collect();
+        let mut tearing_down = false;
+        for wp in &spares {
+            crate::warm_pane_sync::inflight::issue(wp.pane_id);
+            if !crate::warm_pane_sync::inflight::record_pid(wp.pane_id, wp.child_pid) {
+                tearing_down = true;
+            }
+        }
+        if tearing_down {
+            // Teardown has begun and is waiting on these ids: kill here.
+            let mut children: Vec<&mut Box<dyn portable_pty::Child>> =
+                spares.iter_mut().map(|w| &mut w.child).collect();
+            crate::platform::process_kill::kill_process_trees_batch(&mut children);
+            for id in &ids {
+                crate::warm_pane_sync::inflight::release(*id);
+            }
+            return n;
+        }
+        let started = std::thread::Builder::new()
+            .name("psmux-retire-spares".into())
+            .spawn(move || {
+                let mut children: Vec<&mut Box<dyn portable_pty::Child>> =
+                    spares.iter_mut().map(|w| &mut w.child).collect();
+                crate::platform::process_kill::kill_process_trees_batch(&mut children);
+                drop(spares);
+                for id in ids {
+                    crate::warm_pane_sync::inflight::release(id);
+                }
+            });
+        if started.is_err() {
+            // No thread: nothing else will release those ids, and the spares
+            // went with the closure. The reaper still holds their pids.
+            crate::warm_trace!("pool: retire thread failed to start");
+        }
+        n
+    }
+    /// Drop spares whose shell died while idling (#450). Returns how many were
+    /// removed so the caller can decide whether to log.
+    pub fn reap_dead(&mut self) -> usize {
+        let before = self.spares.len();
+        self.spares.retain_mut(|wp| matches!(wp.child.try_wait(), Ok(None)));
+        before - self.spares.len()
+    }
 }
 
 /// A pane extracted from this session for cross-session forwarding.
@@ -319,6 +1251,15 @@ pub struct ForwardedPane {
     pub cols: u16,
     /// Handle to the forwarding threads (so we can abort on kill).
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the forwarding thread once the target session connected the
+    /// I/O tunnel.
+    pub accepted: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the forwarding thread when the tunnel closed: the target dropped
+    /// the proxy pane or its server ended. Nobody can see or type into the
+    /// pane after that, so the reaper ends its child.
+    pub tunnel_closed: Arc<std::sync::atomic::AtomicBool>,
+    /// When the pane was extracted, for the accept timeout.
+    pub created: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -338,6 +1279,21 @@ pub struct Window {
     pub area: Rect,
     /// Per-window `window-size` override. `resize-window` sets this to manual.
     pub window_size: Option<String>,
+    /// Window scoped options written by `set-option -w -t <window>` (#648).
+    ///
+    /// tmux keeps one option table per window plus a `global_w_options` table,
+    /// and `options_get` walks from the window's table to the global one
+    /// (options.c). psmux had only the global store, so `-w` and `-g` selected
+    /// the same map: a write aimed at one window landed on every window AND on
+    /// the global, which is how the reporter's later panes inherited
+    /// `remain-on-exit on` and stopped closing.
+    ///
+    /// A name present here overrides the global store for THIS window only. A
+    /// missing name inherits, so `set -w -u` is just a removal and the window
+    /// goes back to following the global value. Reads go through
+    /// `crate::server::options::window_local_option` (borrowing, for the
+    /// render loop) or `resolve_window_option` (owning, for reporting).
+    pub window_options: std::collections::HashMap<String, String>,
     /// Activity flag: set when pane output is received while window is not active
     pub activity_flag: bool,
     /// Bell flag: set when a bell (\x07) is detected in a pane
@@ -351,7 +1307,8 @@ pub struct Window {
     /// True when the user has manually renamed this window (auto-rename won't override).
     /// Cleared when `set automatic-rename on` is explicitly set.
     pub manual_rename: bool,
-    /// Current position in the named layout cycle (0..4)
+    /// The last named layout applied, plus one (0: none yet, tmux
+    /// `lastlayout == -1`). See `layout::cycle_layout`.
     pub layout_index: usize,
     /// Per-pane MRU (most-recently-used) order: pane IDs ordered by recency.
     /// Front = most recently focused.  Used for:
@@ -394,6 +1351,27 @@ pub struct FloatingPane {
     /// Last `-P` position keyword (top-left/centre/...), kept so the float can
     /// be re-anchored when the terminal is resized. `None` for explicit coords.
     pub position: Option<String>,
+    /// new-pane -s/-S/-R: this float's own styles.
+    pub styles: FloatStyles,
+}
+
+/// A floating pane's own styles (tmux new-pane, cmd-split-window.c): `-s`
+/// sets its window-style and window-active-style, `-S` its
+/// pane-active-border-style, `-R` its pane-border-style. Empty means the
+/// session's option applies.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FloatStyles {
+    pub style: String,
+    pub active_border: String,
+    pub border: String,
+}
+
+/// What new-pane carries beyond position and size: `-e` variables for the new
+/// process and the float's own styles.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FloatExtras {
+    pub env: Vec<(String, String)>,
+    pub styles: FloatStyles,
 }
 
 /// A menu item for display-menu
@@ -464,6 +1442,9 @@ pub enum Mode {
         popup_pane: Option<Pane>,
         /// Scroll offset for static text popups (lines from top)
         scroll_offset: u16,
+        /// Frame title, border lines and styles (#792). Every renderer reads
+        /// the frame through `crate::popup::popup_frame_for`.
+        look: crate::popup::PopupLook,
     },
     /// Confirmation prompt before command
     ConfirmMode { 
@@ -476,6 +1457,13 @@ pub enum Mode {
         input: String,
         forward: bool,
     },
+    /// Copy-mode goto-line input (tmux `window_copy_goto_line`)
+    CopyGoto {
+        input: String,
+    },
+    /// A `command-prompt` opened by a copy mode key table binding; the pane
+    /// stays in copy mode while it is open (see `crate::copy_prompt`).
+    CopyCommandPrompt(Box<crate::copy_prompt::CopyCommandPrompt>),
     /// Big clock display (tmux clock-mode)
     ClockMode,
     /// Interactive buffer chooser (prefix =)
@@ -492,6 +1480,17 @@ pub enum Mode {
         edit_cursor: usize,
         filter: String,
     },
+}
+
+impl Mode {
+    /// True while the focused pane is in copy mode, whichever copy mode prompt
+    /// happens to be open. `copy_mode::in_copy_mode` is this question asked
+    /// about a whole `AppState`; this is it asked about the field alone, which
+    /// is what a caller holding `&mut app.windows` needs, since a call taking
+    /// `&AppState` would borrow the rest of the state along with it.
+    pub fn in_copy(&self) -> bool {
+        matches!(self, Mode::CopyMode | Mode::CopySearch { .. } | Mode::CopyGoto { .. } | Mode::CopyCommandPrompt(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -518,6 +1517,9 @@ pub struct CopyModeState {
     /// Mark and last-jump are pane-local like the rest of copy state (#498)
     pub mark: Option<(usize, u16, u16)>,
     pub last_jump: Option<(u8, char)>,
+    /// `toggle-position` is pane-local too, so a pane parked in copy mode keeps
+    /// its own answer while another pane is focused (#704)
+    pub hide_position: bool,
     /// true when the pane was in CopySearch (not CopyMode)
     pub in_search: bool,
     /// search input buffer (only meaningful when in_search == true)
@@ -544,7 +1546,7 @@ pub struct ShellEntry {
 pub struct AppState {
     pub windows: Vec<Window>,
     pub active_idx: usize,
-    /// While a temporary -t focus is applied (FocusTargetTemp), holds the
+    /// While a -t target is applied (a CtrlReq::Targeted request), holds the
     /// REAL user-visible active window index saved before the switch.
     /// Format evaluation uses it for "is this the active window" variables
     /// (#{window_active}, the `*` flag) so `display-message -t <win>` does
@@ -553,11 +1555,18 @@ pub struct AppState {
     /// temporary focus is in effect.
     pub temp_focus_saved_active: Option<usize>,
     pub mode: Mode,
+    /// Ids of panes in clock mode while another pane holds focus (#828).
+    /// Clock mode belongs to one pane in tmux (`window_pane_set_mode`), but
+    /// psmux keeps the live mode in `mode`, so the focused pane's clock is
+    /// `Mode::ClockMode` and every other pane's is parked here, the same
+    /// split `Pane::copy_state` gives copy mode.
+    pub clock_panes: Vec<usize>,
     pub escape_time_ms: u64,
     pub repeat_time_ms: u64,
     /// True when prefix mode was re-armed by a repeatable binding (not initial prefix press).
     pub prefix_repeating: bool,
-    pub prefix_key: (KeyCode, KeyModifiers),
+    /// None is tmux's KEYC_NONE: `set prefix None` turns the prefix off (#802).
+    pub prefix_key: Option<(KeyCode, KeyModifiers)>,
     pub prefix2_key: Option<(KeyCode, KeyModifiers)>,
     pub prediction_dimming: bool,
     /// allow-predictions: when on, do not force PSReadLine PredictionSource to
@@ -586,6 +1595,17 @@ pub struct AppState {
     /// scroll-enter-copy-mode: when off, mouse scroll at a shell prompt does NOT
     /// auto-enter copy mode.  Default: on (tmux parity).
     pub scroll_enter_copy_mode: bool,
+    /// mouse-drag-enter-copy-mode: when on, dragging with the left button
+    /// in a pane that does not track the mouse enters copy mode and selects
+    /// there (tmux's MouseDragStart -> `copy-mode -M`) instead of painting
+    /// the client-side selection overlay.  Default: off (keep the
+    /// client-side selection, which copies on release).
+    pub mouse_drag_enter_copy_mode: bool,
+    /// ctrl-wheel-zoom: when on, a wheel notch with exactly Ctrl held in a
+    /// client hosted by Windows Terminal is handed back to that terminal as
+    /// its font zoom key instead of scrolling the pane.  psmux specific, no
+    /// tmux equivalent.  Default: off.
+    pub ctrl_wheel_zoom: bool,
     /// pwsh-mouse-selection: when on, client-side drag selection behaves like
     /// Windows 11 PowerShell — pane-aware clipping, no copy-on-release (copy
     /// only on right-click), word/line selection on double/triple-click.
@@ -612,11 +1632,15 @@ pub struct AppState {
     /// open with the live preview pane already visible (no need to press `p`).
     /// Default: off (matches tmux which has no preview-on-by-default option).
     pub choose_tree_preview: bool,
-    pub paste_buffers: Vec<String>,
+    /// Automatic paste buffers, newest first. Each keeps the name it was given
+    /// when it was added (`paste_add`), so a newer buffer never renames an
+    /// older one (issue #818).
+    pub paste_buffers: Vec<PasteBuffer>,
     /// Named paste buffers (HashMap<name, content>). Named buffers are separate
-    /// from the positional stack and are accessed via `set-buffer -b name`.
+    /// from the automatic stack and are made by `set-buffer -b name`.
     pub named_buffers: std::collections::HashMap<String, String>,
-    /// Auto-increment counter for unnamed buffer names (buffer0, buffer1, etc.)
+    /// The number the next automatic buffer is named with, `buffer<n>`. It only
+    /// goes up (tmux's paste_next_index, paste.c:178).
     pub paste_next_index: u32,
     pub status_left: String,
     pub status_right: String,
@@ -632,9 +1656,46 @@ pub struct AppState {
     pub copy_anchor: Option<(u16,u16)>,
     /// Scroll offset when copy_anchor was set (for viewport-relative adjustment)
     pub copy_anchor_scroll_offset: usize,
+    /// The view position that makes `copy_pos`'s screen row mean a specific
+    /// CONTENT line, when that is not the position the view is parked on now.
+    ///
+    /// `None` is the ordinary case and it means "read this endpoint against the
+    /// current offset".  Every route that moves the endpoint leaves it there,
+    /// because it puts the endpoint on a row of the view the user is looking
+    /// at: a cursor motion, `v` / `V` / `o`, a `send-keys -X` verb, a scroll.
+    ///
+    /// A mouse drag is the one exception, so it is the only thing that sets
+    /// this.  Dragging on or past the pane's first or last row records the
+    /// endpoint and THEN auto-scrolls the view (`scroll_copy_up` /
+    /// `scroll_copy_down`), so for the rest of that gesture the endpoint's row
+    /// belongs to the view it was measured in, not to the one now on screen.
+    /// Reading it against the current offset put it on the wrong content line
+    /// and the release yanked a different range than the client had painted.
+    ///
+    /// It used to be a plain `usize` that every endpoint write had to keep up
+    /// to date.  Nine mouse handlers did and roughly ninety other call sites
+    /// did not, so a keyboard selection made after scrolling resolved its
+    /// endpoint against the live bottom of the buffer and copied a range
+    /// displaced by the scroll offset.  `None` makes the common case correct
+    /// by default and leaves the pin to the one gesture that needs it.
+    pub copy_pos_scroll_offset: Option<usize>,
     pub copy_pos: Option<(u16,u16)>,
     /// Cell where mouse was pressed down in copy mode (for click vs drag detection, #199)
     pub copy_mouse_down_cell: Option<(u16,u16)>,
+    /// The copy-mode endpoint of the last frame this server sent, i.e. the
+    /// last cell it told a client to paint the selection at.
+    ///
+    /// Only the RAW mouse protocol reads this (`remote_mouse_up`): a client
+    /// that forwards the terminal's reports verbatim cannot say what it
+    /// painted, so a final motion that arrives together with the release — a
+    /// slip while the button comes up, a phone's coarse last report, coalesced
+    /// motion — is dropped by yanking to this instead of to `copy_pos`.  The
+    /// semantic protocol (`pane-mouse`) does not need it: there the client
+    /// re-reports the endpoint it actually painted just before the release
+    /// (`copy_release_repin` in client.rs), which is the cell the user saw.
+    /// `None` means no frame carried this gesture's selection, so the release
+    /// falls back to `copy_pos`.
+    pub copy_pos_published: Option<(u16,u16)>,
     pub copy_scroll_offset: usize,
     /// Selection mode: Char (default), Line (V), Rect (C-v)
     pub copy_selection_mode: SelectionMode,
@@ -664,9 +1725,54 @@ pub struct AppState {
     /// Last f/F/t/T jump as (kind, char), so `;` (jump-again) and `,`
     /// (jump-reverse) can repeat it (#498).
     pub copy_last_jump: Option<(u8, char)>,
-    /// When true the pane keeps following live output while in copy mode
-    /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
+    /// Automatic refresh of the copy-mode snapshot from the live pane, tmux's
+    /// `refresh-on` / `refresh-off` / `refresh-toggle` (window-copy.c
+    /// `refresh_active`). Off by default. The one shot `refresh-from-pane`,
+    /// which `r` runs, does not touch it (#498, discussion #694).
     pub copy_refresh_live: bool,
+    /// The pane `data_version` the snapshot was last re-cloned at, so the
+    /// automatic refresh only rebuilds it when the pane printed something.
+    pub copy_refresh_version: u64,
+    /// Where the cursor sits in the copy-mode search or goto-line prompt, or in
+    /// a prompt opened by a copy mode binding, counted in characters back from
+    /// the end of the input, so text typed at the end (the common case) needs
+    /// no bookkeeping. tmux keeps it as `prompt_index` (prompt.c) (discussion
+    /// #694).
+    pub copy_prompt_back: usize,
+    /// What C-w last cut at the prompt the server has open (the copy mode
+    /// search, goto line and binding prompts, and the server's command
+    /// prompt), for C-y to insert again. tmux keeps it as `prompt_saved`
+    /// (status.c:1583) and drops it when the prompt closes (status.c:764), so
+    /// it is cleared whenever one of these prompts opens.
+    pub prompt_saved: Option<String>,
+    /// Earlier copy-mode searches, oldest first, for Up and Down in the search
+    /// prompt (tmux's per type prompt history, prompt.c `prompt_up_history`).
+    pub copy_search_history: Vec<String>,
+    /// The history entry Up and Down are on while the prompt is open.
+    pub copy_search_history_pos: Option<usize>,
+    /// Whether the search matches are drawn highlighted. tmux keeps them
+    /// (`searchmark`) from a search until a command marked CLEAR_ALWAYS runs,
+    /// such as begin-selection, clear-selection, rectangle-toggle or set-mark
+    /// (window-copy.c `window_copy_command`) (discussion #694).
+    pub copy_search_marks: bool,
+    /// When true the copy-mode position indicator is not drawn. Toggled by `P`
+    /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
+    /// on the mode the way tmux's `hide_position` does, so leaving copy mode
+    /// and coming back shows the indicator again.
+    pub copy_hide_position: bool,
+    /// Set by a copy-mode command that changes only how the mode is drawn, with
+    /// nothing in the pane or the layout to notice. The server loop turns it
+    /// into one frame and clears it. tmux says the same thing by returning
+    /// `WINDOW_COPY_CMD_REDRAW` from the command (#704).
+    pub copy_needs_redraw: bool,
+    /// Options a `set-option` on the server's own command path (a hook, a key
+    /// binding, a menu, confirm-before) wrote in process. The value is already
+    /// in place; the server loop runs what a client's set-option request runs
+    /// after the write (warm pane, command-alias, pane-border-status, a fresh
+    /// frame) and clears the list. The command used to send itself back to the
+    /// server as well, so the write happened twice: `set -ga` appended twice
+    /// and a bare `set -g mouse` toggled straight back.
+    pub in_process_option_writes: Vec<String>,
     /// Named registers a-z for copy-mode yank/paste
     pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
@@ -715,6 +1821,15 @@ pub struct AppState {
     pub latest_size_client_id: Option<u64>,
     /// Client registry: all active PERSISTENT and CONTROL clients.
     pub client_registry: std::collections::HashMap<u64, ClientInfo>,
+    /// A `command-prompt` run from the command line, waiting for the client it
+    /// targets to open it (#789 follow up). It rides in every state frame until
+    /// that client reports the prompt closed with `prompt-done <id>`.
+    pub prompt_request: Option<PromptRequest>,
+    /// The id the next prompt request gets.
+    pub prompt_request_seq: u64,
+    /// The command lines waiting for their prompt (no `-b`), by request id:
+    /// each gets its reply when the prompt closes, as tmux's client waits.
+    pub prompt_waiters: Vec<(u64, std::sync::mpsc::Sender<String>)>,
     pub created_at: chrono::DateTime<Local>,
     pub next_win_id: usize,
     pub next_pane_id: usize,
@@ -732,7 +1847,10 @@ pub struct AppState {
     pub wait_channels: std::collections::HashMap<String, WaitChannel>,
     /// Pipe pane processes
     pub pipe_panes: Vec<PipePaneState>,
-    /// Last active window index (for last-window command)
+    /// Vec position of the last window (last-window, `!`, the `-` flag).
+    /// [`NO_LAST_WINDOW`] until a window has been left: a fresh session has
+    /// none, and tmux reports none (#601 follow up). Read it through
+    /// [`AppState::last_window_pos`], which also refuses the current window.
     pub last_window_idx: usize,
     /// Last active pane path (for last-pane command)
     pub last_pane_path: Vec<usize>,
@@ -769,6 +1887,9 @@ pub struct AppState {
     pub allow_rename: bool,
     /// allow-set-title: allow programs to set pane title via OSC 0/2 escape sequences
     pub allow_set_title: bool,
+    /// program-status: accept OSC 7501 reports and answer its capability
+    /// query. Off by default; mirrored into `PROGRAM_STATUS_ENABLED`.
+    pub program_status: bool,
     /// monitor-activity / visual-activity: stored for compat
     pub monitor_activity: bool,
     pub visual_activity: bool,
@@ -792,14 +1913,31 @@ pub struct AppState {
     pub update_environment: Vec<String>,
     /// Environment variables set via set-environment
     pub environment: std::collections::HashMap<String, String>,
+    /// Removal markers, hidden entries and shadowed global values that
+    /// `environment` cannot express (tmux global vs session scopes, #775).
+    pub env_scopes: crate::environ::EnvScopes,
     /// User/plugin options (@-prefixed, tmux convention).
     /// Stored separately from `environment` so they are NOT passed as
     /// shell environment variables to child panes (#105).
     pub user_options: std::collections::HashMap<String, String>,
+    /// User options in tmux's GLOBAL window table (`set -gw @name`), which
+    /// every window inherits from before the session chain is consulted
+    /// (format.c format_find). A window's own `@name` lives in
+    /// `Window::window_options`.
+    pub global_window_user_options: std::collections::HashMap<String, String>,
     /// Tracks which options have been explicitly set by the user or config.
     /// Used by set-option -o (only-if-unset) to distinguish defaults from
     /// explicitly configured values.
     pub user_set_options: std::collections::HashSet<String>,
+    /// The session's own option table (#803), kept as the GLOBAL values it
+    /// shadows. psmux runs one session per server, so the typed fields above
+    /// already hold what the session uses: its own value when it set one, the
+    /// global otherwise, which is tmux's options_get walk from the session
+    /// table to its parent. An entry here means "this session overrides
+    /// `name`" and holds what `show -g` reports and `set -u` falls back to:
+    /// `Some(value)` for a global somebody set, `None` for the built in
+    /// default. See options::apply_set_session_option.
+    pub session_option_globals: std::collections::HashMap<String, Option<String>>,
     /// pane-border-style: style for inactive pane borders
     pub pane_border_style: String,
     /// pane-active-border-style: style for active pane borders
@@ -858,10 +1996,12 @@ pub struct AppState {
     pub format_shell_cache: std::sync::Mutex<std::collections::HashMap<String, ShellEntry>>,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
-    /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
-    pub main_pane_width: u16,
-    /// main-pane-height: percentage for main pane in main-horizontal layout (0 = use 60% heuristic)
-    pub main_pane_height: u16,
+    /// main-pane-width as written: cells or `N%` of the window less the
+    /// border (tmux options-table.c default "80", layout_set_main_v).
+    pub main_pane_width: String,
+    /// main-pane-height as written: cells or `N%` (tmux default "24",
+    /// layout_set_main_h).
+    pub main_pane_height: String,
     /// status-left-length: max display width for status-left (default 10)
     pub status_left_length: usize,
     /// status-right-length: max display width for status-right (default 40)
@@ -881,15 +2021,45 @@ pub struct AppState {
     pub copy_command: String,
     /// command-alias: map of alias name to expansion
     pub command_aliases: std::collections::HashMap<String, String>,
+    /// codepoint-widths: server-scope ARRAY of Unicode width overrides, one
+    /// entry per element in tmux order (later entries win). Stored as the raw
+    /// entry strings so `show-options` can echo them back verbatim; the parsed
+    /// lookup table lives in the vt100 crate, which is where every width
+    /// decision is made.
+    pub codepoint_widths: Vec<String>,
+    /// terminal-overrides: server-scope ARRAY of `pattern:cap...` entries,
+    /// raw strings in tmux order. The attach client honours smcup/rmcup from
+    /// it (issue #700, see crate::terminal_overrides).
+    pub terminal_overrides: Vec<String>,
     /// Config parse warnings (unknown command/option, malformed value, missing
     /// args) collected during a config load or source-file, surfaced to the
     /// user instead of being silently ignored (issue #370 follow-up).
     pub config_warnings: Vec<String>,
+    /// Source jobs (issue #842) that have not reported yet. While one runs, a
+    /// new source adds its warnings to `config_warnings` instead of starting
+    /// the list over, and a job that finishes adds its own, so two sources
+    /// that overlap both stay in the list and in config-warnings.log.
+    pub source_jobs_running: usize,
     /// 1-based line number currently being parsed, used to prefix warnings as
     /// `file:line: message` (file comes from config::current_config_file()).
     /// None when parsing a single runtime command.
     pub config_warn_line: Option<usize>,
-    /// set-clipboard: "on", "off", "external" (default "on")
+    /// Set while a runtime source-file or the startup config is parsed
+    /// (config::source_runtime, config::load_config): from the file's first
+    /// command on, its lines are kept here in order for the source job instead
+    /// of being applied or dropped (issue #842). None for every other parse.
+    pub source_defer: Option<SourceDefer>,
+    /// The lines the startup config kept for its source job: load_config
+    /// fills it, and the server starts the job once its loop can answer the
+    /// job's requests (start_startup_config_job).
+    pub startup_source_lines: Vec<DeferredConfigLine>,
+    /// This server is a session that a config file's `new-session` made
+    /// (CONFIG_SESSION_ENV). tmux runs its config once, in the server that
+    /// session shares, so its startup job runs only the commands whose effect
+    /// is server wide there (config::made_session_runs). Without it a config
+    /// with `new-session -d` would start servers without end.
+    pub config_made_session: bool,
+    /// set-clipboard: "on", "off", "external" (fork default "on")
     pub set_clipboard: String,
     /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
     pub clipboard_osc52: Option<String>,
@@ -923,6 +2093,11 @@ pub struct AppState {
     /// Transient status-bar message from display-message (without -p).
     /// Tuple of (message_text, timestamp_when_set, optional per_message_duration_ms).
     pub status_message: Option<(String, std::time::Instant, Option<u64>)>,
+    /// The timestamp of a `display-message -N` status message: key presses
+    /// leave THAT message up until its delay expires (cmd-display-message.c
+    /// Nflag -> status_message_set ignore_keys). Compared against the
+    /// message's own Instant so any later message is not affected.
+    pub status_message_ignore_keys: Option<std::time::Instant>,
     /// Whether warm pane/server pre-spawning is enabled (default: on).
     /// When off, new sessions/windows always cold-spawn a fresh shell.
     pub warm_enabled: bool,
@@ -933,18 +2108,76 @@ pub struct AppState {
     /// by `capture-pane -S` and copy-mode (psmux issue #88).  Mirrors
     /// tmux's `set -g alternate-screen on/off`.
     pub allow_alternate_screen: bool,
-    /// Pre-spawned warm pane: shell already loaded, ready for instant new-window.
-    pub warm_pane: Option<WarmPane>,
+    /// Pool of pre spawned spare shells, ready for an instant new-window or
+    /// split. Depth comes from the `warm-pool-size` option; see [`WarmPool`].
+    pub warm_pane: WarmPool,
+    /// Startup hold on background shell spawns, see [`BootHold`]. `Some` only
+    /// from the first window's creation until its shell has started.
+    pub boot_hold: Option<BootHold>,
+    /// After the boot hold releases, the pool starts one spare at a time
+    /// until one is ready or somebody claims. See [`BootHold`].
+    pub pool_trickle: bool,
+    /// Where a finished background spare is posted back to the server loop.
+    /// Held here rather than only in `run_server` so a claim can schedule its
+    /// own refill the moment it happens: the claim that misses goes on to cold
+    /// spawn, which blocks the loop for a whole shell startup, and a refill
+    /// scheduled after that is a refill scheduled far too late.
+    pub warm_refill_tx: Option<std::sync::mpsc::Sender<Option<WarmPane>>>,
+    /// The matching receiver, so a claim that found nothing can wait for a spare
+    /// that is already on its way instead of spawning a further shell. Taken out
+    /// and put back around each use, as `control_rx` is.
+    pub warm_refill_rx: Option<std::sync::mpsc::Receiver<Option<WarmPane>>>,
     /// Plugin .ps1 scripts queued during config loading for post-startup execution.
     /// These need the server to be running (TCP listener) before they can apply.
+    /// run_server starts them after the startup load, and a warm claim after
+    /// its reply; a config line the server parses later (a source job's
+    /// replay, a runtime source) starts those it queues at once
+    /// (server::spawn_plugin_scripts).
     pub pending_plugin_scripts: Vec<String>,
+    /// The config declared ppm (`set -g @plugin '.../ppm'`). ppm runs the
+    /// entry script of each declared plugin that has no plugin.conf, so psmux
+    /// then leaves those scripts to it. Cleared by each load_config.
+    pub ppm_declared: bool,
     /// Connected control mode clients (keyed by client_id).
     pub control_clients: HashMap<u64, ControlClient>,
+    /// Clients that set `refresh-client -f ignore-size` (tmux
+    /// CLIENT_IGNORESIZE): left out of the window size while any attached
+    /// client has not set it (resize.c ignore_client_size, #825).
+    pub ignore_size_clients: HashSet<u64>,
+    /// The window list as control clients were last told about it
+    /// (control::sync_window_changes), so any change, whatever made it, is
+    /// announced once (#811).
+    pub control_windows_seen: Option<crate::control::WindowSnapshot>,
     /// Session group name (set by `new-session -t target` for tmux group semantics).
     /// Sessions in the same group logically share a window list.
     pub session_group: Option<String>,
     /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a).
     pub defaults_suppressed: bool,
+    /// Built-in copy-mode keys the user took away with `unbind -T copy-mode-vi
+    /// <key>` (or `-T copy-mode`, or `unbind -a -T` on either table), keyed by
+    /// table name and normalised key. tmux holds its copy-mode defaults in real
+    /// key tables, so unbinding one leaves the key doing nothing; psmux's
+    /// built-in handlers consult this set to do the same, and `list-keys` leaves
+    /// these keys out. Cleared whenever the default bindings are re-seeded.
+    pub copy_mode_defaults_unbound: std::collections::HashSet<(String, (KeyCode, KeyModifiers))>,
+    /// The mouse event a user mouse binding is running for, so `send-keys -M`
+    /// in that binding can hand it to the pane: (pane id, SGR button with
+    /// modifier bits, press, pointer cell, when).
+    pub last_mouse_event: Option<(usize, u8, bool, Option<(i16, i16)>, std::time::Instant)>,
+    /// The config file the server loaded at startup (the -f /
+    /// PSMUX_CONFIG_FILE override or the first default path that existed).
+    /// A runtime source-file of THIS file is a config reload and starts from
+    /// the default bindings; any other file only adds, as in tmux.
+    pub startup_config_file: Option<String>,
+    /// tmux's click timer (server-client.c click_timer): the pane, the cell
+    /// of the last left press in it, how many presses so far (1 or 2) and
+    /// when the timer runs out. A second press inside the window is
+    /// SecondClick1Pane; a third is TripleClick1Pane; the timer running out
+    /// after a second press is DoubleClick1Pane.
+    pub click_state: Option<(usize, (i16, i16), u8, std::time::Instant)>,
+    /// When the built-in double / triple click finishes (tmux's
+    /// `run -d0.3 ; send -X copy-pipe-and-cancel`): copy and leave copy mode.
+    pub click_finish_at: Option<std::time::Instant>,
     /// Panes extracted for cross-session forwarding, keyed by forward_id.
     /// The source server keeps these alive so the real ConPTY continues running.
     pub forwarded_panes: HashMap<u64, ForwardedPane>,
@@ -973,7 +2206,237 @@ impl WindowTarget {
     }
 }
 
+/// Where a `new-window` goes: its raw `-t` and the flags that decide the
+/// index (tmux cmd-new-window.c, flag set `abc:de:EF:kn:PSt:T:`).
+///
+/// tmux resolves the `-t` with `CMD_FIND_WINDOW_INDEX`, so `sess:N` naming no
+/// window is the index the new window takes. psmux used to validate that `-t`
+/// as an EXISTING window and dropped the command at exit 0 when none held N,
+/// and the server always appended, so `-t sess:N`, `-a`, `-b`, `-k` and `-S`
+/// all did nothing tmux does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewWindowPlacement {
+    /// The raw `-t` value (`sess:N`, `:N`, `N`, `sess`, `sess:name`, ...).
+    pub target: Option<String>,
+    /// `-a`: insert after the target window, shuffling the ones above up.
+    pub after: bool,
+    /// `-b`: insert before the target window, shuffling it and those above up.
+    pub before: bool,
+    /// `-k`: an index already in use is replaced rather than refused.
+    pub kill: bool,
+    /// `-S`: with `-n` and no index, select the window of that name if any.
+    pub select_existing: bool,
+}
+
+impl NewWindowPlacement {
+    /// Read the placement flags out of a new-window argument list. `-t` is
+    /// taken from `outer_target` when the route already peeled it off.
+    pub fn from_args(args: &[&str], outer_target: Option<&str>) -> Self {
+        let mut p = NewWindowPlacement { target: outer_target.map(|t| t.to_string()), ..Default::default() };
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            if a == "--" { break; }
+            // Value taking flags: skip the value so it is never read as a flag.
+            if matches!(a, "-c" | "-e" | "-F" | "-n" | "-T") { i += 2; continue; }
+            if a == "-t" {
+                if let Some(v) = args.get(i + 1) { p.target = Some(v.trim_matches('"').to_string()); }
+                i += 2;
+                continue;
+            }
+            if a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c.is_ascii_alphabetic()) {
+                for c in a[1..].chars() {
+                    match c {
+                        'a' => p.after = true,
+                        'b' => p.before = true,
+                        'k' => p.kill = true,
+                        'S' => p.select_existing = true,
+                        _ => {}
+                    }
+                    // A value flag inside a cluster ends it (its value follows).
+                    if matches!(c, 'c' | 'e' | 'F' | 'n' | 'T' | 't') { break; }
+                }
+            } else if !a.starts_with('-') {
+                // First positional: the shell command, nothing after it is a flag.
+                break;
+            }
+            i += 1;
+        }
+        p
+    }
+}
+
+/// What a `new-window` resolved to before anything is spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewWindowPlan {
+    /// `-S -n name` found that window: select it (None with `-d`).
+    SelectExisting(Option<usize>),
+    /// Spawn a window. `index` is its display index (None: the next free one),
+    /// `kill_pos` the Vec position of the window `-k` replaces.
+    Create { index: Option<usize>, kill_pos: Option<usize> },
+}
+
+/// An automatic paste buffer and the name it got when it was added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasteBuffer {
+    pub name: String,
+    pub data: String,
+}
+
+impl PartialEq<&str> for PasteBuffer {
+    fn eq(&self, other: &&str) -> bool { self.data == *other }
+}
+
+impl PartialEq<str> for PasteBuffer {
+    fn eq(&self, other: &str) -> bool { self.data == other }
+}
+
+impl PartialEq<String> for PasteBuffer {
+    fn eq(&self, other: &String) -> bool { &self.data == other }
+}
+
+/// How many automatic buffers are kept; the oldest goes first.
+pub const PASTE_BUFFER_LIMIT: usize = 10;
+
 impl AppState {
+    /// Whether a buffer of this name exists, automatic or named.
+    pub fn paste_name_in_use(&self, name: &str) -> bool {
+        self.named_buffers.contains_key(name) || self.paste_buffers.iter().any(|b| b.name == name)
+    }
+
+    /// Add an automatic buffer, as tmux's paste_add does (paste.c:160 to
+    /// :208): empty data adds nothing, the oldest automatic buffer goes when
+    /// the limit is reached, and the new one is named `buffer<n>` from a
+    /// counter that only goes up, skipping any name in use.
+    pub fn paste_add(&mut self, data: String) {
+        if data.is_empty() {
+            return;
+        }
+        while self.paste_buffers.len() >= PASTE_BUFFER_LIMIT {
+            if let Some(old) = self.paste_buffers.pop() {
+                self.paste_notify(false, old.name);
+            }
+        }
+        let name = loop {
+            let n = format!("buffer{}", self.paste_next_index);
+            self.paste_next_index = self.paste_next_index.wrapping_add(1);
+            if !self.paste_name_in_use(&n) {
+                break n;
+            }
+        };
+        self.paste_buffers.insert(0, PasteBuffer { name: name.clone(), data });
+        self.paste_notify(true, name);
+    }
+
+    /// Tell control clients a buffer changed or went away, as paste.c's
+    /// paste_fire_event does for every add, set, rename and free (#813).
+    fn paste_notify(&self, changed: bool, name: String) {
+        if self.control_clients.is_empty() {
+            return;
+        }
+        let notif = if changed {
+            ControlNotification::PasteBufferChanged { name }
+        } else {
+            ControlNotification::PasteBufferDeleted { name }
+        };
+        crate::control::emit_notification(self, notif);
+    }
+
+    /// Tests: make the automatic buffers exactly these, newest first, named as
+    /// if they had been added one by one from the oldest.
+    #[cfg(test)]
+    pub fn paste_set_stack(&mut self, newest_first: &[&str]) {
+        self.paste_buffers.clear();
+        for d in newest_first.iter().rev() {
+            self.paste_add(d.to_string());
+        }
+    }
+
+    /// The newest automatic buffer's data (tmux's paste_get_top, which skips
+    /// named buffers, paste.c:107).
+    pub fn paste_top(&self) -> Option<&str> {
+        self.paste_buffers.first().map(|b| b.data.as_str())
+    }
+
+    /// A buffer's data by name, automatic or named (tmux's paste_get_name,
+    /// paste.c:124).
+    pub fn paste_get(&self, name: &str) -> Option<&str> {
+        if let Some(b) = self.paste_buffers.iter().find(|b| b.name == name) {
+            return Some(b.data.as_str());
+        }
+        self.named_buffers.get(name).map(String::as_str)
+    }
+
+    /// Store `data` under `name`, replacing any buffer of that name, automatic
+    /// or named, as tmux's paste_set does (paste.c:269 to :316). Empty data
+    /// changes nothing.
+    pub fn paste_set(&mut self, name: &str, data: String) {
+        if data.is_empty() {
+            return;
+        }
+        // paste_set frees a buffer of the same name first (paste.c:293).
+        let before = self.paste_buffers.len();
+        self.paste_buffers.retain(|b| b.name != name);
+        let replaced = self.paste_buffers.len() != before;
+        if self.named_buffers.insert(name.to_string(), data).is_some() || replaced {
+            self.paste_notify(false, name.to_string());
+        }
+        self.paste_notify(true, name.to_string());
+    }
+
+    /// Delete the buffer of this name. False when there is none.
+    pub fn paste_delete(&mut self, name: &str) -> bool {
+        let found = if let Some(i) = self.paste_buffers.iter().position(|b| b.name == name) {
+            self.paste_buffers.remove(i);
+            true
+        } else {
+            self.named_buffers.remove(name).is_some()
+        };
+        if found {
+            self.paste_notify(false, name.to_string());
+        }
+        found
+    }
+
+    /// Every buffer as list-buffers prints it, `name: size bytes: "sample"`,
+    /// the automatic ones newest first and then the named ones by name.
+    /// `escape` writes line breaks in the sample as `\n`, for the chooser,
+    /// which reads one buffer per line.
+    pub fn paste_listing(&self, escape: bool) -> String {
+        let line = |name: &str, data: &str| {
+            let preview: String = data.chars().take(50).collect();
+            let preview = if escape { preview.replace('\n', "\\n").replace('\r', "") } else { preview };
+            format!("{}: {} bytes: \"{}\"\n", name, data.len(), preview)
+        };
+        let mut output = String::new();
+        for b in &self.paste_buffers {
+            output.push_str(&line(&b.name, &b.data));
+        }
+        let mut names: Vec<&String> = self.named_buffers.keys().collect();
+        names.sort();
+        for name in names {
+            output.push_str(&line(name, &self.named_buffers[name]));
+        }
+        output
+    }
+
+    /// After a copy made a new top buffer, append it to the buffer that was on
+    /// top before (`prev`, its name) instead of keeping both, as tmux's
+    /// append-selection does: it adds the selection to the top buffer
+    /// (window_copy_append_selection). Nothing happens if the copy added no
+    /// buffer or there was none before it.
+    pub fn paste_append_new_top_to(&mut self, prev: Option<String>) {
+        let Some(prev) = prev else { return };
+        if self.paste_buffers.first().map(|b| b.name != prev).unwrap_or(false) {
+            let new = self.paste_buffers.remove(0);
+            self.paste_notify(false, new.name.clone());
+            if let Some(b) = self.paste_buffers.iter_mut().find(|b| b.name == prev) {
+                b.data.push_str(&new.data);
+                self.paste_notify(true, prev);
+            }
+        }
+    }
+
     /// Whether this is the hidden `__warm__` pre-spawn server: a server started
     /// ahead of time so the next `new-session` can claim it instead of paying a
     /// cold-start. It has no client and no visible session until it is claimed
@@ -982,6 +2445,14 @@ impl AppState {
     /// client-attached/session-created hooks, and the like.
     pub fn is_warm_server(&self) -> bool {
         self.session_name == "__warm__"
+    }
+
+    /// Whether this is a HELD standby (issue #734): unclaimed with
+    /// `exit-empty` off, so untargeted commands reach it as the namespace's
+    /// empty server. Its window and pane are the next session's, not a
+    /// session the user has, so commands it answers see no session.
+    pub fn is_held_standby(&self) -> bool {
+        self.is_warm_server() && !self.exit_empty
     }
 
     /// Whether this server should run the periodic `status-interval` timer,
@@ -1042,11 +2513,25 @@ impl AppState {
     /// the registry entry is naturally unique while the counter is not.
     /// Returns `true` only when a new registry entry was inserted.
     pub fn register_client(&mut self, cid: u64, is_control: bool) -> bool {
+        self.register_client_with_pid(cid, is_control, None)
+    }
+
+    /// [`register_client`](Self::register_client) for a client whose process
+    /// id is known, which then also names it.
+    ///
+    /// tmux names a client after its tty, which is unique on the machine and
+    /// stays the same when the client switches session. psmux clients have no
+    /// tty, and the connection id this name used to be built from is only
+    /// unique inside ONE session's server: two sessions each had a
+    /// `/dev/pts/6`, so `display-message -c /dev/pts/6` could not say which
+    /// one it meant (issue #724). The client's pid has both of tmux's
+    /// properties, so it is the number in the name whenever it is known.
+    pub fn register_client_with_pid(&mut self, cid: u64, is_control: bool, pid: Option<u32>) -> bool {
         if self.client_registry.contains_key(&cid) {
             return false;
         }
 
-        let tty = format!("/dev/pts/{}", cid);
+        let tty = client_tty_name(cid, pid);
         self.client_registry.insert(cid, ClientInfo {
             id: cid,
             width: self.client_area.width,
@@ -1056,6 +2541,9 @@ impl AppState {
             tty_name: tty,
             is_control,
             last_session: None,
+            pid: pid.unwrap_or(0),
+            readonly: false,
+            focused: false,
         });
         self.attached_clients = self.attached_clients.saturating_add(1);
         // Preserve the existing distinction between an interactive TUI client
@@ -1065,6 +2553,22 @@ impl AppState {
             self.latest_client_id = Some(cid);
         }
         true
+    }
+
+    /// A prompt request is over (answered, cancelled, or its client is gone):
+    /// forget it and release the command line waiting for it, if any.
+    pub fn finish_prompt_request(&mut self, id: u64) {
+        if self.prompt_request.as_ref().is_some_and(|r| r.id == id) {
+            self.prompt_request = None;
+        }
+        self.prompt_waiters.retain(|(wid, tx)| {
+            if *wid == id {
+                let _ = tx.send(String::new());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Reap a dead client's `client_registry` entry exactly once, keeping the
@@ -1079,11 +2583,35 @@ impl AppState {
     /// `ClientAttach` incrementing and inserting together).
     pub fn reap_client(&mut self, cid: u64) -> bool {
         self.client_sizes.remove(&cid);
+        self.ignore_size_clients.remove(&cid);
+        // A prompt request for a client that is gone can never be answered:
+        // drop it and let the command line waiting on it go.
+        if self.prompt_request.as_ref().is_some_and(|r| r.client_id == cid) {
+            if let Some(req) = self.prompt_request.take() {
+                self.finish_prompt_request(req.id);
+            }
+        }
         if self.client_registry.remove(&cid).is_some() {
             self.attached_clients = self.attached_clients.saturating_sub(1);
             self.client_prefix_active = false;
+            // A detaching client takes its `switch-client -T` latch with it
+            // (issue #640): the next client starts in the default table.
+            self.current_key_table = None;
             if self.latest_client_id == Some(cid) {
                 self.latest_client_id = self.client_registry.keys().max().copied();
+            }
+            // Record whether the connection was still tracked at reap time.
+            // That is the normal order for a detach the client asked for
+            // (`client-detach` on its own connection, prefix d): the registry
+            // entry goes first and the client closes the socket itself right
+            // after. It is only a fault when no such request precedes it and
+            // no `client-reader` line follows, which is the deaf client that
+            // `teardown_client_connection` exists to prevent.
+            if has_persistent_stream(cid) {
+                crate::debug_log::server_log(
+                    "client-reap",
+                    &format!("client {cid}: registry entry reaped, stream still registered (expected for a client initiated detach)"),
+                );
             }
             true
         } else {
@@ -1147,6 +2675,95 @@ impl AppState {
         for wi in self.window_indices.iter_mut() {
             if *wi >= idx { *wi += 1; }
         }
+    }
+
+    /// tmux's `winlink_shuffle_up` exactly: free the index after (or, with
+    /// `before`, at) the window at Vec position `pos` by moving the run of
+    /// windows that starts there up by one, stopping at the first gap. Windows
+    /// above that gap keep their numbers. Returns the freed display index.
+    pub fn shuffle_up_at(&mut self, pos: usize, before: bool) -> Option<usize> {
+        if pos >= self.windows.len() { return None; }
+        if !self.window_indices_valid() {
+            let base = self.window_base_index;
+            self.window_indices = (0..self.windows.len()).map(|i| i + base).collect();
+        }
+        let base_idx = self.window_indices[pos];
+        let idx = if before { base_idx } else { base_idx.checked_add(1)? };
+        let mut last = idx;
+        while self.win_pos(last).is_some() { last = last.checked_add(1)?; }
+        for wi in self.window_indices.iter_mut() {
+            if *wi >= idx && *wi < last { *wi += 1; }
+        }
+        Some(idx)
+    }
+
+    /// Resolve a `new-window` the way tmux's cmd_new_window_exec does, up to
+    /// (not including) the spawn: the `-t` window part, `-S`, the `-a`/`-b`
+    /// shuffle and the "index N in use" check. The shuffle is applied here,
+    /// as tmux applies it before spawn_window. The error is what tmux prints.
+    pub fn plan_new_window(
+        &mut self,
+        placement: &NewWindowPlacement,
+        name: Option<&str>,
+        detached: bool,
+    ) -> Result<NewWindowPlan, String> {
+        // (wl, idx): the target window's Vec position, if it names one, and
+        // the requested display index (tmux target->wl / target->idx).
+        let active = if self.windows.is_empty() { None } else { Some(self.active_idx.min(self.windows.len() - 1)) };
+        let (wl, idx): (Option<usize>, Option<usize>) = match placement.target.as_deref().map(str::trim) {
+            None | Some("") => (active, None),
+            Some(t) => {
+                let t = crate::cli::strip_exact_match_prefix(t);
+                match t.split_once(':') {
+                    Some((_, w)) if crate::cli::strip_exact_match_prefix(w.trim()).is_empty() => (active, None),
+                    Some(_) => {
+                        if let Some(s) = crate::commands::foreign_session_in_spec(self, t) {
+                            return Err(format!("new-window: target is in session {} (each session runs in its own psmux server)", s));
+                        }
+                        match self.resolve_window_spec(t, true)? {
+                            WindowTarget::Pos(p) => (Some(p), Some(self.win_display_index(p))),
+                            WindowTarget::FreeIndex(i) => (None, Some(i)),
+                        }
+                    }
+                    None => {
+                        // No colon: tmux's cmd_find_get_window tries a window of
+                        // the current session first, then a session.
+                        match self.resolve_window_spec(t, true) {
+                            Ok(WindowTarget::Pos(p)) => (Some(p), Some(self.win_display_index(p))),
+                            Ok(WindowTarget::FreeIndex(i)) => (None, Some(i)),
+                            Err(_) => (active, None),
+                        }
+                    }
+                }
+            }
+        };
+        if placement.select_existing && idx.is_none() {
+            if let Some(n) = name {
+                let mut hit = None;
+                for (i, w) in self.windows.iter().enumerate() {
+                    if w.name != n { continue; }
+                    if hit.is_some() { return Err(format!("multiple windows named {}", n)); }
+                    hit = Some(i);
+                }
+                if let Some(p) = hit {
+                    return Ok(NewWindowPlan::SelectExisting(if detached { None } else { Some(p) }));
+                }
+            }
+        }
+        let mut idx = idx;
+        if placement.after || placement.before {
+            if let Some(p) = wl {
+                if let Some(i) = self.shuffle_up_at(p, placement.before) { idx = Some(i); }
+            }
+        }
+        let mut kill_pos = None;
+        if let Some(i) = idx {
+            if let Some(p) = self.win_pos(i) {
+                if !placement.kill { return Err(format!("create window failed: index {} in use", i)); }
+                kill_pos = Some(p);
+            }
+        }
+        Ok(NewWindowPlan::Create { index: idx, kill_pos })
     }
 
     /// Renumber every window contiguously from `base-index`, tmux's
@@ -1273,11 +2890,50 @@ impl AppState {
         // Drop a leading `session:`; tmux splits on the FIRST colon too.
         let body = match raw.find(':') { Some(p) => &raw[p + 1..], None => raw };
         let body = body.trim();
+        // tmux's `=` exact-match marker (#558) sets CMD_FIND_EXACT_WINDOW and
+        // is not part of the name; `cmd_find_target` strips it before the
+        // resolver ever sees the token. psmux only ever matches a window name
+        // exactly anyway, so dropping it is the whole of it. Without this
+        // `select-window -t :=2` looked for a window literally called "=2"
+        // (#693 item 4 routed select-window through here).
+        let body = crate::cli::strip_exact_match_prefix(body);
         // tmux reports only the WINDOW part: `swap-window -t p:77` prints
         // "can't find window: 77", not the whole "p:77".
         let missing = || format!("can't find window: {}", body);
         if self.windows.is_empty() { return Err(missing()); }
         let last_pos = self.windows.len() - 1;
+        // A pane target identifies its owning window. Retain and validate
+        // every component, including malformed input that parse_target omits.
+        if let Some(id) = body.strip_prefix('%') {
+            let id = id.parse::<usize>().map_err(|_| missing())?;
+            return crate::tree::find_pane_by_id_global(self, id)
+                .or_else(|| crate::tree::find_floating_by_id(self, id))
+                .map(|(pos, _)| WindowTarget::Pos(pos)).ok_or_else(missing);
+        }
+        if let Some((window, pane)) = body.rsplit_once('.') {
+            if window.is_empty() || window.starts_with('@') || pane.starts_with('%') || pane.parse::<usize>().is_ok() || matches!(pane, "+" | "-") {
+                if window.is_empty() && pane.starts_with('%') {
+                    return self.resolve_window_spec(pane, false);
+                }
+                let pos = self.resolve_window_spec(window, false)?.pos().ok_or_else(missing)?;
+                let found = if let Some(id) = pane.strip_prefix('%') {
+                    id.parse::<usize>().ok()
+                        .and_then(|id| crate::tree::find_pane_by_id_global(self, id)
+                            .or_else(|| crate::tree::find_floating_by_id(self, id)))
+                        .is_some_and(|(owner, _)| owner == pos)
+                } else if matches!(pane, "+" | "-") {
+                    // A relative pane always names a pane of this window;
+                    // a window command checks it but never focuses that pane.
+                    true
+                } else {
+                    pane.parse::<usize>().ok()
+                        .and_then(|p| p.checked_sub(self.pane_base_index_of(pos)))
+                        .is_some_and(|p| p < crate::tree::count_panes(&self.windows[pos].root)
+                            + self.windows[pos].floating.len())
+                };
+                return if found { Ok(WindowTarget::Pos(pos)) } else { Err(missing()) };
+            }
+        }
         // `sess:` with nothing after it (and a bare `-t sess`) means the
         // session's current window.
         if body.is_empty() { return Ok(WindowTarget::Pos(self.active_idx.min(last_pos))); }
@@ -1325,8 +2981,7 @@ impl AppState {
         }
         match body {
             "!" => {
-                let p = self.last_window_idx;
-                if p < self.windows.len() { Ok(WindowTarget::Pos(p)) } else { Err(missing()) }
+                match self.last_window_pos() { Some(p) => Ok(WindowTarget::Pos(p)), None => Err(missing()) }
             }
             "^" => Ok(WindowTarget::Pos(0)),
             "$" => Ok(WindowTarget::Pos(last_pos)),
@@ -1349,6 +3004,28 @@ impl AppState {
                 }
                 hit.map(WindowTarget::Pos).ok_or_else(missing)
             }
+        }
+    }
+
+    /// Resolve the `-t` of a command that acts on an existing window
+    /// (kill-window, rename-window, ...) to its Vec position, the way tmux's
+    /// cmd_find_get_window does (cmd-find.c:328): `sess:win` is the window
+    /// part in this session, and a target without a colon is a window of
+    /// this session first (index, name, `@id`, `+`/`-`/`!`/`^`/`$`) and then
+    /// this session's name, meaning its current window. Anything else is
+    /// "can't find window: X"; it never falls back to the current window.
+    pub fn resolve_window_target(&self, spec: &str) -> Result<usize, String> {
+        let spec = spec.trim();
+        let plain = crate::cli::strip_exact_match_prefix(spec);
+        if !spec.contains(':') && !plain.is_empty() && plain == self.session_name {
+            if let Ok(WindowTarget::Pos(p)) = self.resolve_window_spec(spec, false) {
+                return Ok(p);
+            }
+            return Ok(self.active_idx.min(self.windows.len().saturating_sub(1)));
+        }
+        match self.resolve_window_spec(spec, false)? {
+            WindowTarget::Pos(p) => Ok(p),
+            WindowTarget::FreeIndex(i) => Err(format!("can't find window: {}", i)),
         }
     }
 
@@ -1463,9 +3140,44 @@ impl AppState {
         }
     }
 
+    /// The last window's Vec position, or None when the session has none.
+    ///
+    /// tmux keeps the current window off the session's last-window stack
+    /// (session.c:508-509 removes it before pushing the old current), so
+    /// `#{window_last_flag}` (format.c:3120) is never 1 on the current window
+    /// and `last-window` there is `no last window` (cmd-select-window.c:118).
+    /// `last_window_idx` is a single Vec slot, so it can equal the current
+    /// window (a kill that hands focus to it, for one); that reads as none.
+    /// `pane-base-index` for the window at Vec position `idx`: its own value
+    /// (`set -w`), else the global one. tmux keeps it in each window's option
+    /// table (options-table.c:1552-1554, OPTIONS_TABLE_WINDOW) and reads it
+    /// from `w->options` (window.c:1124, :1162), so `set -w -t :1
+    /// pane-base-index 1` renumbers window 1 only.
+    pub fn pane_base_index_of(&self, idx: usize) -> usize {
+        self.windows
+            .get(idx)
+            .and_then(|w| w.window_options.get("pane-base-index"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(self.pane_base_index)
+    }
+
+    pub fn last_window_pos(&self) -> Option<usize> {
+        let p = self.last_window_idx;
+        let current = self.temp_focus_saved_active.unwrap_or(self.active_idx);
+        (p < self.windows.len() && p != current).then_some(p)
+    }
+
     /// Call right after `windows.remove(pos)`. Drops the parallel index and,
     /// when `renumber-windows` is on, renumbers the survivors contiguously.
+    /// The last window slot follows its window down, or is cleared when the
+    /// removed window WAS the last window (tmux winlink_stack_remove in
+    /// session_detach), instead of naming whatever slid into the slot.
     pub fn on_window_removed(&mut self, pos: usize) {
+        if self.last_window_idx == pos {
+            self.last_window_idx = NO_LAST_WINDOW;
+        } else if self.last_window_idx != NO_LAST_WINDOW && self.last_window_idx > pos {
+            self.last_window_idx -= 1;
+        }
         if self.window_indices.len() == self.windows.len() + 1 && pos < self.window_indices.len() {
             self.window_indices.remove(pos);
             if self.renumber_windows {
@@ -1486,10 +3198,11 @@ impl AppState {
             active_idx: 0,
             temp_focus_saved_active: None,
             mode: Mode::Passthrough,
-            escape_time_ms: 500,
+            clock_panes: Vec::new(),
+            escape_time_ms: DEFAULT_ESCAPE_TIME_MS,
             repeat_time_ms: 500,
             prefix_repeating: false,
-            prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
+            prefix_key: Some((crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL)),
             prefix2_key: None,
             prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -1505,6 +3218,8 @@ impl AppState {
                 .map(|s| HostColors::from_spec(&s))
                 .filter(|hc| hc.has_any() || hc.dark.is_some()),
             scroll_enter_copy_mode: true,
+            mouse_drag_enter_copy_mode: false,
+            ctrl_wheel_zoom: false,
             pwsh_mouse_selection: false,
             mouse_selection: true,
             mouse_selection_force: false,
@@ -1519,8 +3234,10 @@ impl AppState {
             window_indices: Vec::new(),
             copy_anchor: None,
             copy_anchor_scroll_offset: 0,
+            copy_pos_scroll_offset: None,
             copy_pos: None,
             copy_mouse_down_cell: None,
+            copy_pos_published: None,
             copy_scroll_offset: 0,
             copy_selection_mode: SelectionMode::Char,
             copy_count: None,
@@ -1535,6 +3252,15 @@ impl AppState {
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
+            copy_refresh_version: 0,
+            copy_prompt_back: 0,
+            prompt_saved: None,
+            copy_search_history: Vec::new(),
+            copy_search_history_pos: None,
+            copy_search_marks: false,
+            copy_hide_position: false,
+            copy_needs_redraw: false,
+            in_process_option_writes: Vec::new(),
             named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
@@ -1548,13 +3274,23 @@ impl AppState {
             format_job_rx: None,
             format_job_tx: None,
             session_name,
-            session_id: crate::session::allocate_session_id(),
+            // Not allocated here. `allocate_session_id` reads and writes the
+            // `next_session_id` counter in the data directory, so constructing
+            // a state object used to spend a number out of whichever directory
+            // the process was pointed at, including a developer's live one from
+            // a unit test. A server allocates its own id once it knows it is a
+            // server (server/mod.rs), which is also the point where
+            // `socket_name` below is finally known.
+            session_id: 0,
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),
             latest_client_id: None,
             latest_size_client_id: None,
             client_registry: std::collections::HashMap::new(),
+            prompt_request: None,
+            prompt_request_seq: 0,
+            prompt_waiters: Vec::new(),
             created_at: Local::now(),
             next_win_id: 1,
             next_pane_id: 1,
@@ -1564,7 +3300,7 @@ impl AppState {
             hooks: std::collections::HashMap::new(),
             wait_channels: std::collections::HashMap::new(),
             pipe_panes: Vec::new(),
-            last_window_idx: 0,
+            last_window_idx: NO_LAST_WINDOW,
             last_pane_path: Vec::new(),
             history_limit: 2000,
             display_time_ms: 750,
@@ -1582,11 +3318,12 @@ impl AppState {
             priority: crate::platform::DEFAULT_PRIORITY.to_string(),
             status_style: "bg=green,fg=black".to_string(),
             default_shell: String::new(),
-            word_separators: " -_@".to_string(),
+            word_separators: crate::grid_reader::DEFAULT_WORD_SEPARATORS.to_string(),
             renumber_windows: false,
             automatic_rename: true,
             allow_rename: true,
             allow_set_title: false,
+            program_status: false,
             monitor_activity: false,
             visual_activity: false,
             activity_action: "other".to_string(),
@@ -1608,8 +3345,11 @@ impl AppState {
                 "XAUTHORITY".to_string(),
             ],
             environment: std::collections::HashMap::new(),
+            env_scopes: crate::environ::EnvScopes::default(),
             user_options: std::collections::HashMap::new(),
+            global_window_user_options: std::collections::HashMap::new(),
             user_set_options: std::collections::HashSet::new(),
+            session_option_globals: std::collections::HashMap::new(),
             pane_border_style: String::new(),
             pane_active_border_style: "fg=green".to_string(),
             pane_border_hover_style: "fg=yellow".to_string(),
@@ -1637,8 +3377,8 @@ impl AppState {
             last_status_interval_fire: std::time::Instant::now(),
             format_shell_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             status_justify: "left".to_string(),
-            main_pane_width: 0,
-            main_pane_height: 0,
+            main_pane_width: "80".to_string(),
+            main_pane_height: "24".to_string(),
             status_left_length: 10,
             status_right_length: 40,
             status_lines: 1,
@@ -1648,8 +3388,14 @@ impl AppState {
             allow_passthrough: "off".to_string(),
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
+            codepoint_widths: Vec::new(),
+            terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
+            source_jobs_running: 0,
             config_warn_line: None,
+            source_defer: None,
+            startup_source_lines: Vec::new(),
+            config_made_session: false,
             set_clipboard: "on".to_string(),
             clipboard_osc52: None,
             bell_forward: false,
@@ -1660,13 +3406,26 @@ impl AppState {
             last_mouse_x: 0,
             last_mouse_y: 0,
             status_message: None,
+            status_message_ignore_keys: None,
             warm_enabled: std::env::var("PSMUX_NO_WARM").map(|v| v != "1" && v != "true").unwrap_or(true),
             allow_alternate_screen: true,
-            warm_pane: None,
+            warm_pane: WarmPool::new(default_warm_pool_size()),
+            boot_hold: None,
+            pool_trickle: false,
+            warm_refill_tx: None,
+            warm_refill_rx: None,
             pending_plugin_scripts: Vec::new(),
+            ppm_declared: false,
             control_clients: HashMap::new(),
+            ignore_size_clients: HashSet::new(),
+            control_windows_seen: None,
             session_group: None,
             defaults_suppressed: false,
+            copy_mode_defaults_unbound: std::collections::HashSet::new(),
+            last_mouse_event: None,
+            startup_config_file: None,
+            click_state: None,
+            click_finish_at: None,
             forwarded_panes: HashMap::new(),
             next_forward_id: 1,
         }
@@ -1676,11 +3435,7 @@ impl AppState {
     /// When socket_name is set (via -L flag), files are stored as `{socket_name}__{session_name}`.
     /// Otherwise, just the session_name is used.
     pub fn port_file_base(&self) -> String {
-        if let Some(ref sn) = self.socket_name {
-            format!("{}__{}", sn, self.session_name)
-        } else {
-            self.session_name.clone()
-        }
+        crate::session::session_name_base(self.socket_name.as_deref(), &self.session_name)
     }
 }
 
@@ -1739,14 +3494,201 @@ pub enum Action {
     SwitchTable(String),
 }
 
+/// A key binding. `note` is `bind-key -N`'s text (tmux key_binding.note),
+/// what `list-keys -N` shows in place of the command.
 #[derive(Clone)]
-pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
+pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool, pub note: Option<String> }
+
+/// Tiled layout, border settings, and focus state used by chooser previews.
+/// Persistent floating panes and pane title bars are not included.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct PreviewWindowState {
+    pub layout: crate::layout::LayoutJson,
+    pub border_lines: String,
+    pub border_indicators: crate::pane_border::PaneBorderIndicators,
+    #[serde(default)]
+    pub pane_border_style: Option<String>,
+    #[serde(default)]
+    pub pane_active_border_style: Option<String>,
+    pub floating_pane_focused: bool,
+}
+
+/// Parse preview state while accepting the layout-only `window-dump <id>`
+/// response.
+pub(crate) fn parse_preview_window_state(raw: &str) -> Option<PreviewWindowState> {
+    if let Ok(state) = serde_json::from_str(raw) {
+        return Some(state);
+    }
+    let layout = serde_json::from_str(raw).ok()?;
+    Some(PreviewWindowState {
+        layout,
+        border_lines: crate::border_lines::DEFAULT.to_string(),
+        border_indicators: crate::pane_border::PaneBorderIndicators::default(),
+        pane_border_style: None,
+        pane_active_border_style: None,
+        floating_pane_focused: false,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowDumpFormat {
+    Layout,
+    PreviewState,
+}
+
+/// The window and/or pane a command's -t names, as `CtrlReq::ValidateTarget`
+/// and `CtrlReq::Targeted` carry it.  `win` is a window index or, when
+/// `win_is_id` is set, an @id; `win_name` is a window name target.  `pane` is
+/// a %id when `pane_is_id` is set, otherwise the pane index as the user wrote
+/// it, pane-base-index included, within the target window (the active window
+/// when there is no window part); the resolver turns it into a position.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TempTarget {
+    pub win: Option<usize>,
+    pub win_is_id: bool,
+    pub win_name: Option<String>,
+    pub pane: Option<usize>,
+    pub pane_is_id: bool,
+    /// The session the target names explicitly (`sess:...`), checked against
+    /// this server's own session before anything else (issue #793). One
+    /// server holds one session, so a connection that reaches the wrong
+    /// server must get tmux's "can't find session", never act on its own
+    /// panes. Always None in a resolved target.
+    pub session: Option<String>,
+    /// The pane part is checked for existence only (a floating pane counts)
+    /// and is NOT part of the resolved target: the command resolves the
+    /// pane itself (display-message, capture-pane and kill-pane by %id,
+    /// select-pane). Without the check those commands fell back to the
+    /// active pane, or did nothing, at exit 0 for a pane that does not exist
+    /// (issue #793 follow up). Always false in a resolved target.
+    pub pane_check_only: bool,
+}
+
+impl TempTarget {
+    /// The window and pane halves of a parsed `-s` / `-t` spec (the session
+    /// half is the caller's business).
+    pub fn from_parsed(pt: &ParsedTarget) -> Self {
+        TempTarget {
+            win: pt.window,
+            win_is_id: pt.window_is_id,
+            win_name: pt.window_name.clone(),
+            pane: pt.pane,
+            pane_is_id: pt.pane_is_id,
+            session: None,
+            pane_check_only: false,
+        }
+    }
+
+    /// True when the target names objects by their stable ids (@window and
+    /// %pane), the form `ValidateTarget` replies with: a later structural
+    /// change (a kill, a split, a swap) can make it vanish but can never make
+    /// it name a different pane, which an index can.
+    pub fn is_resolved(&self) -> bool {
+        self.win_name.is_none()
+            && (self.win.is_none() || self.win_is_id)
+            && (self.pane.is_none() || self.pane_is_id)
+            && (self.win.is_some() || self.pane.is_some())
+    }
+}
+
+/// The display-message flags the server loop itself has to honour
+/// (cmd-display-message.c). `-a`, `-v` and `-p` are applied by the command
+/// handler around the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayFlags {
+    /// `-l`: the message is shown unchanged, no format expansion.
+    pub literal: bool,
+    /// `-N`: key presses do not close the message; only its delay does.
+    pub ignore_keys: bool,
+}
+
+/// The lines of a runtime source-file kept for the source job (issue #842).
+/// tmux runs a sourced file's commands one at a time after the parse
+/// (cfg.c:155 to :204); psmux keeps them here from the first command on, the
+/// option lines after it too, so they still run in file order.
+#[derive(Debug, Default)]
+pub struct SourceDefer {
+    /// The first command has been reached: every line from here on is kept.
+    pub triggered: bool,
+    pub lines: Vec<DeferredConfigLine>,
+}
+
+/// One kept line, with the file and line it came from for its warnings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredConfigLine {
+    pub file: String,
+    pub line: Option<usize>,
+    pub kind: DeferredKind,
+    /// The files being sourced where this line was read, outermost first
+    /// (config::source_key). A `source-file` it runs later is checked
+    /// against them, so a file cannot source itself through the job either.
+    pub ancestors: Vec<String>,
+}
+
+/// What config::source_runtime returns: the lines kept for the source job,
+/// and the errors found while parsing, which are every warning the parse
+/// recorded: in a runtime source each is an error for the client, as tmux
+/// reports a missing file or an invalid option (issue #842).
+#[derive(Debug, Default)]
+pub struct SourceParse {
+    pub lines: Vec<DeferredConfigLine>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeferredKind {
+    /// A command, run through the connection dispatcher.
+    Command(String),
+    /// A line the config parser applies itself (`set`, `bind`, `source-file`,
+    /// `if-shell`, ...), parsed again on the server loop when its turn comes.
+    Directive(String),
+    /// A whole `if-shell ... { } { }` block, as text for parse_config_content,
+    /// so its condition is tested when its turn comes, not at parse time.
+    Block(String),
+}
+
+/// What a client that ran `source-file` is told once the file has run: the
+/// output of its commands and the errors they reported.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SourceOutcome {
+    pub output: String,
+    pub errors: Vec<String>,
+}
+
+/// The result of parsing one kept config line: its warnings, and any lines it
+/// kept in turn (a `source-file`'s commands, an `if-shell` branch).
+#[derive(Debug, Default)]
+pub struct SourceReplayResult {
+    pub warnings: Vec<String>,
+    pub deferred: Vec<DeferredConfigLine>,
+}
+
+/// The move of a `select-window -n`, `-p` or `-l`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelativeWindow { Next, Prev, Last }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489)
-    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E), env (-e, #489)
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489), zoom (-Z)
-    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T), env (-e, #489), zoom (-Z)
+    /// A pane parser thread published new screen state.
+    ///
+    /// Carries nothing: the data itself travels through `PTY_DATA_READY` and
+    /// the panes' own buffers. Its only job is to make the server loop's
+    /// `recv_timeout` return NOW instead of at the end of its poll interval,
+    /// so pty output reaches the render on the event rather than on a timer.
+    /// See `wake_server_loop`.
+    PtyWake,
+    /// A client sent a request that was not a bare pointer sample.
+    ///
+    /// `window-size latest` must follow the client the user is actually
+    /// using (tmux keeps the most recently active client at the head of
+    /// `clients->latest`).  Without this, typing and clicking never
+    /// refreshed the size choice, so a phone client that narrowed the
+    /// window kept it narrow after the user went back to the desktop
+    /// (only a real resize, `client-size`, ever updated it).
+    ClientActivity(u64),
+    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement, Option<mpsc::Sender<Result<(), String>>>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489), placement (-t/-a/-b/-k/-S), outcome
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement),  // cmd, name, detached, start_dir, format, resp ("ERROR: ..." on failure), title (-T), empty (-E), env (-e, #489), placement
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, crate::pane::SplitPlacement, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, placement (-l, -b, -f), error_resp, title (-T), env (-e, #489), zoom (-Z)
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, crate::pane::SplitPlacement, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, placement (-l, -b, -f), format, resp, title (-T), env (-e, #489), zoom (-Z)
     /// new-pane: create a floating pane over the active window's layout.
     /// Flags match tmux: `-X`/`-Y` position, `-x`/`-y` size, `-B` border,
     /// `-T` title, `-c` dir, `-d` detached, `-P` print (returns the pane id).
@@ -1768,16 +3710,18 @@ pub enum CtrlReq {
         empty: bool,
         /// -P: reply with the new pane id over `resp`.
         resp: Option<mpsc::Sender<String>>,
+        /// -e environment for the new process and the -s/-S/-R styles.
+        extra: FloatExtras,
     },
     KillPane,
     KillPaneById(usize),
     /// Capture a pane's plain text. Fields: resp, target pane id
-    /// (`-t %N`, None = active pane), preserve trailing spaces (`-N`).
-    CapturePane(mpsc::Sender<String>, Option<usize>, bool),
+    /// (`-t %N`, None = active pane), the `-N` / `-J` line flags.
+    CapturePane(mpsc::Sender<String>, Option<usize>, crate::copy_mode::CaptureOpts),
     /// Capture a pane's text with ANSI SGR sequences. Fields: resp,
     /// start (-S), end (-E), target pane id (`-t %N`, None = active pane),
-    /// preserve trailing spaces (`-N`).
-    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
+    /// the `-N` / `-J` line flags.
+    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, crate::copy_mode::CaptureOpts),
     FocusWindow(usize),
     /// Focus window by @N id lookup
     FocusWindowById(usize),
@@ -1785,47 +3729,114 @@ pub enum CtrlReq {
     FocusWindowByName(String),
     FocusPane(usize),
     FocusPaneByIndex(usize),
-    /// Temporary focus for generic -t targeting, with validation (issue #545).
-    /// The server resolves the window and/or pane FIRST and replies Err when
-    /// the target does not exist, so the connection thread can report
-    /// "can't find window/pane: X" and skip the follow-on command instead of
-    /// letting it run against whatever window happens to be active (the old
-    /// FocusWindow*Temp handlers silently no-opped on a miss, so kill-pane,
-    /// send-keys, rename-window, capture-pane etc. with a stale target
-    /// destroyed/typed-into/read the ACTIVE window at rc=0). On success the
-    /// focus is applied with the same temp-restore bookkeeping as before.
-    /// `win` carries an index or, when `win_is_id` is set, an @id; `win_name`
-    /// carries a window-name target. `pane` carries a %id when `pane_is_id`
-    /// is set, otherwise a positional pane index within the target window.
-    FocusTargetTemp {
+    /// The whole `-t` of a `select-pane`, as ONE request (issue #691).
+    ///
+    /// The generic `-t` focus block used to send a permanent `FocusWindow` for
+    /// the window part of a pane target and a `FocusPane`/`FocusPaneByIndex`
+    /// for the pane part. `FocusWindow` names `after-select-window` in its
+    /// hook slot and the pane requests name nothing, so `select-pane -t s:0.1`
+    /// moved the active pane, fired `after-select-window` and never fired
+    /// `after-select-pane`. tmux fires the command's OWN hook, once:
+    /// cmd-select-pane.c:276 `cmdq_insert_hook(s, item, current,
+    /// "after-select-pane")`, and cmd-select-pane.c:269 returns before it when
+    /// the target pane is already active.
+    ///
+    /// `fire_hook` is false when a direction, `-l`, `-m`, `-M`, `-e` or `-d`
+    /// flag follows in the same command: `CtrlReq::SelectPane` carries the
+    /// operation then, and one command may fire its after hook only once
+    /// (#690, tmux cmd-queue.c `cmdq_fire_command`).
+    SelectPaneTarget {
         win: Option<usize>,
         win_is_id: bool,
         win_name: Option<String>,
         pane: Option<usize>,
         pane_is_id: bool,
-        resp: mpsc::Sender<Result<(), String>>,
+        fire_hook: bool,
     },
+    /// Resolve a generic -t target WITHOUT changing any focus (issue #545).
+    /// Replies Err("can't find window/pane: X") when it does not exist, so the
+    /// connection thread reports it and never runs the command, or Ok with
+    /// the same target rewritten to stable ids (`TempTarget::is_resolved`),
+    /// which the command's requests then carry in `CtrlReq::Targeted`.
+    ValidateTarget {
+        target: TempTarget,
+        resp: mpsc::Sender<Result<TempTarget, String>>,
+    },
+    /// A bare `-t` name of a window or pane command, resolved on live state
+    /// by tmux's rules (commands::resolve_in_server_target) to the `@id` /
+    /// `%id` it names. `Err` is tmux's "can't find ..." and the command does
+    /// not run; it never falls back to the current window.
+    ResolveTarget {
+        kind: crate::commands::InServerTarget,
+        spec: String,
+        resp: mpsc::Sender<Result<Option<String>, String>>,
+    },
+    /// A request together with the -t target it acts on.  The server loop
+    /// resolves the target, focuses it, runs `inner` and restores the real
+    /// focus in ONE step, so no other request (another client's command, a
+    /// pane output wake) can run in between and nothing can redirect it.  If
+    /// the target is gone by then, `inner` is dropped, never run elsewhere.
+    ///
+    /// This replaced `FocusTargetTemp`, a separate request that switched the
+    /// focus and left it switched until "the next request that is not a temp
+    /// focus", whoever sent it: under concurrency or a server stall that was
+    /// routinely somebody else's request, and `send-keys -t s:0.1` typed
+    /// into the active pane, `kill-pane -t s:0.2` killed pane 0.0, and
+    /// `send-keys -N 3 -t s:0.1 x` sent one x to its target and two to the
+    /// active pane even with nothing else running.  tmux resolves a command's
+    /// target when the command fires (cmd-queue.c cmdq_fire_command, via
+    /// cmd_find_target) and carries it in the command's own state.
+    Targeted(TempTarget, Box<CtrlReq>),
+    /// A request of a command a source job runs, with the file the command
+    /// was read from. #{current_file} names that file while the server loop
+    /// runs `inner`, and only then, as each command tmux parses from a file
+    /// carries it (cfg.c:139 and :191). Wraps a `Targeted` when the command
+    /// has a -t target.
+    InFile(String, Box<CtrlReq>),
     SessionInfo(mpsc::Sender<String>),
     /// `list-sessions -F <fmt>` — render the session row using a tmux format
     /// string. Drop-in compat with iTerm2 and other CC clients that always
     /// pass `-F` to get structured output.
     SessionInfoFormat(mpsc::Sender<String>, String),
     /// Capture a plain-text row range. Fields: resp, start (-S), end (-E),
-    /// target pane id (`-t %N`, None = active pane), preserve trailing
-    /// spaces (`-N`).
-    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
-    ClientAttach(u64),
+    /// target pane id (`-t %N`, None = active pane), the `-N` / `-J` line
+    /// flags.
+    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, crate::copy_mode::CaptureOpts),
+    /// `capture-pane -a`: the main screen the alternate screen covers, with
+    /// the same -S/-E/-e/-N handling as the captures above. `None` when the
+    /// pane is not on the alternate screen (issue #810).
+    CapturePaneSaved {
+        resp: mpsc::Sender<Option<String>>,
+        start: Option<i32>,
+        end: Option<i32>,
+        pane_id: Option<usize>,
+        styled: bool,
+        opts: crate::copy_mode::CaptureOpts,
+    },
+    /// (client id, process id of the attaching client when the server could
+    /// read it from the connection, issue #724).
+    ClientAttach(u64, Option<u32>),
     ClientDetach(u64),
     DumpLayout(mpsc::Sender<String>),
     DumpState(mpsc::Sender<String>, bool, u64),  // (resp, allow_nc, client_id)
     SendText(String),
     SendKey(String),
     SendPaste(String),
+    /// A whole parsed `paste-buffer`, run inside the server loop (issue #684).
+    ///
+    /// One request, not a buffer lookup followed by a separate send: the CLI
+    /// dispatch's `-t` focus is spent by the first non-focus request the server
+    /// handles, so splitting the command in two was what sent a `-t` paste to
+    /// the active pane.  The reply carries tmux's error text ("no buffer x",
+    /// "can't find window: x") or `None`.
+    PasteBuffer(crate::commands::PasteBufferArgs, mpsc::Sender<Option<String>>),
     ZoomPane,
     PrefixBegin,
     PrefixEnd,
     CopyEnter,
-    CopyEnterPageUp,
+    /// A `copy-mode` command with its flags: `-q` leaves the mode, `-H`
+    /// hides the position indicator on a fresh entry, `-u` pages up (#704).
+    CopyModeCmd(crate::copy_mode::CopyModeFlags),
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
@@ -1855,7 +3866,20 @@ pub enum CtrlReq {
     /// pane-relative 0-based (col, row).  The position is optional because older
     /// clients send `pane-scroll PANE up|down` with no coordinates; when it is
     /// absent the server falls back to the pane centre.
-    PaneScroll(u64, usize, bool, Option<(i16, i16)>),
+    /// pane-scroll: client, pane, up, pointer cell, tmux modifier mask
+    /// (shift 4, meta 8, ctrl 16; 0 from an older client).
+    PaneScroll(u64, usize, bool, Option<(i16, i16)>, u8),
+    /// send-keys -M: forward the mouse event that triggered the running
+    /// mouse binding to its pane (tmux cmd-send-keys.c).
+    SendMouse(u64),
+    /// A wheel notch over the status line: client, up, tmux modifier mask.
+    StatusWheel(u64, bool, u8),
+    /// A client routed mouse key with a user binding: client, key name,
+    /// target (`%pane` / `:window`), col, row, SGR button.
+    MouseKey(u64, String, String, i16, i16, u8),
+    /// An unbound root mouse key handed to the pane's program: client, pane,
+    /// SGR button, col, row, press.
+    MouseForward(u64, usize, u8, i16, i16, bool),
     /// Hand a normal-mode client-side drag selection off to server-side copy
     /// mode because the pointer crossed the pane's top edge — or, when the
     /// view is direct-scrolled (scroll-enter-copy-mode off, #193), its
@@ -1880,11 +3904,8 @@ pub enum CtrlReq {
     /// Issue #257: simplified layout (split kind/sizes + pane ids)
     /// for a specific window, used for choose-tree preview rendering.
     WindowLayout(usize, mpsc::Sender<String>),
-    /// Issue #257: full styled `LayoutJson` (rows_v2 cell runs, titles,
-    /// etc.) for a specific window. Lets cross-session previews reuse the
-    /// exact same renderer the main viewport uses, instead of replaying
-    /// `capture-pane -e` per pane and parsing ANSI by hand.
-    WindowDump(usize, mpsc::Sender<String>),
+    /// Issue #257: fully styled layout or preview state for a specific window.
+    WindowDump(usize, WindowDumpFormat, mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
     SetPaneStyle(String),
@@ -1903,8 +3924,36 @@ pub enum CtrlReq {
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
     SendKeysX(String),  // send-keys -X copy-mode-command
+    /// `send-keys -X [-N count] <command>` from a client. Like tmux
+    /// (cmd-send-keys.c) it fails with "not in a mode" when the pane is not in
+    /// copy mode, and `count` is the repeat the copy command takes
+    /// (`wme->prefix`). `resp` carries that outcome back to a one-shot client.
+    SendKeysXRun { cmd: String, count: usize, resp: Option<mpsc::Sender<Result<(), String>>> },
     SelectPane(String, bool),
     SelectWindow(usize),
+    /// `select-window -t <spec>` where the spec is anything but a plain index:
+    /// an `@id`, a window name, the `+N`/`-N` offsets or the `!`/`^`/`$` and
+    /// `{last}`/`{start}`/`{end}`/`{next}`/`{previous}` symbols.
+    ///
+    /// tmux maps the braced spellings through `cmd_find_window_table`
+    /// (cmd-find.c:51-58) and resolves the rest in
+    /// `cmd_find_get_window_with_session` (cmd-find.c:364-457), which is the
+    /// same resolver move-window and swap-window have used since issue #602.
+    /// `select-window` simply never called it, so every symbolic form died on
+    /// the CLI with `no server running on session '<ns>__+1'` (issue #693
+    /// item 4).
+    SelectWindowSpec {
+        spec: String,
+        /// The pane part of the target, only checked to exist in the window.
+        pane: Option<String>,
+        /// `-n`, `-p` or `-l`: the target is only checked, then the move is
+        /// relative to the current window (cmd-select-window.c:109-129).
+        relative: Option<RelativeWindow>,
+        /// `-T`: a target that is already the current window selects the
+        /// last window instead (cmd-select-window.c:131-138).
+        toggle: bool,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     ListPanes(mpsc::Sender<String>),
     ListPanesFormat(mpsc::Sender<String>, String),
     ListAllPanes(mpsc::Sender<String>),
@@ -1913,90 +3962,210 @@ pub enum CtrlReq {
     /// kill-window with an explicit window target. The server resolves the
     /// target itself and reports an unresolvable one as an error instead of
     /// killing whatever window happens to be active (tmux parity: tmux says
-    /// "can't find window: X" and kills nothing). `win` carries an index or,
-    /// when `win_is_id` is set, an @id; `name` carries a window-name target.
+    /// "can't find window: X" and kills nothing). Keep the complete raw
+    /// target so a missing/invalid pane part never becomes an untargeted kill.
     KillWindowTarget {
-        win: Option<usize>,
-        win_is_id: bool,
-        name: Option<String>,
+        /// Complete raw spec: a pane id or malformed field must not vanish.
+        target: String,
         resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// Resolve a complete window target to a stable id without moving focus.
+    /// Subsequent requests carry that id through CtrlReq::Targeted.
+    ResolveWindowTarget {
+        target: String,
+        resp: mpsc::Sender<Result<TempTarget, String>>,
+    },
+    /// Read-only, atomic lookup of every pane endpoint before dispatch.
+    ResolvePaneTargets {
+        specs: Vec<String>,
+        resp: mpsc::Sender<Result<Vec<String>, String>>,
     },
     KillSession,
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, optional client priority,
-    /// response sender.
+    /// optional path to the client's environment block, optional initial
+    /// window name, response sender.
     ///
     /// The priority rides along for the same reason the CWD does (#608): a warm
     /// standby was spawned ahead of time, in an environment that predates the
     /// claiming client, so anything the user set in the shell they ran psmux
     /// from can only reach the already running process through the claim.
-    ClaimSession(String, Option<String>, Option<String>, mpsc::Sender<String>),
+    ///
+    /// The environment file is the general case of that same problem (#659):
+    /// a cold spawned server inherits the client's whole environment block, so
+    /// a claimed standby has to be handed it too or it stays poisoned for life.
+    ///
+    /// The window name is there for the third instance of the same rule (#674):
+    /// `new-session -n NAME` names the initial window and disables
+    /// automatic-rename for it before the session exists, so applying it inside
+    /// this claim, before the OK, is the only way the warm path can match the
+    /// cold one. A follow up `rename-window` was observably not equivalent: it
+    /// left the session visible under the standby's pool name, and lost the
+    /// name entirely whenever that second request did not land.
+    ClaimSession(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<Vec<u8>>, mpsc::Sender<String>),
     SwapPane(String),
-    /// swap-pane -t <target>: swap the active pane with the pane identified by
-    /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id
-    /// (`%N`); otherwise it is a user-facing pane index that is normalized
-    /// using pane-base-index before resolving a positional pane path.
-    SwapPaneTarget(usize, bool),
-    /// swap-pane -s <src> -t <dst>: swap the two explicit panes named by
-    /// `-s` and `-t` (issue #442).  Each pane is a (value, is_id) pair
-    /// resolved the same way as `SwapPaneTarget`.  `detach` is true when
-    /// `-d` was given: the active pane is left unchanged (following its pane
-    /// to the new slot); otherwise, per tmux, the `-t` pane becomes active.
-    SwapPaneSrcDst { src: usize, src_is_id: bool, dst: usize, dst_is_id: bool, detach: bool },
+    /// swap-pane `-s <src>` `-t <dst>`: swap the two panes named by the RAW
+    /// target specs (issues #442 and #689).  `src` of None is tmux's default
+    /// source, the current pane.  Both specs are resolved session wide, so
+    /// either may name a pane in another window (cmd-swap-pane.c:38, :39,
+    /// CMD_FIND_PANE) — they used to be pre-resolved pane indexes looked up in
+    /// the ACTIVE window alone, which made a cross window swap resolve to the
+    /// same pane twice and do nothing at exit 0.  `detach` is `-d`: the panes
+    /// still trade places but neither window changes its active pane.
+    SwapPaneSrcDst { src: Option<String>, dst: String, detach: bool, resp: mpsc::Sender<Result<(), String>> },
     /// swap-pane -t <token>: swap the active pane with the pane at a layout
     /// position token (e.g. `{top-right}`).  Layout-independent.
     SwapPanePosition(String),
     ResizePane(String, u16),
     SetBuffer(String),
-    /// Set a named buffer: (name, content)
+    /// Set a named buffer: (name, content). It replaces any buffer of that
+    /// name, automatic or named.
     SetNamedBuffer(String, String),
+    /// `set-buffer -a -b name`: append to the buffer of that name, or make it.
+    AppendNamedBuffer(String, String),
+    /// A whole parsed `set-buffer` (-a, -b, -n, -t, -w and the data), run by
+    /// commands::run_set_buffer_args; the reply is tmux's error, if any
+    /// (#813).
+    SetBufferCmd(crate::commands::SetBufferArgs, mpsc::Sender<Result<(), String>>),
+    /// Control mode `delete-buffer [-b name]`, run by
+    /// commands::run_delete_buffer (#813).
+    DeleteBufferCmd(Option<String>, mpsc::Sender<Result<(), String>>),
     ListBuffers(mpsc::Sender<String>),
     ListBuffersFormat(mpsc::Sender<String>, String),
     ShowBuffer(mpsc::Sender<String>),
-    /// `None` means no buffer exists at that index (issue #264: lets callers
-    /// like paste-buffer distinguish "buffer not found" from "empty buffer").
-    ShowBufferAt(mpsc::Sender<Option<String>>, usize),
-    /// Show a named buffer by name. `None` means no such named buffer exists.
+    /// Show a buffer by name, automatic or named. `None` means no buffer has
+    /// that name (issue #264: lets callers tell "no buffer" from "empty").
     ShowNamedBuffer(mpsc::Sender<Option<String>>, String),
     DeleteBuffer,
     DeleteBufferAt(usize),
-    /// Delete a named buffer by name
-    DeleteNamedBuffer(String),
-    PasteBufferAt(usize),
-    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    /// Delete a buffer by name; the reply, when asked for, says whether one
+    /// was found.
+    DeleteNamedBuffer(String, Option<mpsc::Sender<bool>>),
+    /// Paste into the active pane the buffer of this name, or else the
+    /// automatic buffer at this index (the chooser's older wire form).
+    PasteBufferAt(Option<String>, usize),
+    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms, -c client, -l/-N
     /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
-    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>),  // resp, format, pane_id, set_status_bar, duration_override_ms
-    LastWindow,
-    LastPane,
+    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>, Option<ClientSel>, DisplayFlags),  // resp, format, pane_id, set_status_bar, duration_override_ms, -c client, -l/-N
+    /// `last-window` / `select-window -l`.  With no last window tmux fails
+    /// with `no last window` at exit 1 (cmd-select-window.c:118-120); the
+    /// reply carries that to a CLI or control caller (None: nobody waits).
+    LastWindow {
+        resp: Option<mpsc::Sender<Result<(), String>>>,
+    },
+    /// `last-pane` / `select-pane -l`.
+    ///
+    /// tmux's cmd-select-pane.c:166-177 takes the window's last pane, falls
+    /// back to the sibling when the window has exactly two panes and neither
+    /// was ever visited, and otherwise fails with `no last pane` at exit 1.
+    /// psmux exited 0 in silence for both of those (issue #693 item 5), so the
+    /// reply channel carries tmux's diagnostic.
+    LastPane {
+        resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// `select-pane -d` (`off` true) / `select-pane -e` (`off` false): set or
+    /// clear [`Pane::input_off`] on the pane `target` names (None: the active
+    /// pane), and with `last` on that window's last pane instead
+    /// (`select-pane -l -d/-e`).  See `server::set_pane_input_off`.
+    ///
+    /// The target travels INSIDE the request rather than as a
+    /// `CtrlReq::Targeted` wrapper on purpose: the temporary focus a wrapper
+    /// applies moves the target WINDOW's active pane and only the real active
+    /// window's is put back, so `select-pane -d -t %N` for a pane in another
+    /// window would have changed which pane that window shows as active.
+    /// tmux's cmd-select-pane.c flips `PANE_INPUTOFF`, redraws borders and
+    /// status, and returns: the active pane, zoom, last pane and MRU stay as
+    /// they were, and the `after-select-pane` hook (cmd-select-pane.c:276) is
+    /// never reached.  `resp` carries tmux's error (`no last pane`, or a
+    /// target that vanished after validation) to a one-shot caller.
+    SetPaneInputOff {
+        target: Option<TempTarget>,
+        off: bool,
+        last: bool,
+        resp: Option<mpsc::Sender<Result<(), String>>>,
+    },
+    /// `rotate-window`. The flag is tmux's `-U` (its default): true moves the
+    /// first pane to the last cell, false is `-D`.
     RotateWindow(bool),
     DisplayPanes,
     DisplayPaneSelect(usize),
-    BreakPane,
+    /// break-pane: move one pane into a window of its own.  Carries the whole
+    /// tmux flag set (`abdPF:n:s:t:`, cmd-break-pane.c:37); it used to carry
+    /// nothing at all, so `-d` was ignored and `-s` silently broke the ACTIVE
+    /// pane (issue #689).  `print` is Some(format) for `-P` (the `-F` template,
+    /// or tmux's BREAK_PANE_TEMPLATE).  The reply is the `-P` text, or the
+    /// error tmux would print.
+    BreakPaneReq {
+        req: crate::window_ops::BreakPaneRequest,
+        print: Option<String>,
+        resp: mpsc::Sender<Result<String, String>>,
+    },
     /// join-pane: move a pane from source window into target window as a split.
     /// Fields: src_win (window index), src_pane (positional pane index), target_win,
-    /// target_pane, horizontal (true = -h side-by-side, false = -v stacked).
+    /// target_pane, horizontal (true = -h side-by-side, false = -v stacked),
+    /// detach (`-d`: graft the pane but do NOT switch to the target window,
+    /// cmd-join-pane.c:515 to 521; it used to be parsed nowhere, so join-pane
+    /// always switched).
     JoinPane {
-        src_win: Option<usize>,
-        src_pane: Option<usize>,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
+        /// The raw `-s` spec, kept for its session half: a source in another
+        /// session is refused instead of read as a window of this one.
+        src_raw: Option<String>,
+        /// `-s`: window and pane, a `%id` pane included (it used to be read
+        /// as a pane INDEX of the active window).
+        src: TempTarget,
+        /// `-t`: window and pane, a `%id` pane included.
+        dst: TempTarget,
         horizontal: bool,
+        detach: bool,
+        /// `-b`: the moved pane goes left of / above the target (#725).
+        before: bool,
+        /// Err is tmux's message (`can't join a pane to its own window`,
+        /// `can't find pane: %N`), printed by the CLI at exit 1.
+        resp: mpsc::Sender<Result<(), String>>,
+        /// move-pane: the source may already be in the target window
+        /// ("like join-pane but allows the same window", tmux CHANGES 1.7).
+        same_window: bool,
+        /// -l size (cells, or a share of the target pane with the flag set).
+        size: Option<(u16, bool)>,
     },
-    RespawnPane(Option<String>, bool, Option<String>, bool),  // optional workdir (-c), kill flag (-k), command (-- shell-command), empty (-E)
-    /// set-option -p (issue #580): pane-scoped option. Fields: raw -t pane
-    /// target ("" = active pane), option name, value ("" = unset via -u/-U),
-    /// reply ("" on success, "ERROR: ..." otherwise). Unwired pane options
-    /// are rejected loudly instead of stored as silent no-ops.
-    SetPaneOption(String, String, String, mpsc::Sender<String>),
+    /// respawn-pane. Fields: optional workdir (-c), kill flag (-k), command
+    /// (`--`/positional shell-command), empty (-E), and the per-request reply.
+    ///
+    /// The reply channel exists because every way this can fail is ROUTINE and
+    /// user-caused (`pane ... still active` without -k, a bad `-c` directory, a
+    /// command that will not spawn). Those used to travel out of the server
+    /// event loop on a `?` and terminate the whole server — every window and
+    /// pane destroyed — while the client still exited 0 with empty output.
+    /// tmux answers `respawn pane failed: <cause>` at exit 1 and keeps running.
+    /// Fields: workdir (-c), kill (-k), command, empty (-E), reply, and the
+    /// `-e KEY=VALUE` pairs for the new process (#708).
+    RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
+    /// set-option -p (issue #580, #728): pane-scoped option. `target` is the
+    /// raw -t pane ("" = active pane); `resp` gets "" on success and
+    /// "ERROR: ..." otherwise. Any `@name` user option is stored on the pane
+    /// (#728); a catalog name psmux does not keep per pane is refused loudly
+    /// instead of stored as a silent no-op.
+    SetPaneOption {
+        target: String,
+        option: String,
+        value: String,
+        unset: bool,
+        append: bool,
+        only_if_unset: bool,
+        quiet: bool,
+        resp: mpsc::Sender<String>,
+    },
     /// show-options -p (issue #580): list a pane's scoped options.
     ShowPaneOptions(String, mpsc::Sender<String>),
-    BindKey(String, String, String, bool),  // table, key, command, repeat
+    BindKey(String, String, String, bool, Option<String>),  // table, key, command, repeat, -N note
     UnbindKey(String, Option<String>),  // key, optional table (None = prefix)
     UnbindAll,
     UnbindAllInTable(String),
     ListKeys(mpsc::Sender<String>),
+    /// list-keys -N: (reply, -T table, -a, key filter).
+    ListKeyNotes(mpsc::Sender<String>, Option<String>, bool, Option<String>),
     SetOption(String, String),
     SetOptionQuiet(String, String, bool),  // set-option with quiet flag
     SetOptionUnset(String),  // set-option -u
@@ -2014,9 +4183,73 @@ pub enum CtrlReq {
     SetOptionToggle(String),  // set-option <bool-option> with no value (#535)
     /// Per-window `window-size` override; None unsets the local value.
     SetWindowSize(Option<String>),
+    /// `set-option [-u|-a|-o|-q] <session option> [value]` without `-g` (#803):
+    /// the session's own table, not the global one. An empty `value` with no
+    /// `-u`/`-a` toggles a boolean. Replies `""` or `ERROR: ...`.
+    SetSessionOption {
+        option: String,
+        value: String,
+        unset: bool,
+        append: bool,
+        only_if_unset: bool,
+        quiet: bool,
+        resp: mpsc::Sender<String>,
+    },
+    /// `show-options [-g] [-A] <session option>` (#803): the value of one
+    /// table (the global one with `-g`, else the session's resolved value) and
+    /// whether the session inherits it.
+    SessionOptionQuery(mpsc::Sender<(String, bool)>, String, bool),
+    /// Rewrite a `show-options` listing for `-g` (global values) or `-A`
+    /// (`*` on every session option the session inherits) (#803).
+    ScopeSessionListing(mpsc::Sender<String>, String, bool, bool),
+    /// `set-option -w [-u|-a|-o] [-t <window>] <name> [value]` (#648).
+    ///
+    /// `target` is the RAW `-t` string so the server can resolve a window by
+    /// name (`s:zero`), by index (`s:1`), by id (`@3`) or by any of tmux's
+    /// symbolic spellings. The old window path carried a pre-parsed index and
+    /// dropped the name form entirely, which is why the reporter's
+    /// `-t "s:zero"` silently acted on the ACTIVE window. Empty means "the
+    /// window the client is looking at".
+    SetWindowOption {
+        target: String,
+        option: String,
+        value: String,
+        unset: bool,
+        append: bool,
+        only_if_unset: bool,
+        quiet: bool,
+        resp: mpsc::Sender<String>,
+    },
     ShowOptions(mpsc::Sender<String>),
     ShowWindowOptions(mpsc::Sender<String>),
-    SourceFile(String),
+    /// `show-options -w [-A] [-g] [-t <window>]`: the window option listing for
+    /// one resolved window.
+    ///
+    /// The third field says WHICH table to print, the question tmux answers in
+    /// `options_scope_from_flags` plus `cmd_show_options_all`: the window's own
+    /// values, those plus every inherited value with a `*` marker (`-A`), or the
+    /// global window table (`-g`). It used to be a bare "mark inherited" bool,
+    /// so `-g` was dropped on the floor and a plain `-w` printed every name
+    /// including the ones the window does not own (#648, #655).
+    ShowWindowOptionsFor(mpsc::Sender<String>, String, crate::server::options::WindowListing),
+    /// `(path, done)`: `done` answers once the file and its commands have run,
+    /// which is how a one-shot `source-file` knows when to answer (#734 follow
+    /// up). With commands to run, the source job answers it (issue #842).
+    SourceFile(String, Option<mpsc::Sender<SourceOutcome>>),
+    /// A config line a source job kept, parsed now on the server loop with its
+    /// file and line (issue #842, config::replay_deferred_line).
+    SourceReplay(DeferredConfigLine, mpsc::Sender<SourceReplayResult>),
+    /// A source job has run its last line: its warnings, and the answer for
+    /// the client that ran `source-file`, if that client waits.
+    SourceJobDone {
+        /// Every warning of the source: the parse's, then the job's own.
+        warnings: Vec<String>,
+        /// Where the job's own warnings start in `warnings`. The parse's are
+        /// in `config_warnings` already.
+        new_from: usize,
+        outcome: SourceOutcome,
+        waiter: Option<mpsc::Sender<SourceOutcome>>,
+    },
     /// Expand `#{...}` format variables against the live server state and send
     /// the result back: `(format_string, reply)`.
     ///
@@ -2027,6 +4260,10 @@ pub enum CtrlReq {
     /// `run-shell "helper --path '#{pane_current_path}'"` handed the helper that
     /// literal string.
     ExpandFormat(String, mpsc::Sender<String>),
+    /// Expand a format with no session, window or pane, as tmux does for a
+    /// CMD_FIND_CANFAIL command whose -t named nothing (issue #793 follow
+    /// up). Server variables and options still resolve.
+    ExpandFormatNoTarget(String, mpsc::Sender<String>),
     /// move-window. `src`/`dst` are RAW tmux target specs, resolved on the
     /// server against the live window list by `AppState::resolve_window_spec`.
     ///
@@ -2061,24 +4298,52 @@ pub enum CtrlReq {
         detach: bool,
         resp: mpsc::Sender<Result<(), String>>,
     },
-    /// link-window: (source window index, target insertion index)
-    LinkWindow(Option<usize>, Option<usize>),
-    UnlinkWindow,
+    /// `link-window`. `src` (`-s`, default the current window) and `dst`
+    /// (`-t`) are RAW tmux target specs, the way `MoveWindow`'s and
+    /// `SwapWindow`'s are.
+    ///
+    /// The `-s` parser used to be `w[1].trim_start_matches(':').parse()`, which
+    /// cannot read a session qualified source, and the `-t` never reached the
+    /// arm at all because `without_outer_target` stripped it and the generic
+    /// temp focus then refused a destination index that no window holds yet
+    /// (issue #693 item 1). In tmux that `-t` is `CMD_FIND_WINDOW_INDEX`
+    /// (cmd-move-window.c:83, shared by move-window and link-window), so it
+    /// need not exist, exactly like break-pane's.
+    LinkWindowReq {
+        src: Option<String>,
+        dst: Option<String>,
+        /// `-d`: do not select the linked window (tmux passes `!dflag` to
+        /// `server_link_window` as its select flag, cmd-move-window.c:103).
+        detach: bool,
+        /// `-k`: kill the window already holding the destination index.
+        kill: bool,
+        /// `-a` / `-b`: land after / before the destination
+        /// (`winlink_shuffle_up`, cmd-move-window.c:94-101).
+        after: bool,
+        before: bool,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
+    /// `unlink-window`. `target` is the RAW `-t` spec, or None for the current
+    /// window (tmux's `.target = { 't', CMD_FIND_WINDOW, 0 }`,
+    /// cmd-kill-window.c:54, and the unlink branch at :75-83 acts on
+    /// `target->wl`).
+    ///
+    /// It used to carry nothing and always removed `app.active_idx`; the only
+    /// reason a `-t` looked honoured was the generic temp focus moving the
+    /// active window to the target first (issue #693 item 2).
+    UnlinkWindowReq {
+        target: Option<String>,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     /// Set session group (used by new-session -t)
     SetSessionGroup(String),
     FindWindow(mpsc::Sender<String>, String),
-    /// move-pane: alias for join-pane
-    MovePane {
-        src_win: Option<usize>,
-        src_pane: Option<usize>,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
-        horizontal: bool,
-    },
     /// Extract a pane and start I/O forwarding for cross-session transfer.
-    /// Fields: window index, pane index, response channel.
+    /// Fields: the source window and pane (None: the active one; a window
+    /// that does not exist or a pane index past the end answers `ERR`),
+    /// response channel.
     /// Response: "FORWARD <id> <port> <pid> <title> <rows> <cols> <screen_b64_len>\n<screen_b64>"
-    PaneForwardExtract(usize, usize, mpsc::Sender<String>),
+    PaneForwardExtract(TempTarget, mpsc::Sender<String>),
     /// Inject a proxy pane from a cross-session transfer.
     /// Fields: source_session, source_addr, source_key, forward_id, fwd_port,
     ///         pid, title, rows, cols, screen_b64, target_window, target_pane, horizontal
@@ -2093,9 +4358,12 @@ pub enum CtrlReq {
         rows: u16,
         cols: u16,
         screen_b64: String,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
+        /// The target window and pane (None everywhere: the active pane).
+        target: TempTarget,
         horizontal: bool,
+        /// `ERR <message>` when the target does not resolve; the pane is not
+        /// grafted anywhere else.
+        resp: mpsc::Sender<Result<(), String>>,
     },
     /// Resize a forwarded pane's real PTY. Fields: forward_id, rows, cols.
     PaneForwardResize(u64, u16, u16),
@@ -2114,7 +4382,14 @@ pub enum CtrlReq {
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),
-    ListClientsFormat(mpsc::Sender<String>, String),
+    /// `list-clients -F <format> [-f <filter>]` (issue #724).
+    ListClientsFormat(mpsc::Sender<String>, String, Option<String>),
+    /// `attach -r` / `client-flags read-only`: (client id, read only).
+    SetClientReadonly(u64, bool),
+    /// `refresh-client -f [!]ignore-size`: (client id, ignore size) (#825).
+    SetClientIgnoreSize(u64, bool),
+    /// focus-in / focus-out from one attached client: (client id, focused).
+    SetClientFocus(u64, bool),
     ForceDetachClient(u64),
     /// detach-client -t <tty>: force-detach a client by tty_name (e.g. "/dev/pts/2").
     /// `kill_parent` is the tmux `-P` flag: also tell the client to kill its parent
@@ -2165,49 +4440,94 @@ pub enum CtrlReq {
         client_id: u64,
         name: String,
     },
-    /// `refresh-client -f pause-after=N` set pause-after flag.
+    /// `refresh-client -f pause-after[=N]` (Some(seconds); bare pause-after
+    /// is Some(0) like tmux) or `!pause-after` / `no-pause` (None).
     ControlSetPauseAfter {
         client_id: u64,
         pause_after_secs: Option<u64>,
     },
+    /// `refresh-client -A '%N:pause'` pause a pane's output for this client.
+    /// `reply` is true when a `%pause` line is due.
+    ControlPausePane {
+        client_id: u64,
+        pane_id: usize,
+        reply: mpsc::Sender<bool>,
+    },
     /// `refresh-client -A '%N:continue'` resume paused pane output.
+    /// `reply` is true when a `%continue` line is due.
     ControlContinuePane {
         client_id: u64,
         pane_id: usize,
+        reply: mpsc::Sender<bool>,
     },
     SuspendClient,
     CopyModePageUp,
     ClearHistory,
+    /// TEST ONLY: sleep the server loop this many milliseconds.  Sent by the
+    /// hidden `debug-stall <ms>` wire command, which the connection thread
+    /// accepts only when the server was started with
+    /// `PSMUX_TEST_STALL_HOOK=1` (see server::connection), so it is inert in
+    /// normal use.  It lets tests\test_stalled_server_target_routing.ps1
+    /// reproduce a long server stall deterministically.
+    DebugStall(u64),
     SaveBuffer(String),
     LoadBuffer(String),
-    SetEnvironment(String, String),
-    UnsetEnvironment(String),
-    ShowEnvironment(mpsc::Sender<String>),
+    /// A parsed and validated `set-environment` (value already `-F` expanded).
+    SetEnvironment(crate::environ::SetEnvArgs),
+    /// The attaching client's environment (`client-environ`), consumed by the
+    /// ClientAttach that follows it for update-environment (#775).
+    ClientEnviron(Vec<(String, String)>),
+    /// A parsed `show-environment`: the listing, or tmux's error text.
+    ShowEnvironment(crate::environ::ShowEnvArgs, mpsc::Sender<Result<String, String>>),
     SetHook(String, String),
     AppendHook(String, String),
     ShowHooks(mpsc::Sender<String>),
     RemoveHook(String),
+    /// End THIS server only. What a one-shot CLI connection asks for: the CLI
+    /// has already worked out the scope and is fanning the request out itself,
+    /// so a server that fanned out again would recurse.
     KillServer,
+    /// `kill-server` typed by an ATTACHED client: end every server on this
+    /// client's socket — its `-L` namespace, or the default one — and then this
+    /// one. `true` is `-a`, the psmux-only sweep of every namespace (#649).
+    KillServerScoped(bool),
     WaitFor(String, WaitForOp),
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayMenuDirect(Menu),
-    DisplayPopup(String, String, String, bool, Option<String>),
+    /// Parsed `display-popup` arguments and whether the popup closes when its
+    /// command exits.
+    DisplayPopup(crate::popup::DisplayPopupArgs, bool),
     ConfirmBefore(String, String),
     ClockMode,
     ResizePaneAbsolute(String, u16),
     ResizePanePercent(String, u8), // axis, percentage (0-100)
     ShowOptionValue(mpsc::Sender<String>, String),
-    /// Read a window-scoped option value. Optional window index targets a
-    /// specific window (from `show-options -w -t :N`); None falls back to
-    /// the active window. Required so per-window overrides like
-    /// `automatic-rename` (implicitly off for `-n NAME` windows, #266)
-    /// can be reported correctly instead of returning the global value.
-    ShowWindowOptionValue(mpsc::Sender<String>, String, Option<usize>),
+    /// Read a window-scoped option value. The third field is the RAW `-t`
+    /// target so the server resolves `s:zero`, `s:1`, `@3` and tmux's
+    /// symbolic window spellings alike; empty means the active window.
+    /// Required so per-window values — `automatic-rename` (implicitly off for
+    /// `-n NAME` windows, #266) and every option in the window's own store
+    /// (#648) — are reported instead of the global one.
+    ShowWindowOptionValue(mpsc::Sender<String>, String, String),
+    /// Look up one user option (`@name`) in the table `show-options` picked,
+    /// answering whether it is SET (an empty value is set) and whether the
+    /// value was inherited, so `show @unset` can say "invalid option" like
+    /// tmux. Fields: reply, name, raw `-t` target, table.
+    UserOptionLookup(
+        mpsc::Sender<Option<(String, bool)>>,
+        String,
+        String,
+        crate::server::options::UserOptionTable,
+    ),
     ChooseBuffer(mpsc::Sender<String>),
     ServerInfo(mpsc::Sender<String>),
     SendPrefix,
     PrevLayout,
-    SwitchClientTable(String),
+    /// `switch-client -T <table>`. The optional reply channel carries tmux's
+    /// "table %s doesn't exist" so a one-shot CLI caller can exit non-zero
+    /// (issue #640); the attached client sends its own latch updates over the
+    /// persistent connection and passes `None`.
+    SwitchClientTable(String, Option<mpsc::Sender<String>>),
     ListCommands(mpsc::Sender<String>),
     ResizeWindow(
         crate::resize_window::ResizeWindowRequest,
@@ -2221,11 +4541,26 @@ pub enum CtrlReq {
         window_id: Option<usize>,
         size: Option<(u16, u16)>,
     },
-    RespawnWindow,
+    /// respawn-window. Fields: optional workdir (-c), optional shell-command
+    /// operand, per-request reply. Shares `respawn_active_pane` with
+    /// `RespawnPane` and therefore shared its server-killing `?`; the spawn
+    /// failures (bad `-c`, unspawnable command) are routine and belong to the
+    /// requesting client. tmux: `respawn window failed: <cause>`, exit 1.
+    /// The last field is the `-e KEY=VALUE` environment (#708).
+    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     FocusIn,
     FocusOut,
-    CommandPrompt(String),
+    /// `command-prompt <args>` from the command line (#789 follow up): open
+    /// it on an attached client. The bool is "wait": the reply then comes
+    /// only when the prompt closes. An error is replied as `ERROR: <msg>`.
+    CommandPrompt(String, bool, mpsc::Sender<String>),
+    /// A client reports that the prompt of request `<id>` closed.
+    PromptDone(u64),
     ShowMessages(mpsc::Sender<String>),
+    /// The warnings THIS server recorded while loading its config, framed by
+    /// `server::config_warnings_reply`. Answered by the main loop, so it is
+    /// never answered before the config is loaded (#706).
+    ConfigWarnings(mpsc::Sender<String>),
     /// Forward raw bytes to the popup PTY (base64-decoded by connection handler)
     PopupInput(Vec<u8>),
     /// Close the current overlay (popup, menu, confirm, etc.)
@@ -2249,7 +4584,11 @@ pub enum CtrlReq {
     ControlRegister {
         client_id: u64,
         echo: bool,
-        notif_tx: mpsc::SyncSender<ControlNotification>,
+        notif_tx: mpsc::Sender<ControlNotification>,
+        /// The control client's process id, read from the connection (#724).
+        pid: Option<u32>,
+        /// Output gate shared with the connection's writer thread (#826).
+        output_gate: Arc<crate::control::ControlOutputGate>,
     },
     /// Deregister a control mode client.
     ControlDeregister {
@@ -2282,6 +4621,98 @@ pub enum CtrlReq {
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The `program-status` option, read by every pane's parser thread before each
+/// batch so panes created later, warm panes, and a parser swapped in by
+/// clear-history all follow the one switch.
+pub static PROGRAM_STATUS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests that need `PROGRAM_STATUS_ENABLED` in a given state hold this for
+/// their whole run: the switch is process wide, and a parallel test flipping
+/// it changes what every live parser thread answers.
+#[cfg(test)]
+pub(crate) fn program_status_switch_for_test(on: bool) -> ProgramStatusSwitchGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = PROGRAM_STATUS_ENABLED.swap(on, std::sync::atomic::Ordering::AcqRel);
+    ProgramStatusSwitchGuard { _lock: lock, previous }
+}
+
+#[cfg(test)]
+pub(crate) struct ProgramStatusSwitchGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ProgramStatusSwitchGuard {
+    fn drop(&mut self) {
+        PROGRAM_STATUS_ENABLED.store(self.previous, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Sender for the server loop's control channel, published once at server
+/// start so threads that have no `AppState` can wake the loop.
+///
+/// A `mpsc::Sender` is `Send` but not `Sync`, hence the mutex; it is taken only
+/// once per coalesced wake, so the lock is never contended in practice.
+static WAKE_TX: std::sync::OnceLock<std::sync::Mutex<mpsc::Sender<CtrlReq>>> =
+    std::sync::OnceLock::new();
+
+/// True while a `CtrlReq::PtyWake` is queued and not yet consumed.
+static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the control sender. Called once, from the server loop's setup.
+pub fn set_wake_sender(tx: mpsc::Sender<CtrlReq>) {
+    let _ = WAKE_TX.set(std::sync::Mutex::new(tx));
+}
+
+/// Wake the server loop because a pane just published new screen state.
+///
+/// Without this the loop learns about pty output only when its `recv_timeout`
+/// expires, so every echoed keystroke waited out the poll interval on its way
+/// to the render, for a hop whose real work is tens of microseconds.
+///
+/// Measured with `pty_trace`, from the parser publishing a batch (`p`) to the
+/// loop having the frame built, 40 single keystrokes into a raw echo child:
+///
+///   before   1.06ms median, and the echo reached the client as a dump-state
+///            RESPONSE (47 of 50 frames) rather than as a push
+///   after    0.22ms median, and 49 of 50 frames went out as pushes
+///
+/// At most ONE wake is ever in flight (`WAKE_PENDING`), so a pane flooding the
+/// screen cannot flood the control channel: the first batch queues a wake, and
+/// every batch until the loop consumes it is free.
+pub fn wake_server_loop() {
+    // Nobody is watching: the frame this would produce has no destination, and
+    // the loop's own 16ms/50ms cadence still picks the data up for alerts and
+    // activity. Waking here would only spend CPU on a detached session.
+    // A control client watches too: its %output is sent from the loop, which
+    // otherwise sat out its 50ms idle wait while a pane flooded (#875).
+    if !has_frame_receivers()
+        && !crate::control_ring::CONTROL_CLIENTS_PRESENT.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    if WAKE_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let sent = WAKE_TX
+        .get()
+        .and_then(|m| m.lock().ok().map(|tx| tx.send(CtrlReq::PtyWake).is_ok()))
+        .unwrap_or(false);
+    if !sent {
+        // No loop to wake (not the server process, or it is shutting down).
+        // Clear the latch so a later wake is not swallowed forever.
+        WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Called by the server loop when it takes the wake off the channel, which
+/// re-arms `wake_server_loop`.
+pub fn clear_wake_pending() {
+    WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+}
+
 /// Set by the parser thread when any pane's `cpr_pending` flag is raised.
 /// Lets the server loop skip the tree walk when no CPR response is needed.
 pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2290,6 +4721,91 @@ pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::
 /// bitmask is raised.  Lets the server loop skip the tree walk when no color
 /// query response is needed.
 pub static COLOR_QUERY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Issue #597: device-attribute and mode replies (DA1, DA2, DSR 5, DECRQM)
+/// that the parser thread has composed and the server loop still has to write
+/// into the owning pane's PTY input.
+///
+/// A global keyed by pane id rather than a field on `Pane`, for the same
+/// reason `PIPE_WRITERS` is one: the queue has to be reachable from a pane's
+/// parser thread, which holds a pane id and nothing else, and every pane kind
+/// (tree pane, warm spare, popup, float) would otherwise need its own copy of
+/// the field threaded through its own constructor.
+///
+/// The replies go out on the PTY writer, not through
+/// `mouse_inject::send_vt_response`, because the thing waiting for a DA1 answer
+/// at pane startup is the console host itself: OpenConsole opens the stream
+/// with `ESC[1t ESC[c` before the child's console connect completes, and it
+/// reads the answer off the input pipe.  A console input record would never
+/// reach it.  This is also the path the ESC[6n responder already uses, and it
+/// is proven under both hosts (see `drain_cpr_pending`).
+pub static DEVICE_REPLIES: Mutex<Vec<(usize, std::time::Instant, Vec<u8>)>> =
+    Mutex::new(Vec::new());
+
+/// How long a queued reply waits for its pane to become reachable before it is
+/// dropped.
+///
+/// A warm spare is built on a worker thread and only reaches `app.warm_pane`
+/// when the server loop takes it off the refill channel, so its console host's
+/// `ESC[c` can easily arrive while the pane is in neither the window tree nor
+/// the pool.  Draining on the raised gate alone would then find no owner, and
+/// with the gate already cleared the reply would sit in the queue forever while
+/// the spare waited out the host's full three second timeout: measured as a
+/// cold first session at 4507 ms against 1392 ms on the inbox host.  So the
+/// drain re-arms the gate while anything is still queued, and this bound is
+/// what stops a reply for a pane that will never be reachable (a proxy pane,
+/// or one killed in the gap) from re-arming it forever.
+const DEVICE_REPLY_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cheap gate for `DEVICE_REPLIES`, the same shape as `CPR_DATA_PENDING`: the
+/// server loop pays one atomic per pass while no pane has asked anything.
+pub static DEVICE_REPLY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Queue a device reply for `pane_id` and raise the gate.  Called from a
+/// pane's parser thread (issue #597).
+pub fn push_device_reply(pane_id: usize, bytes: Vec<u8>) {
+    if bytes.is_empty() { return; }
+    if let Ok(mut q) = DEVICE_REPLIES.lock() {
+        // A pane whose child asks and never reads (or a pane whose server loop
+        // has already gone) must not grow this without bound.
+        const MAX_QUEUED: usize = 64;
+        if q.len() >= MAX_QUEUED { q.remove(0); }
+        q.push((pane_id, std::time::Instant::now(), bytes));
+    }
+    DEVICE_REPLY_PENDING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Take every queued reply for `pane_id`, concatenated in arrival order.
+/// Returns `None` when this pane has nothing waiting (issue #597).
+pub fn take_device_replies(pane_id: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    if let Ok(mut q) = DEVICE_REPLIES.lock() {
+        if q.is_empty() { return None; }
+        q.retain(|(id, _, bytes)| {
+            if *id == pane_id { out.extend_from_slice(bytes); false } else { true }
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Called at the end of a drain pass: expire anything that has waited past
+/// `DEVICE_REPLY_TTL` and leave the gate raised if a reply is still waiting for
+/// a pane that was not reachable this pass (issue #597).
+pub fn rearm_device_replies() {
+    let still_waiting = match DEVICE_REPLIES.lock() {
+        Ok(mut q) => {
+            if !q.is_empty() {
+                let now = std::time::Instant::now();
+                q.retain(|(_, queued, _)| now.duration_since(*queued) < DEVICE_REPLY_TTL);
+            }
+            !q.is_empty()
+        }
+        Err(_) => false,
+    };
+    if still_waiting {
+        DEVICE_REPLY_PENDING.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Issue #473: the host terminal color spec captured by the client at startup
 /// (before the input pump starts), consumed by `establish_connection` which
@@ -2471,6 +4987,55 @@ pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// competing for the ConPTY output pipe.
 pub static PIPE_WRITERS: Mutex<Vec<(usize, Box<dyn std::io::Write + Send>)>> = Mutex::new(Vec::new());
 
+/// Issue #685: the low sixteen OSC 4 palette entries of every pane that has
+/// set any, mirrored out of the pane's `vt100::Screen` so the colour query
+/// responder can read them without taking the parser lock.
+///
+/// tmux answers an `OSC 4;<i>;?` query from the pane's own palette first
+/// (`input.c:2947` `colour_palette_get`) and only asks the real terminal when
+/// the pane has no entry of its own (`input_add_request`,
+/// `INPUT_REQUEST_PALETTE`).  psmux's responder lives in the pane READER
+/// thread (`pane.rs` `scan_color_queries` plus
+/// `server::helpers::answer_color_queries_sync`, issues #473 and #556), which
+/// runs ahead of the parser thread and must not block on it, so the parser
+/// thread publishes here after each batch that changed the palette.
+///
+/// `PANE_PALETTE_ANY` is the same cheap gate `PIPE_PANE_COUNT` is: while no
+/// pane in this server has ever set a palette entry, the responder never takes
+/// the mutex, so nothing about the existing path changes.  Only indexes 0..=15
+/// are mirrored because that is the whole range the query scanner recognises.
+pub static PANE_PALETTE_ANY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static PANE_PALETTES: Mutex<Vec<(usize, [Option<(u8, u8, u8)>; 16])>> =
+    Mutex::new(Vec::new());
+
+/// Publish (or, with an all-`None` table, withdraw) one pane's mirrored
+/// palette.  Called from the pane parser thread only when the palette
+/// generation moved.
+pub fn publish_pane_palette(pane_id: usize, entries: [Option<(u8, u8, u8)>; 16]) {
+    let any = entries.iter().any(Option::is_some);
+    let Ok(mut table) = PANE_PALETTES.lock() else { return };
+    match table.iter_mut().find(|(id, _)| *id == pane_id) {
+        Some(slot) if any => slot.1 = entries,
+        Some(_) => {
+            table.retain(|(id, _)| *id != pane_id);
+        }
+        None if any => table.push((pane_id, entries)),
+        None => {}
+    }
+    PANE_PALETTE_ANY.store(!table.is_empty(), std::sync::atomic::Ordering::Release);
+}
+
+/// This pane's mirrored palette, if it has one.
+#[must_use]
+pub fn pane_palette(pane_id: usize) -> Option<[Option<(u8, u8, u8)>; 16]> {
+    if !PANE_PALETTE_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let table = PANE_PALETTES.lock().ok()?;
+    table.iter().find(|(id, _)| *id == pane_id).map(|(_, e)| *e)
+}
+
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly
 /// `shutdown()` them before `process::exit(0)`.  Without this, Windows
@@ -2497,6 +5062,36 @@ pub fn deregister_persistent_stream(client_id: u64) {
     }
 }
 
+/// True when a persistent stream is still tracked for this client id.
+///
+/// The reaper logs it so a registry entry removed while the connection is
+/// still open can be told apart in the debug log.
+pub fn has_persistent_stream(client_id: u64) -> bool {
+    PERSISTENT_STREAMS
+        .lock()
+        .map(|v| v.iter().any(|(cid, _)| *cid == client_id))
+        .unwrap_or(false)
+}
+
+/// Close everything a client's connection owns: the tracked TCP stream, its
+/// frame-push slot, its directive channel and its frame channel.
+///
+/// The client registry and the connection are two different things, and
+/// dropping one without the other leaves a client that keeps *receiving*
+/// frames (its writer thread and persistent stream are untouched) while
+/// nothing ever reads its input again (the reader that just ended was the only
+/// reader there is). That client is invisible in `list-clients` and completely
+/// dead to the user: clicks, wheel and keystrokes do nothing while the screen
+/// keeps updating, and the only way out is to restart the client by hand.
+///
+/// Closing the connection instead makes the client see EOF, so it reconnects
+/// under a fresh client id and its input works again.
+pub fn teardown_client_connection(client_id: u64) {
+    shutdown_client_stream(client_id);
+    deregister_persistent_stream(client_id);
+    deregister_frame_channel(client_id);
+}
+
 /// Shut down all tracked persistent client streams so their readers get EOF.
 pub fn shutdown_persistent_streams() {
     if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
@@ -2520,7 +5115,7 @@ pub fn shutdown_client_stream(client_id: u64) {
         });
     }
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.retain(|(cid, _)| *cid != client_id);
+        v.retain(|(cid, _, _)| *cid != client_id);
     }
     remove_directive_channel(client_id);
 }
@@ -2553,15 +5148,38 @@ pub fn shutdown_client_stream(client_id: u64) {
 ///     for a path that is not measured-hot.
 pub type FrameSlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
-static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot)>> =
+/// What can wake a persistent connection's writer thread.
+///
+/// The writer has two producers, command responses and pushed frames, and an
+/// `mpsc::Receiver` can only block on one channel. Before this enum the frame
+/// slot was the producer it could NOT block on, so every pushed frame waited
+/// out the response channel's 5ms `recv_timeout`, for a hop whose work is one
+/// `write!`. Carrying both on one channel makes the writer wake on whichever
+/// arrives first.
+///
+/// Measured with `pty_trace`, from the push filling the slot (`f`) to the
+/// writer putting the frame on the socket (`t`): 3.20ms median before (n=3,
+/// because before this change almost nothing took the push path at all),
+/// 0.068ms median after (n=49).
+pub enum WriterWake {
+    /// A command response is coming; the receiver carries its text.
+    Resp(mpsc::Receiver<String>),
+    /// A frame was pushed into this client's slot. Carries nothing, because
+    /// the slot always holds the newest snapshot and the writer reads it.
+    Frame,
+}
+
+static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot, mpsc::Sender<WriterWake>)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Register a frame slot for a persistent connection's writer thread.
+///
+/// `poke` is the writer's own wake channel, used to tell it a frame landed.
 /// Returns the slot Arc for the writer thread to consume from.
-pub fn register_frame_channel(client_id: u64) -> FrameSlot {
+pub fn register_frame_channel(client_id: u64, poke: mpsc::Sender<WriterWake>) -> FrameSlot {
     let slot: FrameSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.push((client_id, slot.clone()));
+        v.push((client_id, slot.clone(), poke));
     }
     slot
 }
@@ -2573,9 +5191,29 @@ pub fn register_frame_channel(client_id: u64) -> FrameSlot {
 /// Dead slots (poisoned mutex) are pruned automatically.
 pub fn push_frame(frame: &str) {
     if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
-        slots.retain(|(_, slot)| {
+        slots.retain(|(_, slot, poke)| {
             match slot.lock() {
-                Ok(mut s) => { *s = Some(frame.to_string()); true }
+                Ok(mut s) => {
+                    // Only an empty->full transition needs a poke. If a frame
+                    // is already waiting the writer has not drained it yet, so
+                    // it is either running or already has a wake queued: this
+                    // is what keeps a flooding pane from queueing one message
+                    // per batch.
+                    let was_empty = s.is_none();
+                    let mut frame = frame.to_string();
+                    // An unread frame being replaced keeps its clipboard
+                    // write and bell (frame_oneshot): they are events, not
+                    // screen state, and the newer snapshot does not have them.
+                    if let Some(mut older) = s.take() {
+                        crate::frame_oneshot::supersede(&mut older, &mut frame);
+                    }
+                    *s = Some(frame);
+                    drop(s);
+                    if was_empty {
+                        let _ = poke.send(WriterWake::Frame);
+                    }
+                    true
+                }
                 Err(_) => false, // writer thread panicked; prune
             }
         });
@@ -2592,7 +5230,7 @@ pub fn has_frame_receivers() -> bool {
 /// returns false when no live clients remain.
 pub fn deregister_frame_channel(client_id: u64) {
     if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
-        v.retain(|(cid, _)| *cid != client_id);
+        v.retain(|(cid, _, _)| *cid != client_id);
     }
 }
 
@@ -2625,12 +5263,16 @@ pub fn send_directive_to_client(client_id: u64, directive: &str) -> bool {
 }
 
 /// Send a directive to ALL persistent clients.
-pub fn send_directive_to_all_clients(directive: &str) {
+/// Returns how many clients the directive was queued for, so a teardown can
+/// skip waiting for writers to flush it when nobody is attached.
+pub fn send_directive_to_all_clients(directive: &str) -> usize {
     if let Ok(channels) = DIRECTIVE_CHANNELS.lock() {
         for (_, tx) in channels.iter() {
             let _ = tx.send(directive.to_string());
         }
+        return channels.len();
     }
+    0
 }
 
 /// Remove a client's directive channel (called on disconnect).
@@ -2673,6 +5315,10 @@ pub struct ParsedTarget {
 mod tests_pr267_backpressure;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_client_connection_teardown.rs"]
+mod tests_client_connection_teardown;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_issue434_reap_client.rs"]
 mod tests_issue434_reap_client;
 
@@ -2691,3 +5337,11 @@ mod tests_base_index_rebase;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue601_602_move_swap_window.rs"]
 mod tests_issue601_602_move_swap_window;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_new_window_index_target.rs"]
+mod tests_new_window_index_target;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_preview_window_state.rs"]
+mod tests_preview_window_state;

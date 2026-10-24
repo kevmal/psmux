@@ -258,14 +258,19 @@ fn audit_exempt(name: &str) -> Option<&'static str> {
 /// the option before the unset is asked to move it back.
 fn probe_value(def: &crate::server::option_catalog::OptionDef) -> String {
     match def.option_type {
-        "number" => {
+        crate::server::option_catalog::OptionType::Number(_) => {
             let cur: i64 = def.default.trim().parse().unwrap_or(0);
             // Stay inside every bound psmux enforces (repeat-time caps at
             // 2000000) while still differing from the default.
             (cur + 7).to_string()
         }
-        "boolean" => {
+        crate::server::option_catalog::OptionType::Boolean => {
             if def.default == "on" { "off".to_string() } else { "on".to_string() }
+        }
+        crate::server::option_catalog::OptionType::Choice(
+            crate::server::option_catalog::ChoiceKind::PaneBorderIndicators,
+        ) => {
+            if def.default == "colour" { "arrows".to_string() } else { "colour".to_string() }
         }
         _ => {
             if def.default == "i619probe" {
@@ -393,10 +398,11 @@ fn unset_removes_window_style_which_has_no_catalog_default() {
 fn config_route_restores_the_default_not_an_empty_value() {
     // The config parser used to call parse_option_value(app, key, "") on -u, so
     // `set -gu escape-time` in a .tmux.conf left the old number where the CLI
-    // restored 500, and `set -gu status-style` produced a styleless status bar.
+    // restored the default, and `set -gu status-style` produced a styleless status bar.
     let mut app = mock_app();
     parse_config_content(&mut app, "set -g escape-time 5\nset -gu escape-time\n");
-    assert_eq!(app.escape_time_ms, 500, "config -u must restore the 500 ms default");
+    // The default is 10 ms since the #841 follow up (tmux 3.5+), 500 before.
+    assert_eq!(app.escape_time_ms, crate::types::DEFAULT_ESCAPE_TIME_MS, "config -u must restore the default");
 
     let mut app2 = mock_app();
     parse_config_content(&mut app2, "set -g status-style fg=red\nset -gu status-style\n");
