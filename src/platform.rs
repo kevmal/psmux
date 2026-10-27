@@ -2463,7 +2463,7 @@ pub mod process_kill {
     /// Used as the "cutoff" for PID-reuse detection: any process whose
     /// creation time is LATER than the cutoff captured just before our
     /// snapshot cannot be a process we enumerated, so it must be a reused PID.
-    fn now_filetime() -> u64 {
+    pub(super) fn now_filetime() -> u64 {
         unsafe {
             let mut ft = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
             GetSystemTimeAsFileTime(&mut ft);
@@ -2475,7 +2475,7 @@ pub mod process_kill {
     /// process cannot be opened or queried (already gone, or a different
     /// security context). The handle is opened with QUERY_LIMITED_INFORMATION
     /// which succeeds for same-user processes.
-    fn process_creation_filetime(pid: u32) -> Option<u64> {
+    pub(super) fn process_creation_filetime(pid: u32) -> Option<u64> {
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -3271,18 +3271,19 @@ pub mod process_info {
     /// `None` when the root has no descendants at all.
     ///
     /// Highest PID is this module's established "most recently created"
-    /// heuristic (Windows exposes no console foreground process group, and
-    /// Toolhelp32 carries no creation time). The iteration guard stops a
-    /// pathological loop from PID reuse inside one snapshot.
+    /// heuristic (Windows exposes no console foreground process group).
+    /// Every edge must also have OS creation times proving that the child
+    /// was born no earlier than its parent. The iteration guard bounds cycles.
     fn deepest_descendant(
-        entries: &[(u32, u32, String)],
+        entries: &ProcessSnapshot,
         root_pid: u32,
     ) -> Option<(u32, String)> {
         let mut cur = root_pid;
         let mut leaf: Option<(u32, String)> = None;
         for _ in 0..64 {
             let next = entries.iter()
-                .filter(|(pid, ppid, name)| *ppid == cur && *pid != cur && !is_system_exe(name))
+                .filter(|(pid, ppid, name)| *ppid == cur && *pid != cur
+                    && !is_system_exe(name) && entries.proven_child(*pid, cur))
                 .max_by_key(|(pid, _, _)| *pid);
             match next {
                 Some((pid, _, name)) => {
@@ -3315,13 +3316,18 @@ pub mod process_info {
             Some(t) => t,
             None => return false,
         };
+        tree_has_vt_bridge(&entries, root_pid)
+    }
+
+    fn tree_has_vt_bridge(entries: &ProcessSnapshot, root_pid: u32) -> bool {
         let mut queue: Vec<u32> = vec![root_pid];
         let mut head = 0;
         while head < queue.len() {
             let parent = queue[head];
             head += 1;
             for (pid, ppid, name) in entries.iter() {
-                if *ppid == parent && *pid != root_pid && !queue.contains(pid) {
+                if *ppid == parent && *pid != root_pid && !queue.contains(pid)
+                    && entries.proven_child(*pid, parent) {
                     if is_vt_bridge_exe(name) {
                         return true;
                     }
@@ -3388,10 +3394,14 @@ pub mod process_info {
         };
 
         autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
+        foreground_child_pid(&entries, root_pid)
+    }
 
+    fn foreground_child_pid(entries: &ProcessSnapshot, root_pid: u32) -> Option<u32> {
         // Immediate children of root_pid, skipping system processes.
         let direct: Vec<(u32, String)> = entries.iter()
-            .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
+            .filter(|(pid, ppid, name)| *ppid == root_pid && *pid != root_pid
+                && !is_system_exe(name) && entries.proven_child(*pid, root_pid))
             .map(|(pid, _, name)| (*pid, name.clone()))
             .collect();
 
@@ -3417,7 +3427,8 @@ pub mod process_info {
         // look one level deeper for the real program.
         if is_wrapper_exe(&chosen_name) {
             let grandchildren: Vec<(u32, String)> = entries.iter()
-                .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
+                .filter(|(pid, ppid, name)| *ppid == chosen_pid && *pid != chosen_pid
+                    && !is_system_exe(name) && entries.proven_child(*pid, chosen_pid))
                 .map(|(pid, _, name)| (*pid, name.clone()))
                 .collect();
 
@@ -3436,8 +3447,51 @@ pub mod process_info {
         Some(chosen_pid)
     }
 
-    /// One `(pid, ppid, lowercased_exe_name)` row per process on the machine.
-    type ProcTable = std::sync::Arc<Vec<(u32, u32, String)>>;
+    /// Toolhelp rows plus lazily queried OS creation times. Cache times with
+    /// their snapshot so render-path lookups only open processes on candidate
+    /// pane branches, once per snapshot, rather than every process per frame.
+    struct ProcessSnapshot {
+        entries: Vec<(u32, u32, String)>,
+        captured_at: u64,
+        creation_times: std::sync::Mutex<std::collections::HashMap<u32, Option<u64>>>,
+    }
+
+    impl std::ops::Deref for ProcessSnapshot {
+        type Target = [(u32, u32, String)];
+
+        fn deref(&self) -> &Self::Target {
+            &self.entries
+        }
+    }
+
+    impl ProcessSnapshot {
+        fn creation_time(&self, pid: u32) -> Option<u64> {
+            self.creation_time_with(pid, super::process_kill::process_creation_filetime)
+        }
+
+        fn creation_time_with(&self, pid: u32, read: impl FnOnce(u32) -> Option<u64>) -> Option<u64> {
+            if !self.entries.iter().any(|(entry_pid, _, _)| *entry_pid == pid) {
+                return None;
+            }
+            let mut times = self.creation_times.lock().unwrap_or_else(|e| e.into_inner());
+            *times.entry(pid).or_insert_with(|| {
+                read(pid)
+                    // A PID recycled after enumeration is not the snapshot's process.
+                    .filter(|born| *born <= self.captured_at)
+            })
+        }
+
+        fn proven_child(&self, child: u32, parent: u32) -> bool {
+            match (self.creation_time(parent), self.creation_time(child)) {
+                (Some(parent_born), Some(child_born)) => child_born >= parent_born,
+                // Missing ages cannot prove lineage. Stop at the last proven
+                // ancestor (or the pane root) instead of following this branch.
+                _ => false,
+            }
+        }
+    }
+
+    type ProcTable = std::sync::Arc<ProcessSnapshot>;
 
     static PROC_TABLE_CACHE: std::sync::LazyLock<
         std::sync::Mutex<Option<(std::time::Instant, ProcTable)>>,
@@ -3499,6 +3553,7 @@ pub mod process_info {
         }
 
         PROC_TABLE_WALKS.with(|c| c.set(c.get() + 1));
+        let captured_at = super::process_kill::now_filetime();
         let entries = unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap == INVALID_HANDLE || snap == 0 {
@@ -3517,7 +3572,11 @@ pub mod process_info {
             entries
         };
 
-        let table: ProcTable = std::sync::Arc::new(entries);
+        let table: ProcTable = std::sync::Arc::new(ProcessSnapshot {
+            entries,
+            captured_at,
+            creation_times: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
         // Publish even for a ZERO-max_age caller: it paid for the walk, so a
         // later render-path caller may as well reuse it. Recover a poisoned lock
         // here too (see the read site above) so a panic elsewhere cannot leave
@@ -3631,6 +3690,9 @@ pub mod process_info {
         for _ in 0..64 {
             match entries.iter().find(|(p, _, _)| *p == cur) {
                 Some((_, ppid, _)) => {
+                    if !entries.proven_child(cur, *ppid) {
+                        return false;
+                    }
                     if *ppid == root_pid {
                         return true;
                     }
@@ -3695,6 +3757,7 @@ pub mod process_info {
         };
         !entries.iter().any(|(pid, ppid, name)| {
             *ppid == root_pid && *pid != root_pid && !is_system_exe(name)
+                && entries.proven_child(*pid, root_pid)
         })
     }
 
@@ -3840,24 +3903,7 @@ pub mod process_info {
             None => return false,
         };
 
-        // BFS from root_pid to check all descendants
-        let mut queue: Vec<u32> = vec![root_pid];
-        let mut head = 0;
-        while head < queue.len() {
-            let parent = queue[head];
-            head += 1;
-            for (pid, ppid, name) in entries.iter() {
-                if *ppid == parent && *pid != root_pid
-                    && !queue.contains(pid)
-                {
-                    if is_vt_bridge_exe(name) {
-                        return true;
-                    }
-                    queue.push(*pid);
-                }
-            }
-        }
-        false
+        tree_has_vt_bridge(&entries, root_pid)
     }
 
     // Path is relative to src/platform/process_info/ — an inline module inside a
@@ -3866,6 +3912,10 @@ pub mod process_info {
     #[cfg(test)]
     #[path = "../../../tests-rs/test_proc_table_cache.rs"]
     mod tests_proc_table_cache;
+
+    #[cfg(test)]
+    #[path = "../../../tests-rs/test_process_tree_birth_order.rs"]
+    mod tests_process_tree_birth_order;
 
     #[cfg(test)]
     #[path = "../../../tests-rs/test_issue579_any_vt_bridge.rs"]
